@@ -216,6 +216,66 @@ impl Clone for Planet {
     }
 }
 
+/// Robust fallback for rays intersecting close to a triangle's edge.
+///
+/// Parry's fast triangle test rejects barycentric components strictly below
+/// zero; rounding near shared edges can exclude *both* adjacent triangles.
+/// The tolerance accounts for the world-space cancellation in `origin - a`
+/// relative to the local triangle edge length rather than using a fixed
+/// world-space epsilon (planets can be millions of units from their origin).
+fn cast_triangle_ray_near_edge(tri: &Triangle, ray: &Ray, max_toi: f64) -> Option<RayIntersection> {
+    let ab = tri.b - tri.a;
+    let ac = tri.c - tri.a;
+    let normal = ab.cross(ac);
+    let denominator = normal.dot(ray.dir);
+    if denominator == 0.0 || !denominator.is_finite() {
+        return None;
+    }
+    let time = normal.dot(tri.a - ray.origin) / denominator;
+    if !time.is_finite() || !(0.0..=max_toi).contains(&time) {
+        return None;
+    }
+    let hit = ray.origin + ray.dir * time;
+    let ap = hit - tri.a;
+    let d00 = ab.dot(ab);
+    let d01 = ab.dot(ac);
+    let d11 = ac.dot(ac);
+    let d20 = ap.dot(ab);
+    let d21 = ap.dot(ac);
+    let det = d00.mul_add(d11, -(d01 * d01));
+    if det <= 0.0 || !det.is_finite() {
+        return None;
+    }
+    let v = d11.mul_add(d20, -(d01 * d21)) / det;
+    let w = d00.mul_add(d21, -(d01 * d20)) / det;
+    let u = 1.0 - (v + w);
+    let edge_scale = ab.length().min(ac.length());
+    if edge_scale == 0.0 {
+        return None;
+    }
+    let world_scale = ray
+        .origin
+        .abs()
+        .max_element()
+        .max(tri.a.abs().max_element())
+        .max(tri.b.abs().max_element())
+        .max(tri.c.abs().max_element());
+    let tolerance = 64.0 * f64::EPSILON * (1.0 + world_scale / edge_scale);
+    if ![u, v, w]
+        .iter()
+        .all(|&component| component >= -tolerance && component <= 1.0 + tolerance)
+    {
+        return None;
+    }
+    let outward = normal.normalize();
+    let (normal, face) = if denominator < 0.0 {
+        (outward, 0)
+    } else {
+        (-outward, 1)
+    };
+    Some(RayIntersection::new(time, normal, FeatureId::Face(face)))
+}
+
 impl RayCast for Planet {
     fn cast_local_ray_and_get_normal(
         &self,
@@ -253,7 +313,10 @@ impl RayCast for Planet {
                     .into_iter()
                     .enumerate()
                     .filter_map(|(i, t)| {
-                        Some((i, t.cast_local_ray_and_get_normal(&ray, remaining, solid)?))
+                        let hit = t
+                            .cast_local_ray_and_get_normal(&ray, remaining, solid)
+                            .or_else(|| cast_triangle_ray_near_edge(&t, &ray, remaining))?;
+                        Some((i, hit))
                     })
                     .min_by(|a, b| a.1.time_of_impact.total_cmp(&b.1.time_of_impact))
                 else {
@@ -1655,16 +1718,16 @@ mod tests {
             32,
             PLANET_RADIUS,
         );
-        planet
-            .cast_local_ray_and_get_normal(
-                &Ray {
-                    origin: Vector::new(1.0, 1.0, PLANET_RADIUS + DISTANCE),
-                    dir: Vector::new(1.5, 1.5, -1.0).normalize(),
-                },
-                1e5,
-                true,
-            )
+        let ray = Ray {
+            origin: Vector::new(1.0, 1.0, PLANET_RADIUS + DISTANCE),
+            dir: Vector::new(1.5, 1.5, -1.0).normalize(),
+        };
+        let hit = planet
+            .cast_local_ray_and_get_normal(&ray, 1e5, true)
             .expect("hit not found");
+        assert!(hit.time_of_impact > 0.0 && hit.time_of_impact < 1e5);
+        let surface_point = ray.origin + ray.dir * hit.time_of_impact;
+        assert!((surface_point.length() - PLANET_RADIUS).abs() < 5.0);
     }
 
     #[test]

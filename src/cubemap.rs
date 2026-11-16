@@ -599,6 +599,14 @@ impl Coords {
         direction: na::Vector3<f32>,
         theta: f32,
     ) -> impl Iterator<Item = Self> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cubemap discretization is defined in f32 and the coordinate is bounded to [0, 1]"
+        )]
+        fn to_grid(x: f64) -> f32 {
+            (unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0) as f32).clamp(0.0, 1.0)
+        }
+
         // Range of one component of a unit vector inside an angular cap.
         // The extrema may be at the +/- cardinal directions, not the rim.
         fn cap_range(axis: f64, cos: f64, sin: f64) -> (f64, f64) {
@@ -614,6 +622,35 @@ impl Coords {
                 axis.mul_add(cos, perpendicular)
             };
             (min, max)
+        }
+
+        // Exact maximum angular dot product for points in the face's
+        // projective square. The maximum is attained at an interior point,
+        // a stationary point on one of its four edges, or a corner.
+        fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
+            if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
+                return 1.0;
+            }
+            let mut best = f64::NEG_INFINITY;
+            let mut consider = |x: f64, y: f64| {
+                let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
+                let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
+                best = best.max(dot / length);
+            };
+            for edge in [-1.0, 1.0] {
+                for corner in [-1.0, 1.0] {
+                    consider(edge, corner);
+                }
+                let x_edge = direction.x.mul_add(edge, direction.z);
+                if x_edge > 0.0 {
+                    consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
+                }
+                let y_edge = direction.y.mul_add(edge, direction.z);
+                if y_edge > 0.0 {
+                    consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
+                }
+            }
+            best
         }
 
         let valid = resolution != 0 && theta.is_finite() && theta >= 0.0;
@@ -634,6 +671,12 @@ impl Coords {
                 }
                 let axis = axis?;
                 let local = face.basis::<f64>().inverse_transform_vector(&axis);
+                // Reject faces that the cone cannot physically reach. Without
+                // this check, a tiny cone near a face's horizon could scan
+                // every texel of that face due to the 1/z projection.
+                if face_max_dot(local) < cos {
+                    return None;
+                }
                 let (lo_x, hi_x) = cap_range(local.x, cos, sin);
                 let (lo_y, hi_y) = cap_range(local.y, cos, sin);
                 let (lo_z, hi_z) = cap_range(local.z, cos, sin);
@@ -654,13 +697,6 @@ impl Coords {
                 };
                 if x_min > 1.0 || y_min > 1.0 || x_max < -1.0 || y_max < -1.0 {
                     return None;
-                }
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "cubemap discretization is defined in f32 and the coordinate is bounded to [0, 1]"
-                )]
-                fn to_grid(x: f64) -> f32 {
-                    (unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0) as f32).clamp(0.0, 1.0)
                 }
                 let (x0, y0) =
                     discretize(resolution, na::Point2::new(to_grid(x_min), to_grid(y_min)));
@@ -1444,7 +1480,7 @@ mod test {
         ];
         for direction in directions {
             let axis = direction.normalize();
-            for theta in [0.01_f32, 0.2, 0.5, 0.8, 1.2, 1.8, 3.14] {
+            for theta in [0.01_f32, 0.2, 0.5, 0.8, 1.2, 1.8, std::f32::consts::PI] {
                 let actual: HashSet<_> =
                     Coords::neighborhood(RESOLUTION, direction, theta).collect();
                 for face in Face::iter() {
