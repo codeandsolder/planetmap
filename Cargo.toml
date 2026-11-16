@@ -32,3 +32,7 @@ fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
 [[bench]]
 name = "bench"
 harness = false
+
+[package.metadata.rust-skills2]
+allow-test-panics = true
+allow-test-panics-reason = "Existing geometric property and integration tests use unwrap and panic assertions; production and examples remain strict"

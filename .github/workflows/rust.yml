@@ -2,44 +2,27 @@ name: CI
 
 on:
   push:
-    branches: ['master']
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v1
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --workspace --all-targets --all-features
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --workspace --all-features
+  strict-rust:
+    name: Strict Rust and source policy
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@9948d6a6a7ce544cef93da9c4dd0e673b3acaed4 # main
+    with:
+      cargo-args: --locked --workspace --all-targets --all-features
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v1
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: rustfmt, clippy
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
-      - uses: actions-rs/cargo@v1
-        if: always()
-        with:
-          command: clippy
-          args: --workspace --all-targets -- -D warnings
+  tests:
+    name: Rust 1.99.1 all-feature tests
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    with:
+      rust-toolchain: "1.99.1"
+      command: cargo +1.99.1 test --locked --workspace --all-targets --all-features

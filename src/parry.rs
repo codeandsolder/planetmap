@@ -591,7 +591,10 @@ fn compute_toi(
     closest
 }
 
-#[allow(clippy::too_many_arguments)] // that's just what it takes
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parry dispatch requires separate motion, shape, time-bound and orientation arguments"
+)]
 fn compute_nonlinear_toi(
     motion_planet: &NonlinearRigidMotion,
     planet: &Planet,
@@ -844,7 +847,10 @@ struct TriangleState {
     phase: bool,
 }
 
-#[allow(clippy::too_many_arguments)] // that's just what it takes
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parry contact-manifold dispatch requires transforms, shapes, workspace, contacts and orientation"
+)]
 fn compute_manifolds_vs_composite<ManifoldData, ContactData>(
     pos12: &Pose,
     pos21: &Pose,
@@ -1297,7 +1303,7 @@ mod tests {
             let rot =
                 Rotation::from_axis_angle(Vector::Z, (i as f64 / 1000.0) * f64::consts::PI * 1e-4);
             let pos = rot * Vector::new(0.0, PLANET_RADIUS + 0.1, 0.0);
-            assert!(ball_contacts(&planet, dbg!(pos), 1.0) > 0);
+            assert!(ball_contacts(&planet, pos, 1.0) > 0);
         }
     }
 

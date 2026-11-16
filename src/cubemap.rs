@@ -33,9 +33,10 @@ impl<T> CubeMap<T> {
     /// cubemap's data. The addressed memory must outlive `'a` and have no outstanding unique
     /// borrows.
     pub unsafe fn from_raw<'a>(ptr: *const u32) -> &'a Self {
-        let dim = ptr.read() as usize;
+        let dim = unsafe { ptr.read() } as usize;
         let len = dim * dim * 6;
-        &*(ptr::slice_from_raw_parts(ptr, len) as *const Self)
+        // SAFETY: the caller guarantees a valid, aligned allocation for the entire DST.
+        unsafe { &*(ptr::slice_from_raw_parts(ptr, len) as *const Self) }
     }
 
     /// Uniquely access a cubemap in existing memory
@@ -45,9 +46,10 @@ impl<T> CubeMap<T> {
     /// `ptr` must address a `u32` containing the cubemap's resolution, positioned just before the
     /// cubemap's data. The addressed memory must outlive `'a` and have no outstanding borrows.
     pub unsafe fn from_raw_mut<'a>(ptr: *mut u32) -> &'a mut Self {
-        let dim = ptr.read() as usize;
+        let dim = unsafe { ptr.read() } as usize;
         let len = dim * dim * 6;
-        &mut *(ptr::slice_from_raw_parts_mut(ptr, len) as *mut Self)
+        // SAFETY: the caller guarantees an exclusive, aligned allocation for the entire DST.
+        unsafe { &mut *(ptr::slice_from_raw_parts_mut(ptr, len) as *mut Self) }
     }
 
     /// Construct a cube map with faces containing `resolution * resolution` slots, each initialized
@@ -1171,7 +1173,6 @@ mod test {
     fn warp_roundtrip() {
         for i in -100..100 {
             let x = i as f32 / 100.0;
-            dbg!(i);
             assert_abs_diff_eq!(x, unwarp(warp(x)));
         }
     }
