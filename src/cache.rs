@@ -10,8 +10,10 @@ struct Slot {
     chunk: Chunk,
     /// Whether the slot is ready for reading
     ready: bool,
-    /// Sequence number of the most recent frame this slot was rendered in
+    /// Sequence number of the most recent frame this slot was visited in
     in_frame: u64,
+    /// Whether this slot belongs to the current visible render cut
+    drawn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,9 @@ impl Manager {
         if let Some(list) = visited.as_deref_mut() {
             list.clear();
         }
+        for &(_, _, slot) in &self.render {
+            self.chunks[slot as usize].drawn = false;
+        }
         self.render.clear();
         self.walk(viewpoints, transfer, &mut visited);
 
@@ -170,9 +175,9 @@ impl Manager {
     /// Allocate a slot for writing
     ///
     /// Determines where in the cache to transfer chunk data to. Returns `None` if the cache is
-    /// full.
+    /// full or the chunk already has a slot (pending or ready).
     pub fn allocate(&mut self, chunk: Chunk) -> Option<u32> {
-        if self.chunks.len() == self.chunks.capacity() {
+        if self.index.contains_key(&chunk) || self.chunks.len() == self.chunks.capacity() {
             return None;
         }
         let entry = self.chunks.vacant_entry();
@@ -181,6 +186,7 @@ impl Manager {
             chunk,
             ready: false,
             in_frame: 0,
+            drawn: false,
         });
         let old = self.index.insert(chunk, slot);
         debug_assert!(
@@ -251,6 +257,12 @@ impl Manager {
             );
         }
 
+        // Only actually drawn chunks can be stitching neighbors. Resident
+        // parents of fully resolved child groups are not part of this cut.
+        for &(_, _, slot) in &self.render {
+            self.chunks[slot as usize].drawn = true;
+        }
+
         // Compute the neighborhood of each rendered chunk.
         for &mut (chunk, ref mut neighborhood, _) in &mut self.render {
             for (edge, neighbor) in Edge::iter().zip(chunk.neighbors().iter()) {
@@ -260,7 +272,7 @@ impl Manager {
                         Some(&x) => x,
                     };
                     let state = &self.chunks[slot as usize];
-                    if state.ready && state.in_frame == self.frame {
+                    if state.drawn {
                         neighborhood[edge] =
                             (chunk.depth - x.depth).min(self.config.max_neighbor_delta);
                         break;
@@ -411,6 +423,26 @@ fn needs_subdivision(chunk: &Chunk, viewpoint: &na::Point3<f64>) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn duplicate_allocation_preserves_cache_slot_identity() {
+        let mut manager = Manager::new(2, Config::default());
+        let first = Chunk::root(Face::Px);
+        let second = Chunk::root(Face::Py);
+        let slot = manager.allocate(first).unwrap();
+        assert_eq!(manager.allocate(first), None);
+        let other_slot = manager.allocate(second).unwrap();
+        assert_ne!(slot, other_slot);
+        assert_eq!(manager.cancel(slot), Ok(first));
+        assert_eq!(manager.cancel(other_slot), Ok(second));
+        let reused = manager.allocate(first).unwrap();
+        manager.release(reused);
+        assert_eq!(
+            manager.cancel(reused),
+            Err(CancelError::CompletedSlot(reused))
+        );
+        assert_eq!(manager.allocate(first), None);
+    }
 
     #[test]
     fn cancellation_releases_only_unfinished_slots_and_can_be_reallocated() {
@@ -644,6 +676,101 @@ mod test {
             transfers.clear();
             mgr.update(&[viewpoint], &mut transfers);
             assert_eq!(transfers.len(), expected - actual);
+        }
+    }
+
+    #[test]
+    fn lod_neighborhood_refers_only_to_actually_rendered_chunks() {
+        use std::collections::HashSet;
+
+        let mut manager = Manager::new(
+            4096,
+            Config {
+                max_depth: 4,
+                max_neighbor_delta: u8::MAX,
+            },
+        );
+        let viewpoints = [
+            na::Point3::new(1.001, 0.5, 0.5),
+            na::Point3::new(-0.75, 0.5, -1.0),
+        ];
+        let mut transfers = Vec::new();
+        manager.update(&viewpoints, &mut transfers);
+        // Fully resolve coarse levels, with only selected complete groups of
+        // deeper children. This models partial splits and asymmetric streaming.
+        for chunk in transfers {
+            if chunk.depth <= 2
+                || (chunk.depth == 3 && (chunk.coords.x / 2 + chunk.coords.y / 2) % 2 == 0)
+            {
+                let slot = manager.allocate(chunk).unwrap();
+                manager.release(slot);
+            }
+        }
+        manager.update(&viewpoints, &mut Vec::new());
+        let rendered = manager.renderable();
+        assert!(!rendered.is_empty());
+        let visible: HashSet<_> = rendered.iter().map(|(chunk, _, _)| *chunk).collect();
+        for (chunk, neighborhood, _) in rendered {
+            for (edge, neighbor) in Edge::iter().zip(chunk.neighbors()) {
+                let expected = neighbor
+                    .path()
+                    .find(|candidate| visible.contains(candidate))
+                    .map_or(0, |candidate| chunk.depth - candidate.depth);
+                assert_eq!(
+                    neighborhood[edge], expected,
+                    "chunk {chunk:?} edge {edge:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lod_neighborhood_invariant_across_incremental_teleports() {
+        use std::collections::HashSet;
+        let mut manager = Manager::new(
+            4096,
+            Config {
+                max_depth: 6,
+                max_neighbor_delta: u8::MAX,
+            },
+        );
+        let viewpoints = [
+            na::Point3::new(1.001, 0.1, 0.1),
+            na::Point3::new(-1.001, 0.4, 0.2),
+            na::Point3::new(0.2, 1.001, 0.2),
+            na::Point3::new(0.1, -1.001, -0.2),
+            na::Point3::new(0.3, 0.1, 1.001),
+            na::Point3::new(-0.2, 0.1, -1.001),
+        ];
+        let mut transfers = Vec::new();
+        for frame in 0..120 {
+            let viewpoint = viewpoints[(frame / 10) % viewpoints.len()];
+            manager.update(&[viewpoint], &mut transfers);
+            for (idx, &chunk) in transfers.iter().enumerate() {
+                if chunk.depth == 0 || idx % 3 == frame % 3 {
+                    if let Some(slot) = manager.allocate(chunk) {
+                        manager.release(slot);
+                    }
+                }
+            }
+            manager.update(&[viewpoint], &mut transfers);
+            let visible: HashSet<_> = manager
+                .renderable()
+                .iter()
+                .map(|(chunk, _, _)| *chunk)
+                .collect();
+            for (chunk, neighborhood, _) in manager.renderable() {
+                for (edge, neighbor) in Edge::iter().zip(chunk.neighbors()) {
+                    let expected = neighbor
+                        .path()
+                        .find(|candidate| visible.contains(candidate))
+                        .map_or(0, |candidate| chunk.depth - candidate.depth);
+                    assert_eq!(
+                        neighborhood[edge], expected,
+                        "frame {frame} chunk {chunk:?} edge {edge:?}"
+                    );
+                }
+            }
         }
     }
 

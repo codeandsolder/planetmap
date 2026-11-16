@@ -38,6 +38,6 @@ interpolation in a vertex shader.
 
 - `parry` exposes helpers for rapier-compatible collision
   detection against the surface of a radial heightmap
-- `simd` exposes `simdeez`-based iterators for data-parallel
+- `fearless_simd` exposes `fearless_simd`-based iterators for data-parallel
   computation of sample coordinates within a `Chunk` or
-  `chunk::Coord`, useful for fast noise sampling
+  `cubemap::Coords`, useful for fast noise sampling
