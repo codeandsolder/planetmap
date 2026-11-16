@@ -48,9 +48,12 @@ impl<T> CubeMap<T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must address a `u32` containing the cubemap's resolution, positioned just before the
-    /// cubemap's data. The addressed memory must outlive `'a` and have no outstanding unique
-    /// borrows.
+    /// `ptr` must point to the aligned start of a fully initialized `#[repr(C)]`
+    /// `CubeMap<T>` allocation, with a valid `u32` resolution and exactly
+    /// `6 * resolution * resolution` initialized `T` values. The payload follows
+    /// the header at the alignment required by `T` (and may have padding).
+    /// The entire DST must be valid for shared reads for `'a`, with no mutable
+    /// borrows during that lifetime. The metadata length must fit in `usize`.
     #[must_use]
     pub const unsafe fn from_raw<'a>(ptr: *const u32) -> &'a Self {
         // SAFETY: caller guarantees a valid, aligned u32 header.
@@ -64,8 +67,12 @@ impl<T> CubeMap<T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must address a `u32` containing the cubemap's resolution, positioned just before the
-    /// cubemap's data. The addressed memory must outlive `'a` and have no outstanding borrows.
+    /// `ptr` must point to the aligned start of a fully initialized `#[repr(C)]`
+    /// `CubeMap<T>` allocation, with a valid `u32` resolution and exactly
+    /// `6 * resolution * resolution` initialized `T` values. The payload follows
+    /// the header at the alignment required by `T` (and may have padding).
+    /// The entire DST must be exclusively accessible for `'a`. The metadata
+    /// length must fit in `usize`, and no other references may alias the data.
     #[must_use]
     pub const unsafe fn from_raw_mut<'a>(ptr: *mut u32) -> &'a mut Self {
         // SAFETY: caller guarantees a valid, aligned u32 header.
@@ -206,6 +213,10 @@ impl<T> IndexMut<Face> for CubeMap<T> {
 impl<T> Index<Coords> for CubeMap<T> {
     type Output = T;
     fn index(&self, coord: Coords) -> &T {
+        assert!(
+            coord.x < self.resolution && coord.y < self.resolution,
+            "cube map cell coordinates out of bounds"
+        );
         let face_size = self.resolution as usize * self.resolution as usize;
         let offset = face_size * coord.face as usize;
         &self.data[offset + self.resolution as usize * coord.y as usize + coord.x as usize]
@@ -214,6 +225,10 @@ impl<T> Index<Coords> for CubeMap<T> {
 
 impl<T> IndexMut<Coords> for CubeMap<T> {
     fn index_mut(&mut self, coord: Coords) -> &mut T {
+        assert!(
+            coord.x < self.resolution && coord.y < self.resolution,
+            "cube map cell coordinates out of bounds"
+        );
         let face_size = self.resolution as usize * self.resolution as usize;
         let offset = face_size * coord.face as usize;
         &mut self.data[offset + self.resolution as usize * coord.y as usize + coord.x as usize]
@@ -573,57 +588,124 @@ impl Coords {
         ]
     }
 
-    /// Select all `Coords` intersecting a cone opening towards `direction` with half-angle `theta`
+    /// Conservatively select cells intersecting a spherical cone around `direction`.
+    ///
+    /// The bounds are computed in 3D before projecting to each cube face, so
+    /// wide cones and cones that cross the horizon of a face remain covered.
+    /// Invalid directions, negative/non-finite angles, and zero resolution
+    /// produce an empty iterator.
     pub fn neighborhood(
         resolution: u32,
         direction: na::Vector3<f32>,
         theta: f32,
     ) -> impl Iterator<Item = Self> {
-        /// Map [-1, 1] to [0, 1]
-        fn remap(x: f32) -> f32 {
-            na::clamp(x, -1.0, 1.0).midpoint(1.0)
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cubemap discretization is defined in f32 and the coordinate is bounded to [0, 1]"
+        )]
+        fn to_grid(x: f64) -> f32 {
+            (unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0) as f32).clamp(0.0, 1.0)
         }
+
+        // Range of one component of a unit vector inside an angular cap.
+        // The extrema may be at the +/- cardinal directions, not the rim.
+        fn cap_range(axis: f64, cos: f64, sin: f64) -> (f64, f64) {
+            let perpendicular = axis.mul_add(-axis, 1.0).max(0.0).sqrt() * sin;
+            let min = if -axis >= cos {
+                -1.0
+            } else {
+                axis.mul_add(cos, -perpendicular)
+            };
+            let max = if axis >= cos {
+                1.0
+            } else {
+                axis.mul_add(cos, perpendicular)
+            };
+            (min, max)
+        }
+
+        // Exact maximum angular dot product for points in the face's
+        // projective square. The maximum is attained at an interior point,
+        // a stationary point on one of its four edges, or a corner.
+        fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
+            if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
+                return 1.0;
+            }
+            let mut best = f64::NEG_INFINITY;
+            let mut consider = |x: f64, y: f64| {
+                let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
+                let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
+                best = best.max(dot / length);
+            };
+            for edge in [-1.0, 1.0] {
+                for corner in [-1.0, 1.0] {
+                    consider(edge, corner);
+                }
+                let x_edge = direction.x.mul_add(edge, direction.z);
+                if x_edge > 0.0 {
+                    consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
+                }
+                let y_edge = direction.y.mul_add(edge, direction.z);
+                if y_edge > 0.0 {
+                    consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
+                }
+            }
+            best
+        }
+
+        let valid = resolution != 0 && theta.is_finite() && theta >= 0.0;
+        let axis = na::Vector3::new(
+            f64::from(direction.x),
+            f64::from(direction.y),
+            f64::from(direction.z),
+        );
+        let axis = axis.try_normalize(1.0e-30);
+        // The small angular margin includes face and texel boundaries after
+        // the final f32 discretization, without moving interior samples.
+        let angle = (f64::from(theta) + 1.0e-6).min(std::f64::consts::PI);
+        let (sin, cos) = angle.sin_cos();
         Face::iter()
             .filter_map(move |face| {
-                let basis = face.basis();
-                if (basis * na::Vector3::z()).dot(&direction) <= 0.0 {
-                    // TODO: Handle theta ≥ π/2
+                if !valid {
                     return None;
                 }
-                let local = basis.inverse_transform_vector(&direction);
-                let rot_x = na::UnitQuaternion::from_axis_angle(&na::Vector3::y_axis(), theta);
-                let rot_y = na::UnitQuaternion::from_axis_angle(&na::Vector3::x_axis(), -theta);
-                let coords_with = |r| {
-                    let w: na::Vector3<f32> = r * local;
-                    w.xy() / w.z
+                let axis = axis?;
+                let local = face.basis::<f64>().inverse_transform_vector(&axis);
+                // Reject faces that the cone cannot physically reach. Without
+                // this check, a tiny cone near a face's horizon could scan
+                // every texel of that face due to the 1/z projection.
+                if face_max_dot(local) < cos {
+                    return None;
+                }
+                let (lo_x, hi_x) = cap_range(local.x, cos, sin);
+                let (lo_y, hi_y) = cap_range(local.y, cos, sin);
+                let (lo_z, hi_z) = cap_range(local.z, cos, sin);
+                if hi_z <= 0.0 {
+                    return None;
+                }
+                let ((x_min, y_min), (x_max, y_max)) = if lo_z <= 0.0 {
+                    // The cone touches the projection horizon; even finite
+                    // component bounds can correspond to unbounded x/z,y/z.
+                    ((-1.0, -1.0), (1.0, 1.0))
+                } else {
+                    let ratio_min = |lo: f64| if lo < 0.0 { lo / lo_z } else { lo / hi_z };
+                    let ratio_max = |hi: f64| if hi > 0.0 { hi / lo_z } else { hi / hi_z };
+                    (
+                        (ratio_min(lo_x), ratio_min(lo_y)),
+                        (ratio_max(hi_x), ratio_max(hi_y)),
+                    )
                 };
-                let lower_x = coords_with(rot_x.inverse()).x;
-                if lower_x > 1.0 {
+                if x_min > 1.0 || y_min > 1.0 || x_max < -1.0 || y_max < -1.0 {
                     return None;
                 }
-                let lower_y = coords_with(rot_y.inverse()).y;
-                if lower_y > 1.0 {
-                    return None;
-                }
-                let lower = na::Vector2::new(lower_x, lower_y);
-
-                let upper_x = coords_with(rot_x).x;
-                if upper_x < -1.0 {
-                    return None;
-                }
-                let upper_y = coords_with(rot_y).y;
-                if upper_y < -1.0 {
-                    return None;
-                }
-                let upper = na::Vector2::new(upper_x, upper_y);
-
-                Some((face, lower.map(unwarp), upper.map(unwarp)))
+                let (x0, y0) =
+                    discretize(resolution, na::Point2::new(to_grid(x_min), to_grid(y_min)));
+                let (x1, y1) =
+                    discretize(resolution, na::Point2::new(to_grid(x_max), to_grid(y_max)));
+                Some((face, x0, x1, y0, y1))
             })
-            .flat_map(move |(face, lower, upper)| {
-                let (x_lower, y_lower) = discretize(resolution, na::Point2::from(lower.map(remap)));
-                let (x_upper, y_upper) = discretize(resolution, na::Point2::from(upper.map(remap)));
-                (y_lower..=y_upper)
-                    .flat_map(move |y| (x_lower..=x_upper).map(move |x| Self { x, y, face }))
+            .flat_map(move |(face, x0, x1, y0, y1)| {
+                (y0..=y1).flat_map(move |y| (x0..=x1).map(move |x| Self { x, y, face }))
             })
     }
 
@@ -1047,6 +1129,42 @@ mod test {
     }
 
     #[test]
+    fn invalid_coordinate_never_aliases_adjacent_cells_or_faces() {
+        let mut map = CubeMap::new(2, 0_u32).unwrap();
+        let valid = Coords {
+            x: 1,
+            y: 0,
+            face: Face::Px,
+        };
+        map[valid] = 42;
+        assert_eq!(map[valid], 42);
+        for (x, y) in [(2, 0), (0, 2), (u32::MAX, 0)] {
+            let invalid = Coords {
+                x,
+                y,
+                face: Face::Px,
+            };
+            assert!(std::panic::catch_unwind(|| {
+                let _ = map[invalid];
+            })
+            .is_err());
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                map[invalid] = 99;
+            }))
+            .is_err());
+        }
+        assert_eq!(map[valid], 42);
+        assert_eq!(
+            map[Coords {
+                x: 0,
+                y: 0,
+                face: Face::Nx
+            }],
+            0
+        );
+    }
+
+    #[test]
     fn cubemap_aligned_elements() {
         #[repr(align(64))]
         #[derive(Clone)]
@@ -1343,6 +1461,41 @@ mod test {
                     let (actual_face, actual_p) = Face::coords(&v);
                     assert_eq!(face, actual_face);
                     assert_abs_diff_eq!(p, actual_p);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neighborhood_contains_every_sample_direction_within_cone() {
+        use std::collections::HashSet;
+        const RESOLUTION: u32 = 8;
+        let directions = [
+            na::Vector3::new(0.1, 1.0, 0.0),
+            na::Vector3::new(1.0, 0.1, 0.0),
+            na::Vector3::new(-0.2, 0.3, 1.0),
+            na::Vector3::new(0.4, 0.8, -1.0),
+            na::Vector3::new(-0.8, -0.2, -0.3),
+            na::Vector3::new(0.5, -1.0, 0.25),
+        ];
+        for direction in directions {
+            let axis = direction.normalize();
+            for theta in [0.01_f32, 0.2, 0.5, 0.8, 1.2, 1.8, std::f32::consts::PI] {
+                let actual: HashSet<_> =
+                    Coords::neighborhood(RESOLUTION, direction, theta).collect();
+                for face in Face::iter() {
+                    for y in 0..RESOLUTION {
+                        for x in 0..RESOLUTION {
+                            let coords = Coords { x, y, face };
+                            let sample = coords.center::<f32>(RESOLUTION);
+                            if axis.dot(sample.as_ref()) > theta.cos() + 1e-4 {
+                                assert!(
+                                    actual.contains(&coords),
+                                    "missed {coords:?} for direction {direction:?} theta {theta}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
