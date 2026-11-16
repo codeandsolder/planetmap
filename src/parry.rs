@@ -4,7 +4,10 @@
 //! query dispatcher that handles both planets and standard shapes can be constructed with
 //! `PlanetDispatcher.chain(DefaultQueryDispatcher)`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BinaryHeap,
+    sync::{Arc, Mutex},
+};
 
 use glam::UVec2;
 use hashbrown::hash_map;
@@ -490,6 +493,140 @@ fn raycast_quad_edges(
     closest
 }
 
+/// A rectangular group of terrain patches in the cubemap, ordered by a
+/// conservative lower bound on the distance to any triangle it contains.
+///
+/// Each undisplaced mesh vertex is a convex combination of four unit corner
+/// directions of its patch. Since cubemap warp is monotonic and each patch is
+/// inside this rectangle, every vertex is inside a cone around the rectangle
+/// center. Its length is in [`cos(half_angle)`, 1]. Adding terrain height gives
+/// the radial interval used by the lower-distance bound below.
+#[derive(Clone, Copy, Debug)]
+struct ProjectionRegion {
+    face: crate::cubemap::Face,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+    lower_distance2: f64,
+}
+
+/// The immutable query geometry shared by all cubemap hierarchy nodes.
+struct ProjectionQuery {
+    resolution: u32,
+    query_axis: Vector,
+    query_radius: f64,
+    planet_radius: f64,
+    min_height: f64,
+    max_height: f64,
+}
+
+impl ProjectionRegion {
+    fn new(
+        face: crate::cubemap::Face,
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        y1: u32,
+        query: &ProjectionQuery,
+    ) -> Self {
+        let scale = 2.0 / f64::from(query.resolution);
+        let face_direction = |x: f64, y: f64| {
+            let d = face.direction(&na::Point2::new(
+                x.mul_add(scale, -1.0),
+                y.mul_add(scale, -1.0),
+            ));
+            Vector::new(d.x, d.y, d.z)
+        };
+        let center = face_direction(
+            f64::from(x0).midpoint(f64::from(x1)),
+            f64::from(y0).midpoint(f64::from(y1)),
+        );
+        // All unit directions in this warped cubemap rectangle lie inside
+        // the positive cone spanned by its four corners. For our centered
+        // axis, the minimum dot product over that cone is bounded by the
+        // minimum over its corners (the normalization can only increase a
+        // positive center dot product of a convex combination).
+        let mut min_cos = 1.0_f64;
+        for x in [x0, x1] {
+            for y in [y0, y1] {
+                min_cos = min_cos.min(center.dot(face_direction(f64::from(x), f64::from(y))));
+            }
+        }
+        // Account for rounding of warp, the face rotation, and corner dot
+        // products when using the bound to prune an entire subtree.
+        min_cos = 64.0f64.mul_add(-f64::EPSILON, min_cos).clamp(0.0, 1.0);
+        let min_radius = query.planet_radius.mul_add(min_cos, query.min_height);
+        let max_radius = query.planet_radius + query.max_height;
+        let lower_distance2 = if min_radius <= 0.0 {
+            // A large negative allowed height can invert a coarse patch's
+            // local radial direction. Do not prune unless all possible
+            // triangle points have a positive radius in the cone.
+            0.0
+        } else {
+            let cos_center = center.dot(query.query_axis).clamp(-1.0, 1.0);
+            let cos_distance = if cos_center >= min_cos {
+                1.0
+            } else {
+                let sin_center = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
+                let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
+                cos_center.mul_add(min_cos, sin_center * sin_cone).min(1.0)
+            };
+            // Closest possible radius at this angular distance, clamped to
+            // the global height envelope and chord sag of this region.
+            let radius = (query.query_radius * cos_distance).clamp(min_radius, max_radius);
+            let delta = query.query_radius - radius;
+            let bound2 = delta.mul_add(
+                delta,
+                2.0 * query.query_radius * radius * (1.0 - cos_distance),
+            );
+            let rounding =
+                128.0 * f64::EPSILON * (query.query_radius + max_radius + query.planet_radius);
+            (bound2.max(0.0).sqrt() - rounding).max(0.0).powi(2)
+        };
+        Self {
+            face,
+            x0,
+            x1,
+            y0,
+            y1,
+            lower_distance2,
+        }
+    }
+}
+
+impl PartialEq for ProjectionRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.lower_distance2
+            .total_cmp(&other.lower_distance2)
+            .is_eq()
+            && (self.face as u8, self.x0, self.x1, self.y0, self.y1)
+                == (other.face as u8, other.x0, other.x1, other.y0, other.y1)
+    }
+}
+impl Eq for ProjectionRegion {}
+impl PartialOrd for ProjectionRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ProjectionRegion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .lower_distance2
+            .total_cmp(&self.lower_distance2)
+            .then_with(|| {
+                (self.face as u8, self.x0, self.x1, self.y0, self.y1).cmp(&(
+                    other.face as u8,
+                    other.x0,
+                    other.x1,
+                    other.y0,
+                    other.y1,
+                ))
+            })
+    }
+}
+
 impl PointQuery for Planet {
     fn project_local_point(&self, pt: Vector, solid: bool) -> PointProjection {
         if solid && pt.length_squared() < self.min_radius() * self.min_radius() {
@@ -500,25 +637,101 @@ impl PointQuery for Planet {
     }
 
     fn project_local_point_and_get_feature(&self, pt: Vector) -> (PointProjection, FeatureId) {
-        // TODO: Optimize/fix this by projecting `pt` onto the cubemap, then scanning *outward* from
-        // the quad containing the projected point until all remaining triangles must be further
-        // than the closest triangle found so far, regardless of height
-        let coords = Coords::from_vector(self.terrain.face_resolution(), &na3f32(pt));
-        let distance2 = |x: Vector| x.distance_squared(pt);
-        let cache = &mut *self
+        // Search the actual nearest triangle, not merely the tile intersected
+        // by the ray from the planet center through the query. Tall cliffs,
+        // patch boundaries, and points near the center can all have their
+        // nearest surface on a different tile or even a different cube face.
+        let face_resolution = self.terrain.face_resolution();
+        let query_radius = pt.length();
+        if !query_radius.is_finite() {
+            return (PointProjection::new(false, pt), FeatureId::Unknown);
+        }
+        let query = ProjectionQuery {
+            resolution: face_resolution,
+            query_radius,
+            query_axis: if query_radius > 0.0 {
+                pt / query_radius
+            } else {
+                Vector::X
+            },
+            planet_radius: self.radius,
+            min_height: f64::from(self.terrain.min_height()),
+            max_height: f64::from(self.terrain.max_height()),
+        };
+        let mut regions = BinaryHeap::new();
+        for face in crate::cubemap::Face::iter() {
+            regions.push(ProjectionRegion::new(
+                face,
+                0,
+                face_resolution,
+                0,
+                face_resolution,
+                &query,
+            ));
+        }
+
+        // The tuple retains the winning grid location, rather than a cache
+        // slot that might be evicted while exploring subsequent regions.
+        let mut nearest: Option<(f64, Coords, u32, PointProjection, FeatureId)> = None;
+        while let Some(region) = regions.pop() {
+            let best_distance2 = nearest.as_ref().map_or(f64::INFINITY, |x| x.0);
+            if region.lower_distance2 > best_distance2 {
+                break;
+            }
+            if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
+                let coords = Coords {
+                    face: region.face,
+                    x: region.x0,
+                    y: region.y0,
+                };
+                let (_, data) = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(self, &coords);
+                let patch = Patch::new(&coords, face_resolution);
+                for (idx, tri) in patch.triangles(self.radius, self.chunk_resolution, &data.samples)
+                {
+                    let (projection, feature) = tri.project_local_point_and_get_feature(pt);
+                    let dist2 = projection.point.distance_squared(pt);
+                    if dist2 < best_distance2 && nearest.as_ref().is_none_or(|x| dist2 < x.0) {
+                        nearest = Some((dist2, coords, idx, projection, feature));
+                    }
+                }
+                continue;
+            }
+
+            let mid_x = region.x0 + (region.x1 - region.x0) / 2;
+            let mid_y = region.y0 + (region.y1 - region.y0) / 2;
+            // Do not create empty rectangles when one axis is already one tile wide.
+            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
+                if x0 == x1 {
+                    continue;
+                }
+                for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
+                    if y0 == y1 {
+                        continue;
+                    }
+                    let candidate = ProjectionRegion::new(region.face, x0, x1, y0, y1, &query);
+                    if candidate.lower_distance2 <= best_distance2 {
+                        regions.push(candidate);
+                    }
+                }
+            }
+        }
+
+        let Some((_, coords, triangle, mut projection, feature)) = nearest else {
+            return (PointProjection::new(false, pt), FeatureId::Unknown);
+        };
+        // The winning slot could have been evicted even when the geometry Arc
+        // stayed valid for the projection. Reacquire it to return a current ID.
+        let (slot, _) = self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (slot, data) = cache.get(self, &coords);
-        let patch = Patch::new(&coords, self.terrain.face_resolution());
-        let (idx, (mut nearest, feature)) = patch
-            .triangles(self.radius, self.chunk_resolution, &data.samples)
-            .map(|(i, tri)| (i, tri.project_local_point_and_get_feature(pt)))
-            .min_by(|(_, (x, _)), (_, (y, _))| distance2(x.point).total_cmp(&distance2(y.point)))
-            .unwrap_or_else(|| (0, (PointProjection::new(false, pt), FeatureId::Unknown)));
-        // TODO: Check neighborhood, so we don't miss as many cliff faces
-        nearest.subshape = self.subshape_id(slot, idx);
-        (nearest, feature)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        projection.subshape = self.subshape_id(slot, triangle);
+        (projection, feature)
     }
 }
 
@@ -1492,6 +1705,238 @@ mod tests {
         fn max_height(&self) -> f32 {
             self.max
         }
+    }
+
+    /// Terrain with deliberate patch-to-patch cliffs, so the globally
+    /// closest triangle need not have the query point's cubemap address.
+    struct ProjectionTerrain {
+        face_resolution: u32,
+        peak: Option<Coords>,
+        patterned: bool,
+        samples: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Terrain for ProjectionTerrain {
+        fn sample(&self, coords: &Coords, out: &mut [f32]) {
+            self.samples
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let height = if self.patterned {
+                let hash = (coords.face as u32)
+                    .wrapping_mul(7)
+                    .wrapping_add(coords.x.wrapping_mul(13))
+                    .wrapping_add(coords.y.wrapping_mul(17));
+                (hash % 6) as f32 - 1.0
+            } else if self.peak == Some(*coords) {
+                5.0
+            } else {
+                0.0
+            };
+            out.fill(height);
+        }
+        fn face_resolution(&self) -> u32 {
+            self.face_resolution
+        }
+        fn chunk_resolution(&self) -> u32 {
+            3
+        }
+        fn min_height(&self) -> f32 {
+            if self.patterned {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        fn max_height(&self) -> f32 {
+            5.0
+        }
+    }
+
+    /// Exhaustive reference over *all* triangles, used only at tiny grid
+    /// resolutions to test spatial pruning independently of the cache.
+    fn brute_force_projection(planet: &Planet, pt: Vector) -> (f64, Vector, Coords) {
+        let mut winner = None;
+        for face in Face::iter() {
+            for y in 0..planet.terrain.face_resolution() {
+                for x in 0..planet.terrain.face_resolution() {
+                    let coords = Coords { face, x, y };
+                    let samples = planet.sample(&coords);
+                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    for (_, tri) in
+                        patch.triangles(planet.radius, planet.chunk_resolution, &samples)
+                    {
+                        let projection = tri.project_local_point(pt, false);
+                        let distance2 = projection.point.distance_squared(pt);
+                        if winner
+                            .as_ref()
+                            .is_none_or(|(best, _, _): &(f64, Vector, Coords)| distance2 < *best)
+                        {
+                            winner = Some((distance2, projection.point, coords));
+                        }
+                    }
+                }
+            }
+        }
+        winner.expect("nonempty terrain mesh")
+    }
+
+    #[test]
+    fn projection_finds_cliff_across_adjacent_patch_and_cube_face() {
+        let near = Coords {
+            x: 1,
+            y: 1,
+            face: Face::Pz,
+        };
+        let across_face = Coords {
+            x: 3,
+            y: 1,
+            face: Face::Pz,
+        };
+        for (low, high, uv) in [
+            (near, Coords { x: 2, ..near }, [0.98, 0.5]),
+            (across_face, across_face.neighbors(4)[Edge::Px], [0.98, 0.5]),
+        ] {
+            let source = Arc::new(ProjectionTerrain {
+                face_resolution: 4,
+                peak: Some(high),
+                patterned: false,
+                samples: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let planet = Planet::new(source, 1, 10.0).unwrap();
+            let direction = low.direction(4, &na::Point2::from(uv)).into_inner();
+            let query = Vector::new(direction.x, direction.y, direction.z) * 15.0;
+            assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+            let (expected_dist2, expected_pt, winning_patch) =
+                brute_force_projection(&planet, query);
+            assert_eq!(winning_patch, high);
+            let (actual, _) = planet.project_local_point_and_get_feature(query);
+            assert_relative_eq!(actual.point, expected_pt, epsilon = 1.0e-9);
+            assert_relative_eq!(
+                actual.point.distance_squared(query),
+                expected_dist2,
+                epsilon = 1.0e-9
+            );
+            let slot = actual.subshape / planet.triangles_per_chunk();
+            let cache = planet.cache.lock().unwrap();
+            assert_eq!(
+                cache
+                    .slots
+                    .iter()
+                    .find(|(id, _)| *id == slot)
+                    .unwrap()
+                    .1
+                    .coords,
+                winning_patch
+            );
+        }
+    }
+
+    #[test]
+    fn projection_matches_exhaustive_mesh_at_boundaries_and_varied_radii() {
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 3,
+            peak: None,
+            patterned: true,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(source, 3, 10.0).unwrap();
+        let mut points = vec![Vector::ZERO];
+        for face in Face::iter() {
+            for uv in [[0.0, 0.0], [0.99, 0.01], [0.51, 0.50], [1.0, 1.0]] {
+                let coords = Coords { x: 1, y: 1, face };
+                let dir = coords.direction(3, &na::Point2::from(uv)).into_inner();
+                let axis = Vector::new(dir.x, dir.y, dir.z);
+                for distance in [5.0, 11.0, 16.0] {
+                    points.push(axis * distance);
+                }
+            }
+        }
+        // Deterministic, off-axis queries prevent the exhaustive reference
+        // from accidentally sharing the same symmetry or face-edge behavior.
+        let mut state = 0x00c0_ffee_5eed_1234_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 32) as u32) as f64 / f64::from(u32::MAX)
+        };
+        for _ in 0..128 {
+            let axis =
+                Vector::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0, next() * 2.0 - 1.0).normalize();
+            points.push(axis * (2.0 + next() * 20.0));
+        }
+        for (index, point) in points.into_iter().enumerate() {
+            let (expected_dist2, _, _) = brute_force_projection(&planet, point);
+            let (actual, _) = planet.project_local_point_and_get_feature(point);
+            assert!(
+                (actual.point.distance_squared(point) - expected_dist2).abs() < 1.0e-9,
+                "query index {index}: {point:?}, expected {expected_dist2}, actual {:?}",
+                actual.point.distance_squared(point)
+            );
+            // Multiple triangles can be equally close at different points;
+            // compare the global minimum distance, not a particular tie-break.
+            assert!(actual.point.is_finite());
+        }
+    }
+
+    #[test]
+    fn projection_handles_negative_radial_interpolation() {
+        struct InwardTerrain;
+        impl Terrain for InwardTerrain {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                out.fill(if coords.face == Face::Px { -9.0 } else { 0.0 });
+            }
+            fn face_resolution(&self) -> u32 {
+                1
+            }
+            fn chunk_resolution(&self) -> u32 {
+                3
+            }
+            fn min_height(&self) -> f32 {
+                -9.0
+            }
+            fn max_height(&self) -> f32 {
+                0.0
+            }
+        }
+        let planet = Planet::new(Arc::new(InwardTerrain), 1, 10.0).unwrap();
+        // The coarse +X patch has corners at radius one, but its interpolation
+        // can have length < 0.9 and an inward height displaces it past zero.
+        // Such triangles cannot be pruned using a positive-radius-only cone.
+        for point in [
+            Vector::ZERO,
+            Vector::X,
+            -Vector::X,
+            Vector::Y * 5.0,
+            Vector::new(0.8, -0.9, 0.4),
+            Vector::new(8.0, 2.0, 1.0),
+        ] {
+            let (expected_dist2, _, _) = brute_force_projection(&planet, point);
+            let projected = planet.project_local_point(point, false);
+            assert_relative_eq!(
+                projected.point.distance_squared(point),
+                expected_dist2,
+                epsilon = 1.0e-9
+            );
+        }
+    }
+
+    #[test]
+    fn projection_near_surface_avoids_scanning_entire_planet() {
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 4096,
+            peak: None,
+            patterned: false,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(Arc::clone(&source) as Arc<dyn Terrain>, 8, 100.0).unwrap();
+        let query = Vector::new(100.1, 0.2, 0.1);
+        let projected = planet.project_local_point(query, false);
+        assert!(projected.point.distance(query) < 0.3);
+        let visited = source.samples.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            visited < 1000,
+            "searched {visited} patches for near-surface query"
+        );
     }
 
     #[test]
