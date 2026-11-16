@@ -26,7 +26,7 @@ fn face_coords(c: &mut Criterion) {
 }
 
 fn cache(c: &mut Criterion) {
-    let mut mgr = CacheManager::new(2048, Default::default());
+    let mut mgr = CacheManager::new(2048, Default::default()).expect("valid benchmark cache");
     let mut transfers = Vec::with_capacity(2048);
     mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
     resolve_transfers(&mut mgr, &mut transfers);
@@ -35,7 +35,7 @@ fn cache(c: &mut Criterion) {
         b.iter(|| mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers));
     });
 
-    let mut mgr = CacheManager::new(2048, Default::default());
+    let mut mgr = CacheManager::new(2048, Default::default()).expect("valid benchmark cache");
     mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
     resolve_transfers(&mut mgr, &mut transfers);
     let diagonal1 = na::Point3::from(-na::Vector3::new(1.0, 1.0, 1.0).normalize());
@@ -68,10 +68,11 @@ fn collision(c: &mut Criterion) {
     const PLANET_RADIUS: f64 = 6371e3;
     let ball = Ball { radius: 1.0 };
     let planet = Planet::new(
-        Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+        Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid benchmark terrain")),
         32,
         PLANET_RADIUS,
-    );
+    )
+    .expect("valid benchmark planet");
 
     c.bench_function("intersect", |b| {
         b.iter(|| {

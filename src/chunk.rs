@@ -10,12 +10,69 @@ use crate::cubemap::{Coords, Edge, Face, SampleIter};
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Chunk {
     /// Coordinates within the set of nodes at this depth in the quadtree
-    pub coords: Coords,
+    pub(crate) coords: Coords,
     /// Depth in the quadtree
-    pub depth: u8,
+    pub(crate) depth: u8,
 }
 
+/// Error constructing a quadtree chunk outside the addressable grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkError {
+    /// More than 31 subdivisions cannot be addressed with `u32` grid resolution.
+    Depth(u8),
+    /// Chunk coordinates must be smaller than `1 << depth` on both axes.
+    Coordinates,
+    /// A direction must be finite and nonzero.
+    Direction,
+    /// A cone half-angle must be finite and nonnegative.
+    Angle,
+}
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Depth(depth) => write!(f, "chunk depth {depth} exceeds the maximum of 31"),
+            Self::Coordinates => write!(f, "chunk coordinates exceed the quadtree depth"),
+            Self::Direction => write!(f, "chunk direction must be finite and nonzero"),
+            Self::Angle => write!(f, "cone half-angle must be finite and nonnegative"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkError {}
+
 impl Chunk {
+    /// Greatest addressable chunk depth (the grid has `2^31` chunks per face edge).
+    pub const MAX_DEPTH: u8 = 31;
+
+    /// Create a chunk after validating its depth and coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Rejects depth greater than 31 and coordinates outside the grid at that depth.
+    pub const fn try_new(coords: Coords, depth: u8) -> Result<Self, ChunkError> {
+        if depth > Self::MAX_DEPTH {
+            return Err(ChunkError::Depth(depth));
+        }
+        let resolution = 1u32 << depth;
+        if coords.x >= resolution || coords.y >= resolution {
+            return Err(ChunkError::Coordinates);
+        }
+        Ok(Self { coords, depth })
+    }
+
+    /// Coordinates identifying the chunk within its face at the current depth.
+    #[must_use]
+    pub const fn coords(&self) -> Coords {
+        self.coords
+    }
+
+    /// Depth of the chunk within the face quadtree.
+    #[must_use]
+    pub const fn depth(&self) -> u8 {
+        self.depth
+    }
+
     /// The top-level chunk corresponding to a particular cubemap face
     #[must_use]
     pub const fn root(face: Face) -> Self {
@@ -25,24 +82,44 @@ impl Chunk {
         }
     }
 
-    /// Compute the chunk at `depth` that intersects the vector from the origin towards `dir`
-    #[must_use]
-    pub fn from_vector(depth: u8, dir: &na::Vector3<f32>) -> Self {
-        Self {
-            coords: Coords::from_vector(2u32.pow(u32::from(depth)), dir),
-            depth,
+    /// Compute the chunk at `depth` that intersects the direction `dir`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects depths outside the addressable quadtree and non-finite or zero directions.
+    pub fn from_vector(depth: u8, dir: &na::Vector3<f32>) -> Result<Self, ChunkError> {
+        if depth > Self::MAX_DEPTH {
+            return Err(ChunkError::Depth(depth));
         }
+        if !dir.iter().all(|x| x.is_finite()) || dir.iter().all(|&x| x == 0.0) {
+            return Err(ChunkError::Direction);
+        }
+        Self::try_new(Coords::from_vector(1u32 << depth, dir), depth)
     }
 
     /// Select all `Chunk`s of a certain depth intersecting a cone opening towards `direction` with
-    /// half-angle `theta`
+    /// half-angle `theta`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects depths above 31, non-finite or zero directions, and non-finite
+    /// or negative half-angles.
     pub fn neighborhood(
         depth: u8,
         direction: na::Vector3<f32>,
         theta: f32,
-    ) -> impl Iterator<Item = Self> {
-        Coords::neighborhood(2u32.pow(depth.into()), direction, theta)
-            .map(move |coords| Self { coords, depth })
+    ) -> Result<impl Iterator<Item = Self>, ChunkError> {
+        if depth > Self::MAX_DEPTH {
+            return Err(ChunkError::Depth(depth));
+        }
+        if !direction.iter().all(|x| x.is_finite()) || direction.iter().all(|&x| x == 0.0) {
+            return Err(ChunkError::Direction);
+        }
+        if !theta.is_finite() || theta < 0.0 {
+            return Err(ChunkError::Angle);
+        }
+        Ok(Coords::neighborhood(1u32 << depth, direction, theta)
+            .map(move |coords| Self { coords, depth }))
     }
 
     /// The smallest chunk that contains this chunk
@@ -65,13 +142,16 @@ impl Chunk {
         Path { chunk: Some(self) }
     }
 
-    /// The largest chunks contained by this chunk
+    /// The four direct children, or `None` at the maximum representable depth.
     #[must_use]
-    pub const fn children(&self) -> [Self; 4] {
+    pub const fn children(&self) -> Option<[Self; 4]> {
+        if self.depth == Self::MAX_DEPTH {
+            return None;
+        }
         let depth = self.depth + 1;
         let (x, y) = (self.coords.x * 2, self.coords.y * 2);
         let face = self.coords.face;
-        [
+        Some([
             Self {
                 coords: Coords { x, y, face },
                 depth,
@@ -92,7 +172,7 @@ impl Chunk {
                 },
                 depth,
             },
-        ]
+        ])
     }
 
     /// Chunks that share an edge with this chunk
@@ -201,6 +281,82 @@ mod test {
     use approx::*;
 
     #[test]
+    fn depth_and_coordinates_are_validated_at_construction() {
+        let face = Face::Px;
+        let max = (1_u32 << Chunk::MAX_DEPTH) - 1;
+        let edge = Coords {
+            x: max,
+            y: max,
+            face,
+        };
+        let deepest = Chunk::try_new(edge, Chunk::MAX_DEPTH).unwrap();
+        assert_eq!(deepest.resolution(), 1_u32 << Chunk::MAX_DEPTH);
+        assert!(deepest.children().is_none());
+        assert_eq!(deepest.path().len(), usize::from(Chunk::MAX_DEPTH) + 1);
+        for neighbor in deepest.neighbors() {
+            assert_eq!(neighbor.depth(), Chunk::MAX_DEPTH);
+            assert!(neighbor.coords().x < neighbor.resolution());
+            assert!(neighbor.coords().y < neighbor.resolution());
+        }
+        assert_eq!(
+            Chunk::try_new(edge, Chunk::MAX_DEPTH + 1),
+            Err(ChunkError::Depth(32))
+        );
+        assert_eq!(
+            Chunk::from_vector(32, &na::Vector3::x()),
+            Err(ChunkError::Depth(32))
+        );
+        assert!(matches!(
+            Chunk::neighborhood(32, na::Vector3::x(), 0.1),
+            Err(ChunkError::Depth(32))
+        ));
+        assert_eq!(
+            Chunk::try_new(Coords { x: 1, y: 0, face }, 0),
+            Err(ChunkError::Coordinates)
+        );
+        assert_eq!(
+            Chunk::try_new(Coords { x: 0, y: 1, face }, 0),
+            Err(ChunkError::Coordinates)
+        );
+        let parent = Chunk::try_new(
+            Coords {
+                x: max / 2,
+                y: max / 2,
+                face,
+            },
+            30,
+        )
+        .unwrap();
+        assert!(parent.children().unwrap().contains(&deepest));
+    }
+
+    #[test]
+    fn direction_and_cone_inputs_are_checked() {
+        let zero = na::Vector3::<f32>::zeros();
+        let nan = na::Vector3::new(f32::NAN, 1.0, 0.0);
+        let infinite = na::Vector3::new(f32::INFINITY, 1.0, 0.0);
+        for invalid in [zero, nan, infinite] {
+            assert_eq!(Chunk::from_vector(0, &invalid), Err(ChunkError::Direction));
+            assert!(matches!(
+                Chunk::neighborhood(0, invalid, 0.1),
+                Err(ChunkError::Direction)
+            ));
+        }
+        assert!(matches!(
+            Chunk::neighborhood(0, na::Vector3::x(), -0.1),
+            Err(ChunkError::Angle)
+        ));
+        assert!(matches!(
+            Chunk::neighborhood(0, na::Vector3::x(), f32::INFINITY),
+            Err(ChunkError::Angle)
+        ));
+        assert!(matches!(
+            Chunk::neighborhood(0, na::Vector3::x(), f32::NAN),
+            Err(ChunkError::Angle)
+        ));
+    }
+
+    #[test]
     fn neighbors() {
         use self::Face::*;
         // Every face chunk's neighbors are the face's neighbors
@@ -212,7 +368,7 @@ mod test {
             }
         }
 
-        let chunk = Chunk::root(Face::Pz).children()[0];
+        let chunk = Chunk::root(Face::Pz).children().unwrap()[0];
         assert_eq!(
             chunk.neighbors()[0],
             Chunk {
@@ -271,8 +427,8 @@ mod test {
         // Every chunk is its neighbor's neighbor
         // Depth 2 to ensure we get all the interesting cases
         for grandparent in Face::iter().map(Chunk::root) {
-            for parent in grandparent.children().iter() {
-                for chunk in parent.children().iter() {
+            for parent in grandparent.children().unwrap().iter() {
+                for chunk in parent.children().unwrap().iter() {
                     for &neighbor in chunk.neighbors().iter() {
                         assert!(neighbor.neighbors().iter().any(|x| x == chunk));
                     }
@@ -284,9 +440,9 @@ mod test {
     #[test]
     fn parents() {
         for grandparent in Face::iter().map(Chunk::root) {
-            for &parent in grandparent.children().iter() {
+            for &parent in grandparent.children().unwrap().iter() {
                 assert_eq!(parent.parent(), Some(grandparent));
-                for chunk in parent.children().iter() {
+                for chunk in parent.children().unwrap().iter() {
                     assert_eq!(chunk.parent(), Some(parent));
                 }
             }
@@ -308,13 +464,13 @@ mod test {
             na::Vector3::z_axis()
         );
 
-        let chunk = Chunk::root(Face::Pz).children()[1];
+        let chunk = Chunk::root(Face::Pz).children().unwrap()[1];
         assert!(chunk.samples::<f32>(2).any(|x| x == na::Vector3::z_axis()));
 
         // Every face's
         for face in Face::iter() {
             // immediate children
-            for chunk in &Chunk::root(face).children() {
+            for chunk in &Chunk::root(face).children().unwrap() {
                 // each have one sample at exactly the center of the face
                 assert_eq!(
                     chunk
@@ -348,7 +504,7 @@ mod test {
                 face: Face::Pz,
             },
         };
-        let children = chunk.children();
+        let children = chunk.children().unwrap();
         let neighbor = chunk.neighbors()[0];
         assert_eq!(
             children[0]
@@ -376,7 +532,7 @@ mod test {
         };
         assert_eq!(
             chunk,
-            Chunk::from_vector(chunk.depth, chunk.origin().as_ref())
+            Chunk::from_vector(chunk.depth, chunk.origin().as_ref()).unwrap()
         );
 
         assert_abs_diff_eq!(chunk.origin(), chunk.direction(&na::Point2::new(0.5, 0.5)));

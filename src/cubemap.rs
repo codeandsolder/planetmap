@@ -659,7 +659,11 @@ impl Coords {
             f64::from(direction.y),
             f64::from(direction.z),
         );
-        let axis = axis.try_normalize(1.0e-30);
+        let axis = if axis.iter().all(|x| x.is_finite()) {
+            axis.try_normalize(0.0)
+        } else {
+            None
+        };
         // The small angular margin includes face and texel boundaries after
         // the final f32 discretization, without moving interior samples.
         let angle = (f64::from(theta) + 1.0e-6).min(std::f64::consts::PI);
