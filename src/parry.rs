@@ -53,6 +53,65 @@ pub trait Terrain: Send + Sync + 'static {
     fn min_height(&self) -> f32;
 }
 
+/// Invalid radial terrain or collision-cache configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanetConfigError {
+    /// A cubemap face has no chunks.
+    FaceResolution,
+    /// At least two samples per chunk edge are needed to form triangles.
+    ChunkResolution,
+    /// The sample grid cannot fit within Rust allocation limits.
+    SampleGridTooLarge,
+    /// Collision-cache capacity must be positive.
+    CacheSize,
+    /// The planet radius or terrain-adjusted radius is not finite and positive.
+    Radius,
+    /// Height extrema must be finite and ordered.
+    HeightRange,
+    /// Parry's 32-bit subshape identifiers cannot represent the proposed cache.
+    SubshapeIdOverflow,
+}
+
+impl std::fmt::Display for PlanetConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FaceResolution => write!(f, "face resolution must be positive"),
+            Self::ChunkResolution => write!(f, "chunk resolution must be at least two"),
+            Self::SampleGridTooLarge => write!(f, "terrain sample grid exceeds allocation limits"),
+            Self::CacheSize => write!(f, "collision cache size must be positive"),
+            Self::Radius => write!(
+                f,
+                "planet radius must remain finite and positive with terrain heights"
+            ),
+            Self::HeightRange => write!(f, "height bounds must be finite and ordered"),
+            Self::SubshapeIdOverflow => write!(
+                f,
+                "cache and triangle count exceed 32-bit subshape identifier space"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanetConfigError {}
+
+fn validate_terrain_geometry(
+    face_resolution: u32,
+    chunk_resolution: u32,
+) -> Result<(), PlanetConfigError> {
+    if face_resolution == 0 {
+        return Err(PlanetConfigError::FaceResolution);
+    }
+    if chunk_resolution < 2 {
+        return Err(PlanetConfigError::ChunkResolution);
+    }
+    let sample_count = u64::from(chunk_resolution).pow(2);
+    let max_elements = (isize::MAX as u64) / size_of::<f32>() as u64;
+    if sample_count > max_elements {
+        return Err(PlanetConfigError::SampleGridTooLarge);
+    }
+    Ok(())
+}
+
 /// Trivial `Terrain` impl
 #[derive(Debug, Copy, Clone)]
 pub struct FlatTerrain {
@@ -61,12 +120,18 @@ pub struct FlatTerrain {
 }
 
 impl FlatTerrain {
-    #[must_use]
-    pub const fn new(face_resolution: u32, chunk_resolution: u32) -> Self {
-        Self {
+    /// Construct a flat terrain with a valid cubemap and triangle grid.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero face resolution or chunk resolutions that cannot form an
+    /// addressable sample grid with at least two vertices per edge.
+    pub fn new(face_resolution: u32, chunk_resolution: u32) -> Result<Self, PlanetConfigError> {
+        validate_terrain_geometry(face_resolution, chunk_resolution)?;
+        Ok(Self {
             face_resolution,
             chunk_resolution,
-        }
+        })
     }
 }
 
@@ -110,13 +175,48 @@ impl Planet {
     /// `terrain` - source of height samples
     /// `cache_size` - maximum number of chunks of height data to keep in memory
     /// `radius` - distance from origin of points with height 0
-    pub fn new(terrain: Arc<dyn Terrain>, cache_size: u32, radius: f64) -> Self {
-        Self {
-            chunk_resolution: terrain.chunk_resolution(),
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid source geometry, non-finite/negative radial extents,
+    /// zero cache capacity, and cache geometries that would alias Parry's
+    /// 32-bit triangle subshape identifiers.
+    pub fn new(
+        terrain: Arc<dyn Terrain>,
+        cache_size: u32,
+        radius: f64,
+    ) -> Result<Self, PlanetConfigError> {
+        let chunk_resolution = terrain.chunk_resolution();
+        validate_terrain_geometry(terrain.face_resolution(), chunk_resolution)?;
+        if cache_size == 0 {
+            return Err(PlanetConfigError::CacheSize);
+        }
+        let (min, max) = (terrain.min_height(), terrain.max_height());
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return Err(PlanetConfigError::HeightRange);
+        }
+        if !radius.is_finite()
+            || radius <= 0.0
+            || !((radius + f64::from(min)).is_finite())
+            || radius + f64::from(min) <= 0.0
+            || !(radius + f64::from(max)).is_finite()
+        {
+            return Err(PlanetConfigError::Radius);
+        }
+        // Every cached slot owns two triangles per quad. The maximum
+        // identifier, including the last slot, must fit in SubShapeId=u32.
+        let quads_per_edge = u64::from(chunk_resolution - 1);
+        let triangles_per_chunk = 2 * quads_per_edge * quads_per_edge;
+        let total = u64::from(cache_size) * triangles_per_chunk;
+        if total > u64::from(u32::MAX) + 1 {
+            return Err(PlanetConfigError::SubshapeIdOverflow);
+        }
+        Ok(Self {
+            chunk_resolution,
             terrain,
             radius,
             cache: Mutex::new(Cache::new(cache_size)),
-        }
+        })
     }
 
     fn max_radius(&self) -> f64 {
@@ -462,13 +562,17 @@ impl Shape for Planet {
 struct Cache {
     slots: LruSlab<ChunkData>,
     index: HashMap<Coords, u32>,
+    max_size: u32,
 }
 
 impl Cache {
     pub fn new(capacity: u32) -> Self {
         Self {
-            slots: LruSlab::with_capacity(capacity),
-            index: HashMap::with_capacity(capacity as usize),
+            // LruSlab grows on demand. Do not preallocate potentially
+            // enormous capacity merely because it fits the identifier space.
+            slots: LruSlab::new(),
+            index: HashMap::new(),
+            max_size: capacity,
         }
     }
 
@@ -476,7 +580,7 @@ impl Cache {
         let (slot, old) = match self.index.entry(*coords) {
             hash_map::Entry::Occupied(e) => (*e.get(), None),
             hash_map::Entry::Vacant(e) => {
-                let old = if self.slots.len() == self.slots.capacity() {
+                let old = if self.slots.len() == self.max_size {
                     self.slots.lru().map(|lru| self.slots.remove(lru).coords)
                 } else {
                     None
@@ -1358,9 +1462,163 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct TestTerrain {
+        face: u32,
+        chunk: u32,
+        min: f32,
+        max: f32,
+    }
+
+    impl Terrain for TestTerrain {
+        fn sample(&self, _: &Coords, out: &mut [f32]) {
+            out.fill(0.0);
+        }
+        fn face_resolution(&self) -> u32 {
+            self.face
+        }
+        fn chunk_resolution(&self) -> u32 {
+            self.chunk
+        }
+        fn min_height(&self) -> f32 {
+            self.min
+        }
+        fn max_height(&self) -> f32 {
+            self.max
+        }
+    }
+
+    #[test]
+    fn terrain_config_rejects_invalid_dimensions() {
+        assert!(matches!(
+            FlatTerrain::new(0, 2),
+            Err(PlanetConfigError::FaceResolution)
+        ));
+        assert!(matches!(
+            FlatTerrain::new(1, 0),
+            Err(PlanetConfigError::ChunkResolution)
+        ));
+        assert!(matches!(
+            FlatTerrain::new(1, 1),
+            Err(PlanetConfigError::ChunkResolution)
+        ));
+        assert!(matches!(
+            FlatTerrain::new(1, u32::MAX),
+            Err(PlanetConfigError::SampleGridTooLarge)
+        ));
+        assert!(FlatTerrain::new(3, 3).is_ok());
+    }
+
+    #[test]
+    fn planet_config_rejects_invalid_geometry_heights_and_cache_size() {
+        let make = |face, chunk, min, max| -> Arc<dyn Terrain> {
+            Arc::new(TestTerrain {
+                face,
+                chunk,
+                min,
+                max,
+            })
+        };
+        assert!(matches!(
+            Planet::new(make(0, 2, 0.0, 0.0), 1, 10.0),
+            Err(PlanetConfigError::FaceResolution)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 1, 0.0, 0.0), 1, 10.0),
+            Err(PlanetConfigError::ChunkResolution)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, u32::MAX, 0.0, 0.0), 1, 10.0),
+            Err(PlanetConfigError::SampleGridTooLarge)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 2, 0.0, 0.0), 0, 10.0),
+            Err(PlanetConfigError::CacheSize)
+        ));
+        for radius in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            assert!(matches!(
+                Planet::new(make(1, 2, 0.0, 0.0), 1, radius),
+                Err(PlanetConfigError::Radius)
+            ));
+        }
+        assert!(matches!(
+            Planet::new(make(1, 2, -11.0, 0.0), 1, 10.0),
+            Err(PlanetConfigError::Radius)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 2, f32::NAN, 0.0), 1, 10.0),
+            Err(PlanetConfigError::HeightRange)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 2, 0.0, f32::INFINITY), 1, 10.0),
+            Err(PlanetConfigError::HeightRange)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 2, 3.0, -1.0), 1, 10.0),
+            Err(PlanetConfigError::HeightRange)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 65_536, 0.0, 0.0), 1, 10.0),
+            Err(PlanetConfigError::SubshapeIdOverflow)
+        ));
+        assert!(matches!(
+            Planet::new(make(1, 2, 0.0, 0.0), u32::MAX, 10.0),
+            Err(PlanetConfigError::SubshapeIdOverflow)
+        ));
+    }
+
+    #[test]
+    fn planet_subshape_ids_fit_exactly_and_cache_capacity_is_lazy() {
+        // Two triangles per chunk; the full 32-bit ID range fits exactly.
+        let terrain = Arc::new(FlatTerrain::new(1, 2).unwrap());
+        let planet = Planet::new(terrain, 1 << 31, 1.0)
+            .expect("maximum slot count is representable without preallocating all slots");
+        let mut cache = planet.cache.lock().unwrap();
+        assert_eq!(cache.slots.len(), 0);
+        let (first, _) = cache.get(
+            &planet,
+            &Coords {
+                x: 0,
+                y: 0,
+                face: Face::Px,
+            },
+        );
+        assert_eq!(first, 0);
+        assert_eq!(planet.subshape_id(first, 1), 1);
+        assert!(cache.slots.capacity() < 32);
+        drop(cache);
+        // Ordinary LRU eviction must preserve the configured slot bound.
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 1.0).unwrap();
+        let mut cache = planet.cache.lock().unwrap();
+        let (a, _) = cache.get(
+            &planet,
+            &Coords {
+                x: 0,
+                y: 0,
+                face: Face::Px,
+            },
+        );
+        let (b, _) = cache.get(
+            &planet,
+            &Coords {
+                x: 0,
+                y: 0,
+                face: Face::Py,
+            },
+        );
+        assert_eq!(a, b);
+        assert_eq!(cache.slots.len(), 1);
+        assert_eq!(cache.index.len(), 1);
+    }
+
     #[test]
     fn triangles() {
-        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2)), 32, 1.0);
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(1, 2).expect("valid test terrain")),
+            32,
+            1.0,
+        )
+        .expect("valid test planet");
         let coords = Coords {
             x: 0,
             y: 0,
@@ -1410,10 +1668,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
 
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         // We add 0.1 to PLANET_RADIUS in positive tests below to hack around the issue in
         // https://github.com/dimforge/parry/pull/148. Can be removed once fix is released.
@@ -1441,10 +1700,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         const BALL_RADIUS: f64 = 50.0;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         let pos =
             Vector::new(-5_195_083.148, 3_582_099.812, -877_091.267).normalize() * PLANET_RADIUS;
@@ -1458,10 +1718,11 @@ mod tests {
         const DISTANCE: f64 = 10.0;
         let ball = Ball { radius: 1.0 };
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         let impact = PlanetDispatcher
             .cast_shapes(
@@ -1506,7 +1767,12 @@ mod tests {
 
     #[test]
     fn subshape_id_unique() {
-        let planet = Planet::new(Arc::new(FlatTerrain::new(2u32.pow(12), 17)), 32, 1.0);
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
+            32,
+            1.0,
+        )
+        .expect("valid test planet");
         let stride = planet.triangles_per_chunk();
         assert_eq!(planet.subshape_id(1, 0) - planet.subshape_id(0, 0), stride);
         // The last triangle of one chunk must not alias the first triangle of the next.
@@ -1518,10 +1784,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         const DISTANCE: f64 = 10.0;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
         // A point well within a single triangle, away from chunk and triangle edges.
         let point = Vector::new(PLANET_RADIUS, 123.0, 456.0);
         let (proj, _) = planet.project_local_point_and_get_feature(point);
@@ -1543,10 +1810,11 @@ mod tests {
     fn intersection_subshapes() {
         const PLANET_RADIUS: f64 = 6371e3;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
         // The first triangle hovers above the surface; the second pierces it.
         let mesh = TriMesh::new(
             vec![
@@ -1580,7 +1848,12 @@ mod tests {
     #[test]
     fn swapped_composite_manifolds_use_mesh_part_ids() {
         const RADIUS: f64 = 6371e3;
-        let planet = Planet::new(Arc::new(FlatTerrain::new(4096, 17)), 32, RADIUS);
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(4096, 17).expect("valid test terrain")),
+            32,
+            RADIUS,
+        )
+        .expect("valid test planet");
         let mesh = TriMesh::new(
             vec![
                 Vector::new(RADIUS - 10.0, -10.0, -10.0),
@@ -1611,7 +1884,12 @@ mod tests {
     #[test]
     fn nonlinear_cast_swapped_order_preserves_shape_orientation() {
         const RADIUS: f64 = 6371e3;
-        let planet = Planet::new(Arc::new(FlatTerrain::new(4096, 17)), 32, RADIUS);
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(4096, 17).expect("valid test terrain")),
+            32,
+            RADIUS,
+        )
+        .expect("valid test planet");
         let ball = Ball { radius: 1.0 };
         let moving = NonlinearRigidMotion {
             start: Pose::translation(RADIUS + 1.5, 0.0, 0.0),
@@ -1633,7 +1911,12 @@ mod tests {
 
     #[test]
     fn raycast_toi_is_relative_to_original_origin_across_patches() {
-        let planet = Planet::new(Arc::new(FlatTerrain::new(8, 5)), 128, 10.0);
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(8, 5).expect("valid test terrain")),
+            128,
+            10.0,
+        )
+        .expect("valid test planet");
         let ray = Ray {
             origin: Vector::new(20.0, 5.0, 0.25),
             dir: -Vector::X,
@@ -1658,10 +1941,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         const DISTANCE: f64 = 10.0;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
         let hit = planet
             .cast_local_ray_and_get_normal(
                 &Ray {
@@ -1691,10 +1975,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         const DISTANCE: f64 = 10.0;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         for &dir in [Vector::X, Vector::Y, -Vector::X, -Vector::Y].iter() {
             let hit = planet.cast_local_ray_and_get_normal(
@@ -1714,10 +1999,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         const DISTANCE: f64 = 1000.0;
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
         let ray = Ray {
             origin: Vector::new(1.0, 1.0, PLANET_RADIUS + DISTANCE),
             dir: Vector::new(1.5, 1.5, -1.0).normalize(),
@@ -1735,10 +2021,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         let ball = Ball { radius: 1.0 };
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         assert!(
             PlanetDispatcher
@@ -1763,10 +2050,11 @@ mod tests {
         const PLANET_RADIUS: f64 = 6371e3;
         let ball = Ball { radius: 1.0 };
         let planet = Planet::new(
-            Arc::new(FlatTerrain::new(2u32.pow(12), 17)),
+            Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid test terrain")),
             32,
             PLANET_RADIUS,
-        );
+        )
+        .expect("valid test planet");
 
         let toi = PlanetDispatcher
             .cast_shapes_nonlinear(
