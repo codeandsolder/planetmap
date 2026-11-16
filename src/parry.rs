@@ -30,7 +30,11 @@ use parry3d_f64::{
 use crate::cubemap::{Coords, Edge};
 
 /// Convert a `parry` vector to the nalgebra type consumed by the `cubemap` module
-fn na3f32(v: Vector) -> na::Vector3<f32> {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Parry uses f64 world-space vectors, but terrain sampling is intentionally f32"
+)]
+const fn na3f32(v: Vector) -> na::Vector3<f32> {
     na::Vector3::new(v.x as f32, v.y as f32, v.z as f32)
 }
 
@@ -57,7 +61,8 @@ pub struct FlatTerrain {
 }
 
 impl FlatTerrain {
-    pub fn new(face_resolution: u32, chunk_resolution: u32) -> Self {
+    #[must_use]
+    pub const fn new(face_resolution: u32, chunk_resolution: u32) -> Self {
         Self {
             face_resolution,
             chunk_resolution,
@@ -115,10 +120,10 @@ impl Planet {
     }
 
     fn max_radius(&self) -> f64 {
-        self.radius + self.terrain.max_height() as f64
+        self.radius + f64::from(self.terrain.max_height())
     }
     fn min_radius(&self) -> f64 {
-        self.radius + self.terrain.min_height() as f64
+        self.radius + f64::from(self.terrain.min_height())
     }
 
     fn sample(&self, coords: &Coords) -> Box<[f32]> {
@@ -131,7 +136,7 @@ impl Planet {
 
     /// Number of triangles in a single chunk, i.e. the stride between chunk slots in
     /// [`Self::subshape_id`].
-    fn triangles_per_chunk(&self) -> u32 {
+    const fn triangles_per_chunk(&self) -> u32 {
         2 * (self.chunk_resolution - 1).pow(2)
     }
 
@@ -139,12 +144,16 @@ impl Planet {
     ///
     /// Unique among the triangles currently cached, though a triangle's ID changes if its chunk
     /// is evicted and reloaded into a different slot.
-    fn subshape_id(&self, slot: u32, triangle: u32) -> SubShapeId {
+    const fn subshape_id(&self, slot: u32, triangle: u32) -> SubShapeId {
         slot * self.triangles_per_chunk() + triangle
     }
 
     /// Applies the function `f` to all the triangles intersecting the given sphere. Exits early on
     /// `false` return.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "The cubemap neighbor lookup uses f32 directions and angular bounds by design"
+    )]
     pub fn map_elements_in_local_sphere(
         &self,
         bounds: &BoundingSphere,
@@ -153,7 +162,10 @@ impl Planet {
     ) {
         let dir = bounds.center();
         let distance = dir.length();
-        let cache = &mut *self.cache.lock().unwrap();
+        let cache = &mut *self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Iterate over each overlapping chunk
         'outer: for chunk_coords in Coords::neighborhood(
             self.terrain.face_resolution(),
@@ -161,8 +173,8 @@ impl Planet {
             bounds.radius().atan2(distance) as f32,
         ) {
             let (slot, data) = cache.get(self, &chunk_coords);
-            if self.radius + data.max as f64 + bounds.radius() < distance
-                || self.radius + data.min as f64 - bounds.radius() > distance
+            if self.radius + f64::from(data.max) + bounds.radius() < distance
+                || self.radius + f64::from(data.min) - bounds.radius() > distance
             {
                 // Short-circuit if `other` is way above or below this chunk
                 continue;
@@ -185,7 +197,12 @@ impl Clone for Planet {
     fn clone(&self) -> Self {
         Self {
             terrain: self.terrain.clone(),
-            cache: Mutex::new(self.cache.lock().unwrap().clone()),
+            cache: Mutex::new(
+                self.cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
             ..*self
         }
     }
@@ -204,7 +221,10 @@ impl RayCast for Planet {
         let mut ray = *ray;
 
         // Walk along the ray until we hit something
-        let cache = &mut *self.cache.lock().unwrap();
+        let cache = &mut *self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             let (slot, data) = cache.get(self, &chunk);
             // FIXME: Rays can sometimes slip between bounding planes and the outer edge of a
@@ -227,7 +247,7 @@ impl RayCast for Planet {
                     return true;
                 };
                 let quad_index = quad.position.y * self.chunk_resolution + quad.position.x;
-                let index = (quad_index << 1) | tri as u32;
+                let index = (quad_index << 1) | u32::from(tri == 1);
                 hit.subshape = self.subshape_id(slot, index);
                 maybe_hit = Some(hit);
                 false
@@ -250,12 +270,16 @@ impl RayCast for Planet {
 }
 
 /// `quad` is row-major vectors from the origin
-fn raycast_quad_edges(ray: &Ray, [a, b, c, d]: &[Vector; 4], max_toi: f64) -> Option<(Edge, f64)> {
+fn raycast_quad_edges(
+    ray: &Ray,
+    [bottom_left, bottom_right, top_left, top_right]: &[Vector; 4],
+    max_toi: f64,
+) -> Option<(Edge, f64)> {
     let edges: [(Edge, [Vector; 2]); 4] = [
-        (Edge::Nx, [*c, *a]),
-        (Edge::Ny, [*a, *b]),
-        (Edge::Px, [*b, *d]),
-        (Edge::Py, [*d, *c]),
+        (Edge::Nx, [*top_left, *bottom_left]),
+        (Edge::Ny, [*bottom_left, *bottom_right]),
+        (Edge::Px, [*bottom_right, *top_right]),
+        (Edge::Py, [*top_right, *top_left]),
     ];
 
     let mut closest = None;
@@ -294,16 +318,17 @@ impl PointQuery for Planet {
         // than the closest triangle found so far, regardless of height
         let coords = Coords::from_vector(self.terrain.face_resolution(), &na3f32(pt));
         let distance2 = |x: Vector| x.distance_squared(pt);
-        let cache = &mut *self.cache.lock().unwrap();
+        let cache = &mut *self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (slot, data) = cache.get(self, &coords);
         let patch = Patch::new(&coords, self.terrain.face_resolution());
         let (idx, (mut nearest, feature)) = patch
             .triangles(self.radius, self.chunk_resolution, &data.samples)
             .map(|(i, tri)| (i, tri.project_local_point_and_get_feature(pt)))
-            .min_by(|(_, (x, _)), (_, (y, _))| {
-                distance2(x.point).partial_cmp(&distance2(y.point)).unwrap()
-            })
-            .unwrap();
+            .min_by(|(_, (x, _)), (_, (y, _))| distance2(x.point).total_cmp(&distance2(y.point)))
+            .unwrap_or_else(|| (0, (PointProjection::new(false, pt), FeatureId::Unknown)));
         // TODO: Check neighborhood, so we don't miss as many cliff faces
         nearest.subshape = self.subshape_id(slot, idx);
         (nearest, feature)
@@ -371,8 +396,7 @@ impl Cache {
             hash_map::Entry::Occupied(e) => (*e.get(), None),
             hash_map::Entry::Vacant(e) => {
                 let old = if self.slots.len() == self.slots.capacity() {
-                    let lru = self.slots.lru().unwrap();
-                    Some(self.slots.remove(lru).coords)
+                    self.slots.lru().map(|lru| self.slots.remove(lru).coords)
                 } else {
                     None
                 };
@@ -400,8 +424,8 @@ struct ChunkData {
 
 impl ChunkData {
     fn new(coords: Coords, samples: Box<[f32]>) -> Self {
-        let mut iter = samples.iter().cloned();
-        let first = iter.next().expect("empty sample array");
+        let mut iter = samples.iter().copied();
+        let first = iter.next().unwrap_or(0.0);
         let mut min = first;
         let mut max = first;
         for sample in iter {
@@ -749,11 +773,14 @@ fn compute_manifolds<ManifoldData, ContactData>(
     ManifoldData: Default + Clone + Send + Sync,
     ContactData: Default + Copy + Send + Sync,
 {
-    let workspace = workspace
-        .get_or_insert_with(|| ContactManifoldsWorkspace(Box::<Workspace>::default()))
-        .0
-        .downcast_mut::<Workspace>()
-        .unwrap();
+    let workspace =
+        workspace.get_or_insert_with(|| ContactManifoldsWorkspace(Box::<Workspace>::default()));
+    if !workspace.0.is::<Workspace>() {
+        *workspace = ContactManifoldsWorkspace(Box::<Workspace>::default());
+    }
+    let Some(workspace) = workspace.0.downcast_mut::<Workspace>() else {
+        return;
+    };
     let dispatcher = DefaultQueryDispatcher; // TODO after https://github.com/dimforge/parry/issues/8
 
     workspace.phase ^= true;
@@ -865,10 +892,13 @@ fn compute_manifolds_vs_composite<ManifoldData, ContactData>(
     ContactData: Default + Copy + Send + Sync,
 {
     let workspace = workspace
-        .get_or_insert_with(|| ContactManifoldsWorkspace(Box::<WorkspaceVsComposite>::default()))
-        .0
-        .downcast_mut::<WorkspaceVsComposite>()
-        .unwrap();
+        .get_or_insert_with(|| ContactManifoldsWorkspace(Box::<WorkspaceVsComposite>::default()));
+    if !workspace.0.is::<WorkspaceVsComposite>() {
+        *workspace = ContactManifoldsWorkspace(Box::<WorkspaceVsComposite>::default());
+    }
+    let Some(workspace) = workspace.0.downcast_mut::<WorkspaceVsComposite>() else {
+        return;
+    };
     let dispatcher = DefaultQueryDispatcher; // TODO after https://github.com/dimforge/parry/issues/8
 
     workspace.phase ^= true;
@@ -918,7 +948,7 @@ fn compute_manifolds_vs_composite<ManifoldData, ContactData>(
                                 manifold.subshape1 = subshape;
                                 manifold.subshape2 = composite_subshape;
                                 manifold.set_subshape_pos2(composite_part_pos.copied());
-                            };
+                            }
 
                             let tri_state = TriangleState {
                                 manifold_index: manifolds.len(),
@@ -1039,14 +1069,17 @@ impl Patch {
     #[inline(always)]
     fn project(&self, dir: &Vector) -> Vec2 {
         // Project onto each triangle, then select the in-bounds result
-        #[inline(always)]
         fn project(p: Vector, x: Vector, y: Vector, dir: Vector) -> Vec2 {
             // t * dir = p + u * x + v * y
             // -p = x * u + y * v - t * dir
             //    = [x y dir] [u v -t]^T
             // [u v -t]^T = [x y dir]^-1 . -p
             let m = Matrix::from_cols(x, y, dir);
-            -(m.try_inverse().unwrap() * p).truncate()
+            let Some(inverse) = m.try_inverse() else {
+                // A tangent direction has no unique ray/patch intersection.
+                return Vec2::ZERO;
+            };
+            -(inverse * p).truncate()
         }
 
         let left = project(self.a, self.d - self.c, self.c - self.a, *dir);
@@ -1075,6 +1108,14 @@ impl Patch {
             .flatten()
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Clamped normalized coordinates are bounded before discretization into u32 quads"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Normalized quad coordinates are nonnegative before conversion into u32 quads"
+    )]
     fn quads_within_inner<'a>(
         &'a self,
         aabb: &Aabb,
@@ -1088,11 +1129,16 @@ impl Patch {
             .fold((v0, v0), |(lower, upper), p| (lower.min(p), upper.max(p)));
         // Components are clamped to [0, 1], so any component equals 1 iff the largest does, and
         // likewise for 0.
-        if lower.max_element() == 1.0 || upper.min_element() == 0.0 {
+        if lower.max_element() >= 1.0 || upper.min_element() <= 0.0 {
+            return None;
+        }
+        if chunk_resolution < 2 {
             return None;
         }
         let quad_resolution = chunk_resolution - 1;
-        let discretize = |x: f64| ((x * quad_resolution as f64) as u32).min(quad_resolution - 1);
+        let discretize = |x: f64| {
+            ((x.clamp(0.0, 1.0) * f64::from(quad_resolution)) as u32).min(quad_resolution - 1)
+        };
         // FIXME: wrong units! Reuse bounding
         let lower = UVec2::new(discretize(lower.x), discretize(lower.y));
         let upper = UVec2::new(discretize(upper.x), discretize(upper.y));
@@ -1112,8 +1158,8 @@ impl Patch {
             quad.displace(radius, chunk_resolution, samples)
                 .triangles()
                 .into_iter()
-                .enumerate()
-                .map(move |(i, tri)| ((index << 1) | i as u32, tri))
+                .zip(0u32..)
+                .map(move |(tri, i)| ((index << 1) | i, tri))
         })
     }
 }
@@ -1136,7 +1182,7 @@ impl Quad {
         }
     }
 
-    fn index(&self, chunk_resolution: u32) -> u32 {
+    const fn index(&self, chunk_resolution: u32) -> u32 {
         self.position.y * chunk_resolution + self.position.x
     }
 
@@ -1163,8 +1209,8 @@ impl Quad {
         self.displace(radius, chunk_resolution, samples)
             .triangles()
             .into_iter()
-            .enumerate()
-            .map(move |(i, tri)| ((index << 1) | i as u32, tri))
+            .zip(0u32..)
+            .map(move |(tri, i)| ((index << 1) | i, tri))
     }
 }
 
@@ -1193,7 +1239,7 @@ fn walk_patch(
     max_toi: f64,
     mut f: impl FnMut(&Quad) -> bool,
 ) -> Option<(Edge, f64)> {
-    let quad_resolution_f = quad_resolution as f64;
+    let quad_resolution_f = f64::from(quad_resolution);
     let start = patch.project(&ray.origin);
     let mut quad = (start * quad_resolution_f)
         .trunc()

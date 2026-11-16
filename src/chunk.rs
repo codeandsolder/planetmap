@@ -17,7 +17,8 @@ pub struct Chunk {
 
 impl Chunk {
     /// The top-level chunk corresponding to a particular cubemap face
-    pub fn root(face: Face) -> Self {
+    #[must_use]
+    pub const fn root(face: Face) -> Self {
         Self {
             coords: Coords { x: 0, y: 0, face },
             depth: 0,
@@ -25,9 +26,10 @@ impl Chunk {
     }
 
     /// Compute the chunk at `depth` that intersects the vector from the origin towards `dir`
+    #[must_use]
     pub fn from_vector(depth: u8, dir: &na::Vector3<f32>) -> Self {
         Self {
-            coords: Coords::from_vector(2u32.pow(depth as u32), dir),
+            coords: Coords::from_vector(2u32.pow(u32::from(depth)), dir),
             depth,
         }
     }
@@ -44,6 +46,7 @@ impl Chunk {
     }
 
     /// The smallest chunk that contains this chunk
+    #[must_use]
     pub fn parent(&self) -> Option<Self> {
         let depth = self.depth.checked_sub(1)?;
         Some(Self {
@@ -57,29 +60,31 @@ impl Chunk {
     }
 
     /// Iterator over the path from this chunk to the root, inclusive
-    pub fn path(self) -> Path {
+    #[must_use]
+    pub const fn path(self) -> Path {
         Path { chunk: Some(self) }
     }
 
     /// The largest chunks contained by this chunk
-    pub fn children(&self) -> [Self; 4] {
+    #[must_use]
+    pub const fn children(&self) -> [Self; 4] {
         let depth = self.depth + 1;
         let (x, y) = (self.coords.x * 2, self.coords.y * 2);
         let face = self.coords.face;
         [
-            Chunk {
+            Self {
                 coords: Coords { x, y, face },
                 depth,
             },
-            Chunk {
+            Self {
                 coords: Coords { x, y: y + 1, face },
                 depth,
             },
-            Chunk {
+            Self {
                 coords: Coords { x: x + 1, y, face },
                 depth,
             },
-            Chunk {
+            Self {
                 coords: Coords {
                     x: x + 1,
                     y: y + 1,
@@ -91,23 +96,24 @@ impl Chunk {
     }
 
     /// Chunks that share an edge with this chunk
+    #[must_use]
     pub fn neighbors(&self) -> [Self; 4] {
         let x = self.coords.neighbors(self.resolution());
         let depth = self.depth;
         [
-            Chunk {
+            Self {
                 coords: x[Edge::Nx],
                 depth,
             },
-            Chunk {
+            Self {
                 coords: x[Edge::Ny],
                 depth,
             },
-            Chunk {
+            Self {
                 coords: x[Edge::Px],
                 depth,
             },
-            Chunk {
+            Self {
                 coords: x[Edge::Py],
                 depth,
             },
@@ -115,6 +121,7 @@ impl Chunk {
     }
 
     /// Length of one of this chunk's edges before mapping onto the sphere
+    #[must_use]
     pub fn edge_length<N: RealField>(&self) -> N {
         Coords::edge_length(self.resolution())
     }
@@ -122,6 +129,7 @@ impl Chunk {
     /// Location of the center of this chunk on the surface of the sphere
     ///
     /// Shorthand for `direction(&[0.5; 2].into())`.
+    #[must_use]
     pub fn origin<N: RealField + Copy>(&self) -> na::Unit<na::Vector3<N>> {
         let size = self.edge_length::<N>();
         let vec = na::Vector2::new(self.coords.x, self.coords.y)
@@ -133,6 +141,7 @@ impl Chunk {
     }
 
     /// Returns a grid of resolution^2 directions contained by the chunk, in scan-line order
+    #[must_use]
     pub fn samples<N: RealField + Copy>(&self, resolution: u32) -> SampleIter<N> {
         self.coords.samples(self.resolution(), resolution)
     }
@@ -142,11 +151,13 @@ impl Chunk {
     /// Because this returns data in batches of `S::VF32_WIDTH`, a few excess values will be
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
+    #[must_use]
     pub fn samples_ps<S: Simd>(&self, simd: S, resolution: u32) -> SampleIterSimd<S> {
         self.coords.samples_ps(simd, self.resolution(), resolution)
     }
 
     /// Compute the direction identified by a [0..1]^2 vector on this chunk
+    #[must_use]
     pub fn direction<N: RealField + Copy>(
         &self,
         coords: &na::Point2<N>,
@@ -155,8 +166,9 @@ impl Chunk {
     }
 
     /// Number of chunks at this depth along a cubemap edge, i.e. 2^depth
+    #[must_use]
     pub fn resolution(&self) -> u32 {
-        2u32.pow(self.depth as u32)
+        2u32.pow(u32::from(self.depth))
     }
 }
 

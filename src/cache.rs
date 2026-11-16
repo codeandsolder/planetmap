@@ -21,7 +21,7 @@ pub struct Config {
     /// Upper bound for `Neighborhood` fields
     ///
     /// Should be set to the base 2 logarithm of the number of quads along the edge of a chunk to
-    /// reduce stitching artifacts across extreme LoD boundaries.
+    /// reduce stitching artifacts across extreme `LoD` boundaries.
     pub max_neighbor_delta: u8,
 }
 
@@ -36,6 +36,7 @@ impl Default for Config {
 
 impl Config {
     /// Number of slots needed by this config to represent maximum detail for a worst-case viewpoint
+    #[must_use]
     pub fn slots_needed(&self) -> usize {
         Face::iter()
             .map(Chunk::root)
@@ -57,7 +58,6 @@ impl Config {
     }
 }
 
-/// Helper for streaming `Chunk`-oriented LoD into a fixed-size cache
 /// Failure to cancel an unfinished cache slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelError {
@@ -77,6 +77,7 @@ impl std::fmt::Display for CancelError {
 }
 impl std::error::Error for CancelError {}
 
+/// Helper for streaming `Chunk`-oriented `LoD` into a fixed-size cache
 pub struct Manager {
     chunks: Slab<Slot>,
     index: HashMap<Chunk, u32>,
@@ -88,6 +89,7 @@ pub struct Manager {
 
 impl Manager {
     /// Create a manager for a cache of `slots` slots
+    #[must_use]
     pub fn new(slots: usize, config: Config) -> Self {
         Self {
             chunks: Slab::with_capacity(slots),
@@ -158,8 +160,9 @@ impl Manager {
         self.frame += 1;
     }
 
-    /// Chunks that can be rendered immediately, with their LoD neighborhood and slot index
+    /// Chunks that can be rendered immediately, with their `LoD` neighborhood and slot index
     #[inline]
+    #[must_use]
     pub fn renderable(&self) -> &[(Chunk, Neighborhood, u32)] {
         &self.render
     }
@@ -172,11 +175,13 @@ impl Manager {
         if self.chunks.len() == self.chunks.capacity() {
             return None;
         }
-        let slot = self.chunks.insert(Slot {
+        let entry = self.chunks.vacant_entry();
+        let slot = u32::try_from(entry.key()).ok()?;
+        entry.insert(Slot {
             chunk,
             ready: false,
             in_frame: 0,
-        }) as u32;
+        });
         let old = self.index.insert(chunk, slot);
         debug_assert!(
             old.is_none(),
@@ -192,6 +197,11 @@ impl Manager {
     ///
     /// This operation never discards completed terrain. It intentionally
     /// returns the removed chunk so external schedulers can verify ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CancelError::InvalidSlot`] for an unknown slot or
+    /// [`CancelError::CompletedSlot`] when the slot has already been released.
     pub fn cancel(&mut self, slot: u32) -> Result<Chunk, CancelError> {
         let idx = slot as usize;
         let Some(entry) = self.chunks.get(idx) else {
@@ -216,7 +226,7 @@ impl Manager {
     }
 
     fn get(&self, chunk: &Chunk) -> Option<u32> {
-        self.index.get(chunk).cloned()
+        self.index.get(chunk).copied()
     }
 
     fn walk(
@@ -233,7 +243,7 @@ impl Manager {
                 viewpoints,
                 transfers,
                 visited,
-                ChunkState {
+                &ChunkState {
                     chunk,
                     slot,
                     renderable: slot.is_some_and(|idx| self.chunks[idx as usize].ready),
@@ -266,7 +276,7 @@ impl Manager {
         viewpoints: &[na::Point3<f64>],
         transfers: &mut Vec<Chunk>,
         visited: &mut Option<&mut Vec<Chunk>>,
-        chunk: ChunkState,
+        chunk: &ChunkState,
     ) {
         if let Some(list) = visited.as_deref_mut() {
             list.push(chunk.chunk);
@@ -284,9 +294,9 @@ impl Manager {
                 .iter()
                 .any(|v| needs_subdivision(&chunk.chunk, v));
         if !subdivide {
-            if chunk.renderable {
+            if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
                 self.render
-                    .push((chunk.chunk, Neighborhood::default(), chunk.slot.unwrap()));
+                    .push((chunk.chunk, Neighborhood::default(), slot));
             }
             return;
         }
@@ -304,9 +314,11 @@ impl Manager {
             .iter()
             .all(|slot| slot.is_some_and(|x| self.chunks[x as usize].ready));
         // If this subtree should be rendered and the children can't be rendered, this chunk must be rendered.
-        if chunk.renderable && !children_renderable {
-            self.render
-                .push((chunk.chunk, Neighborhood::default(), chunk.slot.unwrap()));
+        if !children_renderable {
+            if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
+                self.render
+                    .push((chunk.chunk, Neighborhood::default(), slot));
+            }
         }
         // Recurse into the children
         for (&child, &slot) in children.iter().zip(child_slots.iter()) {
@@ -314,7 +326,7 @@ impl Manager {
                 viewpoints,
                 transfers,
                 visited,
-                ChunkState {
+                &ChunkState {
                     chunk: child,
                     renderable: children_renderable,
                     slot,
@@ -324,7 +336,7 @@ impl Manager {
     }
 }
 
-/// For each edge of a particular chunk, this represents the number of LoD levels higher that chunk
+/// For each edge of a particular chunk, this represents the number of `LoD` levels higher that chunk
 /// is than its neighbor on that edge.
 ///
 /// Smoothly interpolating across chunk boundaries requires careful attention to these values. In
@@ -333,24 +345,24 @@ impl Manager {
 /// terrain using heightmapped tiles should weld together a subset of the vertices on an edge shared
 /// with a lower-detail chunk.
 ///
-/// Note that increases in LoD are not represented here; it is always the responsibility of the
+/// Note that increases in `LoD` are not represented here; it is always the responsibility of the
 /// higher-detail chunk to account for neighboring lower-detail chunks.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct Neighborhood {
-    /// Decrease in LoD in the local -X direction
+    /// Decrease in `LoD` in the local -X direction
     pub nx: u8,
-    /// Decrease in LoD in the local -Y direction
+    /// Decrease in `LoD` in the local -Y direction
     pub ny: u8,
-    /// Decrease in LoD in the local +X direction
+    /// Decrease in `LoD` in the local +X direction
     pub px: u8,
-    /// Decrease in LoD in the local +Y direction
+    /// Decrease in `LoD` in the local +Y direction
     pub py: u8,
 }
 
 impl Index<Edge> for Neighborhood {
     type Output = u8;
     fn index(&self, edge: Edge) -> &u8 {
-        use Edge::*;
+        use Edge::{Nx, Ny, Px, Py};
         match edge {
             Nx => &self.nx,
             Ny => &self.ny,
@@ -362,7 +374,7 @@ impl Index<Edge> for Neighborhood {
 
 impl IndexMut<Edge> for Neighborhood {
     fn index_mut(&mut self, edge: Edge) -> &mut u8 {
-        use Edge::*;
+        use Edge::{Nx, Ny, Px, Py};
         match edge {
             Nx => &mut self.nx,
             Ny => &mut self.ny,
@@ -383,7 +395,7 @@ struct ChunkState {
 fn needs_subdivision(chunk: &Chunk, viewpoint: &na::Point3<f64>) -> bool {
     // Half-angle of the cone whose edges are simultaneously tangent to the edges of a pair of
     // circles inscribed on a chunk at depth D and a neighbor of that chunk at depth D+1. Setting a
-    // threshold larger than this leads to LoD deltas greater than 1 across edges.
+    // threshold larger than this leads to `LoD` deltas greater than 1 across edges.
     let max_half_angle = 1.0f64.atan2(10.0f64.sqrt());
 
     let center = na::Point3::from(chunk.origin().into_inner());
@@ -527,7 +539,7 @@ mod test {
         let mut transfers = Vec::new();
         mgr.update(&[viewpoint], &mut transfers);
         assert_eq!(mgr.renderable().len(), 0);
-        // Get +X to LoD 1, +Y to LoD 0
+        // Get +X to `LoD` 1, +Y to `LoD` 0
         for &chunk in &[
             Chunk {
                 coords: Coords {
