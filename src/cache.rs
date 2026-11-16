@@ -58,6 +58,25 @@ impl Config {
 }
 
 /// Helper for streaming `Chunk`-oriented LoD into a fixed-size cache
+/// Failure to cancel an unfinished cache slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelError {
+    /// The slot was never allocated or has already been removed.
+    InvalidSlot(u32),
+    /// Ready slots must instead be evicted by the manager after a viewpoint update.
+    CompletedSlot(u32),
+}
+
+impl std::fmt::Display for CancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSlot(slot) => write!(f, "invalid cache slot {slot}"),
+            Self::CompletedSlot(slot) => write!(f, "cache slot {slot} is already ready"),
+        }
+    }
+}
+impl std::error::Error for CancelError {}
+
 pub struct Manager {
     chunks: Slab<Slot>,
     index: HashMap<Chunk, u32>,
@@ -87,9 +106,37 @@ impl Manager {
     ///
     /// Writes unavailable chunks needed for target quality to `transfer`.
     pub fn update(&mut self, viewpoints: &[na::Point3<f64>], transfer: &mut Vec<Chunk>) {
+        self.update_inner(viewpoints, transfer, None);
+    }
+
+    /// Updates the render cut and reports *every* chunk selected by the
+    /// current viewpoint traversal, including already allocated and pending
+    /// chunks. Applications can use `visited` to cancel obsolete in-flight
+    /// requests without guessing which parts of the quadtree are needed.
+    ///
+    /// Both vectors are cleared before use. The visited list contains no
+    /// duplicate chunks for a single update.
+    pub fn update_with_visited(
+        &mut self,
+        viewpoints: &[na::Point3<f64>],
+        transfer: &mut Vec<Chunk>,
+        visited: &mut Vec<Chunk>,
+    ) {
+        self.update_inner(viewpoints, transfer, Some(visited));
+    }
+
+    fn update_inner(
+        &mut self,
+        viewpoints: &[na::Point3<f64>],
+        transfer: &mut Vec<Chunk>,
+        mut visited: Option<&mut Vec<Chunk>>,
+    ) {
         transfer.clear();
+        if let Some(list) = visited.as_deref_mut() {
+            list.clear();
+        }
         self.render.clear();
-        self.walk(viewpoints, transfer);
+        self.walk(viewpoints, transfer, &mut visited);
 
         // Make room for transfers by discarding chunks that we don't currently need.
         let mut available = self.chunks.capacity() - self.chunks.len();
@@ -138,6 +185,27 @@ impl Manager {
         Some(slot)
     }
 
+    /// Revoke an unfinished allocation and make its slot immediately
+    /// reusable. The caller is responsible for invalidating any asynchronous
+    /// writer/completion associated with this allocation before another job
+    /// can use the recycled slot.
+    ///
+    /// This operation never discards completed terrain. It intentionally
+    /// returns the removed chunk so external schedulers can verify ownership.
+    pub fn cancel(&mut self, slot: u32) -> Result<Chunk, CancelError> {
+        let idx = slot as usize;
+        let Some(entry) = self.chunks.get(idx) else {
+            return Err(CancelError::InvalidSlot(slot));
+        };
+        if entry.ready {
+            return Err(CancelError::CompletedSlot(slot));
+        }
+        let chunk = self.chunks.remove(idx).chunk;
+        let previous = self.index.remove(&chunk);
+        debug_assert_eq!(previous, Some(slot));
+        Ok(chunk)
+    }
+
     /// Indicate that a previously `allocate`d slot can now be safely read or reused
     pub fn release(&mut self, slot: u32) {
         debug_assert!(
@@ -151,7 +219,12 @@ impl Manager {
         self.index.get(chunk).cloned()
     }
 
-    fn walk(&mut self, viewpoints: &[na::Point3<f64>], transfers: &mut Vec<Chunk>) {
+    fn walk(
+        &mut self,
+        viewpoints: &[na::Point3<f64>],
+        transfers: &mut Vec<Chunk>,
+        visited: &mut Option<&mut Vec<Chunk>>,
+    ) {
         // Gather the set of chunks we can should render and want to transfer
         for chunk in Face::iter().map(Chunk::root) {
             let slot = self.get(&chunk);
@@ -159,6 +232,7 @@ impl Manager {
             self.walk_inner(
                 viewpoints,
                 transfers,
+                visited,
                 ChunkState {
                     chunk,
                     slot,
@@ -191,8 +265,12 @@ impl Manager {
         &mut self,
         viewpoints: &[na::Point3<f64>],
         transfers: &mut Vec<Chunk>,
+        visited: &mut Option<&mut Vec<Chunk>>,
         chunk: ChunkState,
     ) {
+        if let Some(list) = visited.as_deref_mut() {
+            list.push(chunk.chunk);
+        }
         // If this chunk is already associated with a cache slot, preserve that slot; otherwise,
         // tell the caller we want it.
         if let Some(idx) = chunk.slot {
@@ -235,6 +313,7 @@ impl Manager {
             self.walk_inner(
                 viewpoints,
                 transfers,
+                visited,
                 ChunkState {
                     chunk: child,
                     renderable: children_renderable,
@@ -320,6 +399,94 @@ fn needs_subdivision(chunk: &Chunk, viewpoint: &na::Point3<f64>) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn cancellation_releases_only_unfinished_slots_and_can_be_reallocated() {
+        let mut mgr = Manager::new(
+            6,
+            Config {
+                max_depth: 1,
+                max_neighbor_delta: 1,
+            },
+        );
+        let root = Chunk::root(Face::Px);
+        let slot = mgr.allocate(root).expect("room for first patch");
+        assert_eq!(mgr.cancel(slot), Ok(root));
+        assert_eq!(mgr.cancel(slot), Err(CancelError::InvalidSlot(slot)));
+        let reused = mgr.allocate(root).expect("cancel frees cache slot");
+        assert_eq!(reused, slot);
+        mgr.release(reused);
+        assert_eq!(mgr.cancel(reused), Err(CancelError::CompletedSlot(reused)));
+    }
+
+    #[test]
+    fn visited_reports_current_viewpoint_tree_including_pending_chunks() {
+        use std::collections::HashSet;
+
+        let mut mgr = Manager::new(
+            2048,
+            Config {
+                max_depth: 5,
+                max_neighbor_delta: 1,
+            },
+        );
+        let east = na::Point3::new(1.001, 0.0, 0.0);
+        let west = na::Point3::new(-1.001, 0.0, 0.0);
+        let mut transfer = Vec::new();
+        let mut visited = Vec::new();
+        mgr.update_with_visited(&[east], &mut transfer, &mut visited);
+        assert!(!transfer.is_empty());
+        assert!(transfer.iter().all(|chunk| visited.contains(chunk)));
+        assert_eq!(visited.len(), visited.iter().collect::<HashSet<_>>().len());
+        let pending = *transfer
+            .iter()
+            .find(|chunk| chunk.depth >= 3)
+            .expect("near-viewpoint deep patch");
+        let slot = mgr.allocate(pending).unwrap();
+        mgr.update_with_visited(&[west], &mut transfer, &mut visited);
+        assert!(
+            !visited.contains(&pending),
+            "opposite hemisphere should not need old deep patch"
+        );
+        assert_eq!(mgr.cancel(slot), Ok(pending));
+        mgr.update_with_visited(&[east], &mut transfer, &mut visited);
+        assert!(
+            transfer.contains(&pending),
+            "cancelled tile must be requested again"
+        );
+    }
+
+    #[test]
+    fn cancellation_preserves_completed_parent_fallback() {
+        let mut mgr = Manager::new(
+            128,
+            Config {
+                max_depth: 2,
+                max_neighbor_delta: 1,
+            },
+        );
+        for face in Face::iter() {
+            let slot = mgr.allocate(Chunk::root(face)).unwrap();
+            mgr.release(slot);
+        }
+        let viewpoint = na::Point3::new(1.001, 0.0, 0.0);
+        let mut transfer = Vec::new();
+        let mut visited = Vec::new();
+        mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
+        let pending = *transfer.iter().find(|c| c.depth == 1).unwrap();
+        let slot = mgr.allocate(pending).unwrap();
+        assert_eq!(mgr.cancel(slot), Ok(pending));
+        mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
+        assert!(transfer.contains(&pending));
+        assert!(
+            mgr.renderable().contains(&(
+                Chunk::root(pending.coords.face),
+                Neighborhood::default(),
+                mgr.index[&Chunk::root(pending.coords.face)],
+            )),
+            "root must stay rendered during incomplete child split"
+        );
+    }
 
     #[test]
     fn transfer_completeness() {
