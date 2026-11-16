@@ -19,12 +19,12 @@ struct Slot {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Maximum depth of quad-tree traversal
-    pub max_depth: u8,
+    pub(crate) max_depth: u8,
     /// Upper bound for `Neighborhood` fields
     ///
     /// Should be set to the base 2 logarithm of the number of quads along the edge of a chunk to
     /// reduce stitching artifacts across extreme `LoD` boundaries.
-    pub max_neighbor_delta: u8,
+    pub(crate) max_neighbor_delta: u8,
 }
 
 impl Default for Config {
@@ -36,27 +36,72 @@ impl Default for Config {
     }
 }
 
+/// Failure to create an addressable terrain cache configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheConfigError {
+    /// The quadtree depth exceeds the range supported by 32-bit grid coordinates.
+    Depth(u8),
+    /// A slot count is zero or cannot be represented as 32-bit cache indices.
+    Slots(usize),
+}
+
+impl std::fmt::Display for CacheConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Depth(depth) => write!(f, "cache depth {depth} exceeds maximum 31"),
+            Self::Slots(slots) => write!(f, "cache slots {slots} must fit in 1..=u32::MAX"),
+        }
+    }
+}
+impl std::error::Error for CacheConfigError {}
+
 impl Config {
-    /// Number of slots needed by this config to represent maximum detail for a worst-case viewpoint
-    #[must_use]
-    pub fn slots_needed(&self) -> usize {
-        Face::iter()
-            .map(Chunk::root)
-            .map(|x| self.slots_needed_inner(&x))
-            .sum()
+    /// Construct an addressable terrain cache configuration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a maximum depth that cannot be represented as a `u32` face grid.
+    pub const fn new(max_depth: u8, max_neighbor_delta: u8) -> Result<Self, CacheConfigError> {
+        if max_depth > Chunk::MAX_DEPTH {
+            return Err(CacheConfigError::Depth(max_depth));
+        }
+        Ok(Self {
+            max_depth,
+            max_neighbor_delta,
+        })
     }
 
-    fn slots_needed_inner(&self, chunk: &Chunk) -> usize {
+    /// Maximum quadtree depth that can be selected for a viewpoint.
+    #[must_use]
+    pub const fn max_depth(&self) -> u8 {
+        self.max_depth
+    }
+
+    /// Maximum amount of `LoD` coarsening reported across a shared edge.
+    #[must_use]
+    pub const fn max_neighbor_delta(&self) -> u8 {
+        self.max_neighbor_delta
+    }
+
+    /// Number of slots needed by this config to represent maximum detail for a worst-case viewpoint
+    #[must_use]
+    pub fn slots_needed(&self) -> Option<usize> {
+        Face::iter()
+            .map(Chunk::root)
+            .try_fold(0_usize, |sum, chunk| {
+                sum.checked_add(self.slots_needed_inner(&chunk)?)
+            })
+    }
+
+    fn slots_needed_inner(&self, chunk: &Chunk) -> Option<usize> {
         let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
         if chunk.depth == self.max_depth || !needs_subdivision(chunk, &viewpoint) {
-            return 1;
+            return Some(1);
         }
-        chunk
-            .children()
-            .iter()
-            .map(|x| self.slots_needed_inner(x))
-            .sum::<usize>()
-            + 1
+        let children = chunk.children()?;
+        children.iter().try_fold(1_usize, |sum, child| {
+            sum.checked_add(self.slots_needed_inner(child)?)
+        })
     }
 }
 
@@ -82,6 +127,7 @@ impl std::error::Error for CancelError {}
 /// Helper for streaming `Chunk`-oriented `LoD` into a fixed-size cache
 pub struct Manager {
     chunks: Slab<Slot>,
+    max_slots: usize,
     index: HashMap<Chunk, u32>,
     config: Config,
     /// Frame counter used to update `Slot.in_frame`
@@ -90,16 +136,27 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Create a manager for a cache of `slots` slots
-    #[must_use]
-    pub fn new(slots: usize, config: Config) -> Self {
-        Self {
-            chunks: Slab::with_capacity(slots),
-            index: HashMap::with_capacity(slots),
+    /// Create a manager for a cache of `slots` slots.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero slots, slot counts exceeding `u32::MAX` and invalid
+    /// depth configurations. Storage is grown on demand, not preallocated.
+    pub fn new(slots: usize, config: Config) -> Result<Self, CacheConfigError> {
+        if slots == 0 || slots > u32::MAX as usize {
+            return Err(CacheConfigError::Slots(slots));
+        }
+        if config.max_depth > Chunk::MAX_DEPTH {
+            return Err(CacheConfigError::Depth(config.max_depth));
+        }
+        Ok(Self {
+            chunks: Slab::new(),
+            max_slots: slots,
+            index: HashMap::new(),
             config,
             frame: 0,
-            render: Vec::with_capacity(slots),
-        }
+            render: Vec::new(),
+        })
     }
 
     /// Compute slots to render for a given set of viewpoints, and to load for improved detail in
@@ -146,7 +203,7 @@ impl Manager {
         self.walk(viewpoints, transfer, &mut visited);
 
         // Make room for transfers by discarding chunks that we don't currently need.
-        let mut available = self.chunks.capacity() - self.chunks.len();
+        let mut available = self.max_slots - self.chunks.len();
         for idx in 0..self.chunks.capacity() {
             if available >= transfer.len() {
                 break;
@@ -177,7 +234,7 @@ impl Manager {
     /// Determines where in the cache to transfer chunk data to. Returns `None` if the cache is
     /// full or the chunk already has a slot (pending or ready).
     pub fn allocate(&mut self, chunk: Chunk) -> Option<u32> {
-        if self.index.contains_key(&chunk) || self.chunks.len() == self.chunks.capacity() {
+        if self.index.contains_key(&chunk) || self.chunks.len() == self.max_slots {
             return None;
         }
         let entry = self.chunks.vacant_entry();
@@ -313,7 +370,9 @@ impl Manager {
             return;
         }
 
-        let children = chunk.chunk.children();
+        let Some(children) = chunk.chunk.children() else {
+            return;
+        };
         let child_slots = [
             self.get(&children[Edge::Nx]),
             self.get(&children[Edge::Ny]),
@@ -425,8 +484,35 @@ mod test {
     use super::*;
 
     #[test]
+    fn cache_rejects_invalid_depth_or_capacity_and_allocates_lazily() {
+        assert!(matches!(
+            Config::new(32, 1),
+            Err(CacheConfigError::Depth(32))
+        ));
+        let config = Config::new(31, u8::MAX).unwrap();
+        assert_eq!(config.max_depth(), 31);
+        assert_eq!(config.max_neighbor_delta(), u8::MAX);
+        assert!(matches!(
+            Manager::new(0, config.clone()),
+            Err(CacheConfigError::Slots(0))
+        ));
+        if let Ok(too_many) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(matches!(
+                Manager::new(too_many, config.clone()),
+                Err(CacheConfigError::Slots(_))
+            ));
+        }
+        let mut manager = Manager::new(100_000_000, config).unwrap();
+        assert_eq!(manager.chunks.capacity(), 0);
+        let slot = manager.allocate(Chunk::root(Face::Px)).unwrap();
+        assert_eq!(slot, 0);
+        assert!(manager.chunks.capacity() < 32);
+    }
+
+    #[test]
     fn duplicate_allocation_preserves_cache_slot_identity() {
-        let mut manager = Manager::new(2, Config::default());
+        let mut manager =
+            Manager::new(2, Config::default()).expect("valid test cache configuration");
         let first = Chunk::root(Face::Px);
         let second = Chunk::root(Face::Py);
         let slot = manager.allocate(first).unwrap();
@@ -452,7 +538,8 @@ mod test {
                 max_depth: 1,
                 max_neighbor_delta: 1,
             },
-        );
+        )
+        .expect("valid test cache configuration");
         let root = Chunk::root(Face::Px);
         let slot = mgr.allocate(root).expect("room for first patch");
         assert_eq!(mgr.cancel(slot), Ok(root));
@@ -473,7 +560,8 @@ mod test {
                 max_depth: 5,
                 max_neighbor_delta: 1,
             },
-        );
+        )
+        .expect("valid test cache configuration");
         let east = na::Point3::new(1.001, 0.0, 0.0);
         let west = na::Point3::new(-1.001, 0.0, 0.0);
         let mut transfer = Vec::new();
@@ -508,7 +596,8 @@ mod test {
                 max_depth: 2,
                 max_neighbor_delta: 1,
             },
-        );
+        )
+        .expect("valid test cache configuration");
         for face in Face::iter() {
             let slot = mgr.allocate(Chunk::root(face)).unwrap();
             mgr.release(slot);
@@ -534,7 +623,8 @@ mod test {
 
     #[test]
     fn transfer_completeness() {
-        let mut mgr = Manager::new(2048, Config::default());
+        let mut mgr =
+            Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let mut transfers = Vec::new();
         mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
         assert_eq!(mgr.renderable().len(), 0);
@@ -555,8 +645,8 @@ mod test {
                 max_depth,
                 ..Config::default()
             };
-            let needed = config.slots_needed();
-            let mut mgr = Manager::new(2048, config);
+            let needed = config.slots_needed().unwrap();
+            let mut mgr = Manager::new(2048, config).expect("valid test cache configuration");
             let mut transfers = Vec::new();
             mgr.update(&[viewpoint], &mut transfers);
             assert_eq!(transfers.len(), needed);
@@ -566,7 +656,8 @@ mod test {
     #[test]
     fn neighborhood() {
         use crate::cubemap::Coords;
-        let mut mgr = Manager::new(2048, Config::default());
+        let mut mgr =
+            Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
         let mut transfers = Vec::new();
         mgr.update(&[viewpoint], &mut transfers);
@@ -660,7 +751,8 @@ mod test {
 
     #[test]
     fn incremental_transfer() {
-        let mut mgr = Manager::new(2048, Config::default());
+        let mut mgr =
+            Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let viewpoint = na::Point3::from(na::Vector3::new(0.0, 1.0, 0.0));
         let mut transfers = Vec::new();
         mgr.update(&[viewpoint], &mut transfers);
@@ -689,7 +781,8 @@ mod test {
                 max_depth: 4,
                 max_neighbor_delta: u8::MAX,
             },
-        );
+        )
+        .expect("valid test cache configuration");
         let viewpoints = [
             na::Point3::new(1.001, 0.5, 0.5),
             na::Point3::new(-0.75, 0.5, -1.0),
@@ -733,7 +826,8 @@ mod test {
                 max_depth: 6,
                 max_neighbor_delta: u8::MAX,
             },
-        );
+        )
+        .expect("valid test cache configuration");
         let viewpoints = [
             na::Point3::new(1.001, 0.1, 0.1),
             na::Point3::new(-1.001, 0.4, 0.2),

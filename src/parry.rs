@@ -248,8 +248,11 @@ impl Planet {
         slot * self.triangles_per_chunk() + triangle
     }
 
-    /// Applies the function `f` to all the triangles intersecting the given sphere. Exits early on
-    /// `false` return.
+    /// Applies the function `f` to potentially overlapping triangles, exiting
+    /// early when it returns `false`. `f` is invoked without holding the cache
+    /// mutex and may safely reenter this planet. As with any query over an LRU
+    /// cache, a callback that loads other chunks can recycle slot identifiers;
+    /// the numeric slot is an ephemeral identifier, not a persistent handle.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "The cubemap neighbor lookup uses f32 directions and angular bounds by design"
@@ -262,10 +265,6 @@ impl Planet {
     ) {
         let dir = bounds.center();
         let distance = dir.length();
-        let cache = &mut *self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A bounding sphere at distance d subtends asin(r/d), not
         // atan2(r, d). If it contains the planet origin, its angular
         // coverage is the entire sphere.
@@ -280,7 +279,14 @@ impl Planet {
             na3f32(dir),
             angular_radius as f32,
         ) {
-            let (slot, data) = cache.get(self, &chunk_coords);
+            // Never call an application-provided callback with our cache lock
+            // held. An Arc keeps the geometry alive even if a nested query
+            // evicts this slot before the callback completes.
+            let (slot, data) = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(self, &chunk_coords);
             if self.radius + f64::from(data.max) + bounds.radius() < distance
                 || self.radius + f64::from(data.min) - bounds.radius() > distance
             {
@@ -560,7 +566,7 @@ impl Shape for Planet {
 
 #[derive(Clone)]
 struct Cache {
-    slots: LruSlab<ChunkData>,
+    slots: LruSlab<Arc<ChunkData>>,
     index: HashMap<Coords, u32>,
     max_size: u32,
 }
@@ -576,7 +582,7 @@ impl Cache {
         }
     }
 
-    pub fn get(&mut self, planet: &Planet, coords: &Coords) -> (u32, &ChunkData) {
+    pub fn get(&mut self, planet: &Planet, coords: &Coords) -> (u32, Arc<ChunkData>) {
         let (slot, old) = match self.index.entry(*coords) {
             hash_map::Entry::Occupied(e) => (*e.get(), None),
             hash_map::Entry::Vacant(e) => {
@@ -587,7 +593,7 @@ impl Cache {
                 };
                 let slot = self
                     .slots
-                    .insert(ChunkData::new(*coords, planet.sample(coords)));
+                    .insert(Arc::new(ChunkData::new(*coords, planet.sample(coords))));
                 e.insert(slot);
                 (slot, old)
             }
@@ -595,7 +601,7 @@ impl Cache {
         if let Some(old) = old {
             self.index.remove(&old);
         }
-        (slot, self.slots.get_mut(slot))
+        (slot, Arc::clone(self.slots.get_mut(slot)))
     }
 }
 
@@ -1486,6 +1492,36 @@ mod tests {
         fn max_height(&self) -> f32 {
             self.max
         }
+    }
+
+    #[test]
+    fn collider_callback_can_reenter_cache_and_evict_current_chunk() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 5).unwrap()), 1, 10.0).unwrap();
+        let center = Vector::new(10.0, 0.0, 0.0);
+        let bounds = BoundingSphere::new(center, 7.0);
+        let aabb = Aabb::from_half_extents(center, Vector::splat(7.0));
+        let mut seen = 0;
+        planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, _, _| {
+            // Previously the callback was invoked while holding this mutex.
+            assert!(planet.cache.try_lock().is_ok());
+            // Reenter a different cubemap face with capacity 1 to ensure the
+            // outer Arc snapshot remains valid after its LRU slot is evicted.
+            let mut cache = planet.cache.lock().unwrap();
+            let other = Coords {
+                x: 0,
+                y: 0,
+                face: Face::Py,
+            };
+            let _ = cache.get(&planet, &other);
+            drop(cache);
+            assert_eq!(coords.face, Face::Px);
+            seen += 1;
+            true
+        });
+        assert!(
+            seen > 0,
+            "expected collision callback to visit terrain triangles"
+        );
     }
 
     #[test]
