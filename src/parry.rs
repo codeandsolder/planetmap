@@ -1835,7 +1835,8 @@ impl Planet {
         let cap_radius = bounds.radius() + *max_distance;
         let inscribed = self.radius / 3.0_f64.sqrt() + f64::from(self.terrain.min_height());
         if inscribed <= 64.0 * f64::EPSILON * self.radius
-            || !(distance > cap_radius)
+            || !distance.is_finite()
+            || distance <= cap_radius
             || !cap_radius.is_finite()
         {
             return None;
@@ -1868,6 +1869,58 @@ impl Planet {
             }
         }
         Some(true)
+    }
+
+    /// Visit a region's single terrain chunk after distance pruning. A
+    /// finite bound allows exact AABB/sphere filtering; only an unsupported
+    /// or non-finite initial result forces transient full-chunk inspection.
+    fn visit_proximity_leaf(
+        &self,
+        coords: Coords,
+        bounds: &BoundingSphere,
+        other_aabb: &Aabb,
+        roundoff: f64,
+        max_distance: &mut Real,
+        visitor: &mut impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
+    ) -> bool {
+        if max_distance.is_infinite() {
+            let patch = Patch::new(&coords, self.terrain.face_resolution());
+            let (_, data) = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(self, &coords);
+            for quad in patch.quads(self.chunk_resolution) {
+                for (index, triangle) in quad
+                    .displace(self.radius, self.chunk_resolution, &data.samples)
+                    .triangles()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let triangle_id =
+                        (quad.index(self.chunk_resolution) << 1) | u32::from(index == 1);
+                    if !visitor(coords, triangle_id, &triangle, max_distance) {
+                        return false;
+                    }
+                }
+            }
+            true
+        } else {
+            let limit = (*max_distance + roundoff).max(0.0);
+            let search_aabb = other_aabb.loosened(limit);
+            let search_sphere = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
+            let mut continue_search = true;
+            self.map_elements_in_chunk(
+                coords,
+                &search_sphere,
+                &search_aabb,
+                &mut |&at, _, index, triangle| {
+                    continue_search = visitor(at, index, triangle, max_distance);
+                    continue_search
+                },
+            );
+            continue_search
+        }
     }
 
     /// Explore the complete surface for a shape-to-shape minimum-distance
@@ -1937,47 +1990,15 @@ impl Planet {
                     x: region.x0,
                     y: region.y0,
                 };
-                // The seed provides a finite cutoff for supported shape
-                // pairs. A local shape returning a non-finite result cannot
-                // establish a useful candidate: inspect the full patch.
-                if max_distance.is_infinite() {
-                    let patch = Patch::new(&coords, self.terrain.face_resolution());
-                    let (_, data) = self
-                        .cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(self, &coords);
-                    for quad in patch.quads(self.chunk_resolution) {
-                        for (index, triangle) in quad
-                            .displace(self.radius, self.chunk_resolution, &data.samples)
-                            .triangles()
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let triangle_id =
-                                (quad.index(self.chunk_resolution) << 1) | u32::from(index == 1);
-                            if !visitor(coords, triangle_id, &triangle, max_distance) {
-                                return;
-                            }
-                        }
-                    }
-                } else {
-                    let limit = (*max_distance + roundoff).max(0.0);
-                    let search_aabb = other_aabb.loosened(limit);
-                    let search_sphere = BoundingSphere::new(center, bounds.radius() + limit);
-                    let mut continue_search = true;
-                    self.map_elements_in_chunk(
-                        coords,
-                        &search_sphere,
-                        &search_aabb,
-                        &mut |&at, _, index, triangle| {
-                            continue_search = visitor(at, index, triangle, max_distance);
-                            continue_search
-                        },
-                    );
-                    if !continue_search {
-                        return;
-                    }
+                if !self.visit_proximity_leaf(
+                    coords,
+                    &bounds,
+                    &other_aabb,
+                    roundoff,
+                    max_distance,
+                    &mut visitor,
+                ) {
+                    return;
                 }
                 continue;
             }
@@ -2305,18 +2326,20 @@ fn planet_shape_distance(
         pos12,
         other,
         &mut max_distance,
-        |coords, index, triangle, limit| match dispatcher.distance(pos12, triangle, other) {
-            Ok(result) => {
-                if best.is_none_or(|(_, _, previous)| result.distance < previous.distance) {
-                    *limit = result.distance;
-                    best = Some((coords, index, result));
-                }
-                *limit > 0.0
-            }
-            Err(_) => {
-                unsupported = true;
-                false
-            }
+        |coords, index, triangle, limit| {
+            dispatcher.distance(pos12, triangle, other).map_or_else(
+                |_| {
+                    unsupported = true;
+                    false
+                },
+                |result| {
+                    if best.is_none_or(|(_, _, previous)| result.distance < previous.distance) {
+                        *limit = result.distance;
+                        best = Some((coords, index, result));
+                    }
+                    *limit > 0.0
+                },
+            )
         },
     );
     if unsupported {
@@ -2335,7 +2358,7 @@ fn planet_shape_closest_points(
     other: &dyn Shape,
     max_dist: Real,
 ) -> Result<ClosestPoints, Unsupported> {
-    if !(max_dist >= 0.0) {
+    if max_dist.is_nan() || max_dist < 0.0 {
         return Err(Unsupported);
     }
     if let Some(plane) = other.as_shape::<HalfSpace>() {
