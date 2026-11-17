@@ -6,7 +6,10 @@
 
 use std::{
     collections::BinaryHeap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use glam::UVec2;
@@ -258,6 +261,35 @@ impl Planet {
         slot * self.triangles_per_chunk() + triangle
     }
 
+    /// Search an uncached chunk without constructing its full displaced
+    /// vertex grid or quad index. Candidate leaves are checked against the
+    /// same exact world-space quad AABBs as the warmed index.
+    fn map_sparse_collision_quads(
+        &self,
+        patch: &Patch,
+        data: &ChunkData,
+        aabb: &Aabb,
+        emit: &mut impl FnMut(Quad) -> bool,
+    ) -> bool {
+        let sparse = SparseQuadSearch {
+            patch,
+            samples: &data.samples,
+            query: aabb,
+            radius: self.radius,
+            height_abs: f64::from(data.min).abs().max(f64::from(data.max).abs()),
+            resolution: self.chunk_resolution,
+        };
+        sparse.visit(
+            QuadCellRegion {
+                x0: 0,
+                x1: self.chunk_resolution - 1,
+                y0: 0,
+                y1: self.chunk_resolution - 1,
+            },
+            emit,
+        )
+    }
+
     /// Evaluate a candidate tile without holding the cache lock during
     /// callbacks; return false when the visitor requested an early exit.
     fn map_elements_in_chunk(
@@ -319,9 +351,21 @@ impl Planet {
         };
         let side = self.chunk_resolution - 1;
         if data.samples.len() <= MAX_CACHED_PROJECTION_VERTICES {
-            // Most collision chunks are small (e.g. 17x17 vertices).
-            // A cache of exact quad AABBs rejects non-overlapping quads
-            // without reconstructing their displaced triangle geometry.
+            // A warm chunk takes the original cached-index path after one
+            // relaxed counter load; avoid repeated OnceLock checks and an
+            // extra chunk-size branch in the steady-state collision path.
+            if data.broadphase_queries.load(AtomicOrdering::Relaxed)
+                < QUAD_INDEX_BUILD_AFTER_QUERIES
+                && data.quad_bounds.get().is_none()
+                && data
+                    .broadphase_queries
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    < QUAD_INDEX_BUILD_AFTER_QUERIES
+            {
+                return self.map_sparse_collision_quads(&patch, &data, aabb, &mut emit);
+            }
+            // Chunks receiving repeat queries retain the exact row/block
+            // index; extremely cold chunks do not allocate that index.
             let boxes = data.quad_bounds(self);
             let blocks_per_row = side.div_ceil(QUAD_BLOCK_WIDTH);
             for y in 0..side {
@@ -1494,6 +1538,113 @@ struct QuadBoundsIndex {
 }
 
 const QUAD_BLOCK_WIDTH: u32 = 8;
+/// Index on fourth collision query for a still-resident chunk; a single
+/// collision query should not build every vertex and bounding box.
+const QUAD_INDEX_BUILD_AFTER_QUERIES: u8 = 3;
+
+/// A rectangle of quad cells, with exclusive upper bounds.
+#[derive(Clone, Copy, Debug)]
+struct QuadCellRegion {
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+/// Sparse, proof-backed search for quads in a cold terrain chunk. It uses
+/// only four to six evaluations of the *undisplaced* piecewise-affine patch
+/// for each visited region, and displaces geometry only at candidate leaves.
+struct SparseQuadSearch<'a> {
+    patch: &'a Patch,
+    samples: &'a [f32],
+    query: &'a Aabb,
+    radius: f64,
+    height_abs: f64,
+    resolution: u32,
+}
+
+impl SparseQuadSearch<'_> {
+    /// `Patch::get(u,v)` is affine on each side of `u=v`, and continuous
+    /// along that diagonal. The extrema of its coordinates over a rectangle
+    /// occur at the four corners or the diagonal's boundary intersections.
+    /// A displaced vertex is R*v + h*normalize(v), whose height contribution
+    /// lies component-wise within `max(abs(min_height), abs(max_height))`.
+    /// Convex combinations preserve this AABB for complete triangle interiors.
+    fn conservative_bounds(&self, region: QuadCellRegion) -> Aabb {
+        let scale = 1.0 / f64::from(self.resolution - 1);
+        let left = f64::from(region.x0) * scale;
+        let right = f64::from(region.x1) * scale;
+        let bottom = f64::from(region.y0) * scale;
+        let top = f64::from(region.y1) * scale;
+        let mut lower = Vector::splat(f64::INFINITY);
+        let mut upper = Vector::splat(f64::NEG_INFINITY);
+        for uv in [
+            Vec2::new(left, bottom),
+            Vec2::new(right, bottom),
+            Vec2::new(left, top),
+            Vec2::new(right, top),
+        ] {
+            let vertex = self.patch.get(&uv);
+            lower = lower.min(vertex);
+            upper = upper.max(vertex);
+        }
+        let diagonal_start = left.max(bottom);
+        let diagonal_end = right.min(top);
+        if diagonal_start <= diagonal_end {
+            for coord in [diagonal_start, diagonal_end] {
+                let vertex = self.patch.get(&Vec2::splat(coord));
+                lower = lower.min(vertex);
+                upper = upper.max(vertex);
+            }
+        }
+        // Covers rounding in UV subdivision, affine interpolation, height
+        // displacement and world-space AABB comparisons, including 6,371 km
+        // planets and extremely small chunks.
+        let roundoff = 512.0
+            * f64::EPSILON
+            * (self.radius
+                + self.height_abs
+                + self.query.mins.abs().max_element()
+                + self.query.maxs.abs().max_element());
+        let extension = Vector::splat(self.height_abs + roundoff);
+        Aabb::new(
+            lower * self.radius - extension,
+            upper * self.radius + extension,
+        )
+    }
+
+    /// Returns false only if the callback explicitly terminates traversal.
+    fn visit(&self, region: QuadCellRegion, emit: &mut impl FnMut(Quad) -> bool) -> bool {
+        if !self.conservative_bounds(region).intersects(self.query) {
+            return true;
+        }
+        if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
+            let quad = Quad::new(
+                self.patch,
+                self.resolution - 1,
+                UVec2::new(region.x0, region.y0),
+            );
+            let displaced = quad.displace(self.radius, self.resolution, self.samples);
+            let [top_left, top_right, bottom_left, bottom_right] = displaced.corners;
+            let lower = top_left.min(top_right).min(bottom_left).min(bottom_right);
+            let upper = top_left.max(top_right).max(bottom_left).max(bottom_right);
+            return !Aabb::new(lower, upper).intersects(self.query) || emit(quad);
+        }
+        let mid_x = region.x0 + (region.x1 - region.x0) / 2;
+        let mid_y = region.y0 + (region.y1 - region.y0) / 2;
+        for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
+            if y0 == y1 {
+                continue;
+            }
+            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
+                if x0 != x1 && !self.visit(QuadCellRegion { x0, x1, y0, y1 }, emit) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
 
 #[derive(Debug)]
 struct ChunkData {
@@ -1506,6 +1657,7 @@ struct ChunkData {
     /// Exact AABBs of displaced quads in row-major order; initialized only
     /// by collision broadphase queries and shared by the chunk LRU's Arc.
     quad_bounds: OnceLock<QuadBoundsIndex>,
+    broadphase_queries: AtomicU8,
 }
 
 impl ChunkData {
@@ -1528,6 +1680,7 @@ impl ChunkData {
             max,
             projection_vertices: OnceLock::new(),
             quad_bounds: OnceLock::new(),
+            broadphase_queries: AtomicU8::new(0),
         }
     }
 
@@ -3149,6 +3302,203 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             }
         }
         assert!(inverted > 0);
+    }
+
+    #[test]
+    fn first_collision_query_does_not_build_whole_chunk_mesh() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 17).unwrap()), 1, 10.0).unwrap();
+        let coords = Coords {
+            face: Face::Px,
+            x: 0,
+            y: 0,
+        };
+        let patch = Patch::new(&coords, 1);
+        let samples = planet.sample(&coords);
+        let triangle = Quad::new(&patch, 16, UVec2::new(8, 8))
+            .displace(10.0, 17, &samples)
+            .triangles()[0];
+        let center = (triangle.a + triangle.b + triangle.c) / 3.0;
+        let aabb = Aabb::from_half_extents(center, Vector::splat(0.01));
+        let mut matched = false;
+        planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |&at, _, _, _| {
+            matched |= at == coords;
+            true
+        });
+        assert!(
+            matched,
+            "the cold query must still emit the actual surface triangle"
+        );
+        let cache = planet.cache.lock().unwrap();
+        for (_, data) in cache.slots.iter() {
+            assert!(
+                data.quad_bounds.get().is_none(),
+                "single cold query should not build all quad bounding boxes"
+            );
+            assert!(
+                data.projection_vertices.get().is_none(),
+                "single cold query should not build the whole displaced vertex grid"
+            );
+        }
+        drop(cache);
+        // The first three calls use sparse traversal. Repeated collision
+        // queries on a still-resident chunk graduate to the cached index.
+        for _ in 0..3 {
+            planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |_, _, _, _| true);
+        }
+        let cache = planet.cache.lock().unwrap();
+        assert!(
+            cache
+                .slots
+                .iter()
+                .any(|(_, data)| data.quad_bounds.get().is_some()),
+            "reused chunks must graduate to the existing warm index"
+        );
+    }
+
+    #[test]
+    fn sparse_region_bounds_cover_every_displaced_sample_in_nonuniform_terrain() {
+        // Includes diagonal crossings, non-power-of-two grids, reversed
+        // radial directions, six faces, and both small/planetary radii.
+        let mut seed = 0xa69e_3d94_1718_31c5_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 32) as u32
+        };
+        for (radius, radius_f32) in [(10.0, 10.0_f32), (6_371_000.0, 6_371_000.0_f32)] {
+            for resolution in [3, 4, 5, 9, 17] {
+                for face in Face::iter() {
+                    let coords = Coords { face, x: 0, y: 0 };
+                    let patch = Patch::new(&coords, 1);
+                    let mut samples = vec![0.0_f32; (resolution * resolution) as usize];
+                    for (index, height) in samples.iter_mut().enumerate() {
+                        let modulus = (index * 37 + usize::from(face as u8) * 13) % 101;
+                        let fraction = f32::from(u8::try_from(modulus).unwrap()) / 100.0;
+                        *height = fraction.mul_add(1.4, -0.9) * radius_f32;
+                    }
+                    let height_abs = samples
+                        .iter()
+                        .map(|height| f64::from(*height).abs())
+                        .fold(0.0, f64::max);
+                    let query = Aabb::from_half_extents(Vector::ZERO, Vector::splat(3.0 * radius));
+                    let search = SparseQuadSearch {
+                        patch: &patch,
+                        samples: &samples,
+                        query: &query,
+                        radius,
+                        height_abs,
+                        resolution,
+                    };
+                    let side = resolution - 1;
+                    for case in 0..64 {
+                        let x0 = next() % side;
+                        let x1 = x0 + 1 + next() % (side - x0);
+                        let y0 = next() % side;
+                        let y1 = y0 + 1 + next() % (side - y0);
+                        let region = QuadCellRegion { x0, x1, y0, y1 };
+                        let bound = search.conservative_bounds(region);
+                        for row in y0..y1 {
+                            for col in x0..x1 {
+                                let quad = Quad::new(&patch, side, UVec2::new(col, row));
+                                for vertex in quad.displace(radius, resolution, &samples).corners {
+                                    assert!(vertex.cmpge(bound.mins).all() && vertex.cmple(bound.maxs).all(),
+                                        "radius={radius},res={resolution},face={face:?},case={case},region={region:?},vertex={vertex:?},bound={bound:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
+        // Different heights at every *vertex*, rather than only one height
+        // per chunk, including negative values that reverse radial vectors.
+        struct VaryingHeight {
+            face_resolution: u32,
+            chunk_resolution: u32,
+        }
+        impl Terrain for VaryingHeight {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                for (index, sample) in out.iter_mut().enumerate() {
+                    let modulus = (index * 31
+                        + usize::try_from(coords.x).unwrap() * 13
+                        + usize::try_from(coords.y).unwrap() * 11
+                        + usize::from(coords.face as u8) * 17)
+                        % 101;
+                    *sample = f32::from(u8::try_from(modulus).unwrap()).mul_add(0.14, -9.0);
+                }
+            }
+            fn face_resolution(&self) -> u32 {
+                self.face_resolution
+            }
+            fn chunk_resolution(&self) -> u32 {
+                self.chunk_resolution
+            }
+            fn min_height(&self) -> f32 {
+                -9.0
+            }
+            fn max_height(&self) -> f32 {
+                5.0
+            }
+        }
+        for (face_resolution, resolution) in [(1, 9), (2, 5), (3, 4)] {
+            let planet = Planet::new(
+                Arc::new(VaryingHeight {
+                    face_resolution,
+                    chunk_resolution: resolution,
+                }),
+                1,
+                10.0,
+            )
+            .unwrap();
+            let mut triangles = Vec::new();
+            for face in Face::iter() {
+                for y in 0..face_resolution {
+                    for x in 0..face_resolution {
+                        let coords = Coords { face, x, y };
+                        let samples = planet.sample(&coords);
+                        let patch = Patch::new(&coords, face_resolution);
+                        for (index, triangle) in patch.triangles(10.0, resolution, &samples) {
+                            triangles.push((coords, index, triangle));
+                        }
+                    }
+                }
+            }
+            for case in 0..72 {
+                let (_, _, seed) = triangles[(case * 101 + 7) % triangles.len()];
+                let center = seed.a * 0.2 + seed.b * 0.3 + seed.c * 0.5;
+                let extent = [0.02, 0.2, 1.0, 4.0][case % 4];
+                let aabb = Aabb::from_half_extents(center, Vector::splat(extent));
+                let mut found = std::collections::HashSet::new();
+                planet.map_elements_in_local_sphere(
+                    &aabb.bounding_sphere(),
+                    &aabb,
+                    |&coords, _, index, _| {
+                        found.insert((coords, index));
+                        true
+                    },
+                );
+                let cuboid = Cuboid::new(Vector::splat(extent));
+                let pos12 = Pose::translation(center.x, center.y, center.z);
+                let missing: Vec<_> = triangles
+                    .iter()
+                    .filter(|(coords, index, triangle)| {
+                        triangle.compute_local_aabb().intersects(&aabb)
+                            && !found.contains(&(*coords, *index))
+                            && DefaultQueryDispatcher
+                                .intersection_test(&pos12, triangle, &cuboid)
+                                .unwrap()
+                                .intersecting
+                    })
+                    .map(|(coords, index, _)| (*coords, *index))
+                    .collect();
+                assert!(missing.is_empty(), "face_resolution={face_resolution},resolution={resolution},case={case},center={center:?},missing={missing:?}");
+            }
+        }
     }
 
     #[test]
