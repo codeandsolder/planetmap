@@ -265,7 +265,7 @@ impl Planet {
         chunk_coords: Coords,
         bounds: &BoundingSphere,
         aabb: &Aabb,
-        f: &mut impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+        visitor: &mut impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
     ) -> bool {
         let dir = bounds.center();
         let distance = dir.length();
@@ -311,7 +311,7 @@ impl Planet {
                 .enumerate()
             {
                 let index = (quad.index(self.chunk_resolution) << 1) | u32::from(i == 1);
-                if !f(&chunk_coords, slot, index, &triangle) {
+                if !visitor(&chunk_coords, slot, index, &triangle) {
                     return false;
                 }
             }
@@ -323,7 +323,7 @@ impl Planet {
             // A cache of exact quad AABBs rejects non-overlapping quads
             // without reconstructing their displaced triangle geometry.
             let boxes = data.quad_bounds(self);
-            let blocks_per_row = side.div_ceil(QUAD_BLOCK_WIDTH as u32);
+            let blocks_per_row = side.div_ceil(QUAD_BLOCK_WIDTH);
             for y in 0..side {
                 if !boxes.rows[y as usize].intersects(aabb) {
                     continue;
@@ -332,8 +332,8 @@ impl Planet {
                     if !boxes.blocks[(y * blocks_per_row + block) as usize].intersects(aabb) {
                         continue;
                     }
-                    let x_start = block * QUAD_BLOCK_WIDTH as u32;
-                    for x in x_start..(x_start + QUAD_BLOCK_WIDTH as u32).min(side) {
+                    let x_start = block * QUAD_BLOCK_WIDTH;
+                    for x in x_start..(x_start + QUAD_BLOCK_WIDTH).min(side) {
                         let i = (y * side + x) as usize;
                         if boxes.quads[i].intersects(aabb)
                             && !emit(Quad::new(&patch, side, UVec2::new(x, y)))
@@ -348,10 +348,10 @@ impl Planet {
             // with exactly the same world-space quad AABB semantics.
             for quad in patch.quads(self.chunk_resolution) {
                 let displaced = quad.displace(self.radius, self.chunk_resolution, &data.samples);
-                let [a, b, c, d] = displaced.corners;
-                if Aabb::new(a.min(b).min(c).min(d), a.max(b).max(c).max(d)).intersects(aabb)
-                    && !emit(quad)
-                {
+                let [top_left, top_right, bottom_left, bottom_right] = displaced.corners;
+                let lower = top_left.min(top_right).min(bottom_left).min(bottom_right);
+                let upper = top_left.max(top_right).max(bottom_left).max(bottom_right);
+                if Aabb::new(lower, upper).intersects(aabb) && !emit(quad) {
                     return false;
                 }
             }
@@ -1493,7 +1493,7 @@ struct QuadBoundsIndex {
     blocks: Box<[Aabb]>,
 }
 
-const QUAD_BLOCK_WIDTH: usize = 8;
+const QUAD_BLOCK_WIDTH: u32 = 8;
 
 #[derive(Debug)]
 struct ChunkData {
@@ -1538,21 +1538,24 @@ impl ChunkData {
             let vertices = self.projection_vertices(planet);
             let width = planet.chunk_resolution as usize;
             let side = width - 1;
-            let blocks_per_row = side.div_ceil(QUAD_BLOCK_WIDTH);
+            let block_width = QUAD_BLOCK_WIDTH as usize;
+            let blocks_per_row = side.div_ceil(block_width);
             let mut quads = Vec::with_capacity(side * side);
             let mut rows = Vec::with_capacity(side);
             let mut blocks = Vec::with_capacity(side * blocks_per_row);
             for y in 0..side {
                 let row_start = quads.len();
                 for x in 0..side {
-                    let i = y * width + x;
-                    let [a, b, c, d] = [
-                        vertices[i],
-                        vertices[i + 1],
-                        vertices[i + width],
-                        vertices[i + width + 1],
+                    let index = y * width + x;
+                    let [top_left, top_right, bottom_left, bottom_right] = [
+                        vertices[index],
+                        vertices[index + 1],
+                        vertices[index + width],
+                        vertices[index + width + 1],
                     ];
-                    quads.push(Aabb::new(a.min(b).min(c).min(d), a.max(b).max(c).max(d)));
+                    let lower = top_left.min(top_right).min(bottom_left).min(bottom_right);
+                    let upper = top_left.max(top_right).max(bottom_left).max(bottom_right);
+                    quads.push(Aabb::new(lower, upper));
                 }
                 let row = &quads[row_start..];
                 let mut row_box = row[0];
@@ -1560,7 +1563,7 @@ impl ChunkData {
                     row_box = row_box.merged(candidate);
                 }
                 rows.push(row_box);
-                for block in row.chunks(QUAD_BLOCK_WIDTH) {
+                for block in row.chunks(block_width) {
                     let mut block_box = block[0];
                     for candidate in &block[1..] {
                         block_box = block_box.merged(candidate);
