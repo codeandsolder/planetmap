@@ -261,6 +261,35 @@ impl Planet {
         slot * self.triangles_per_chunk() + triangle
     }
 
+    /// Search an uncached chunk without constructing its full displaced
+    /// vertex grid or quad index. Candidate leaves are checked against the
+    /// same exact world-space quad AABBs as the warmed index.
+    fn map_sparse_collision_quads(
+        &self,
+        patch: &Patch,
+        data: &ChunkData,
+        aabb: &Aabb,
+        emit: &mut impl FnMut(Quad) -> bool,
+    ) -> bool {
+        let sparse = SparseQuadSearch {
+            patch,
+            samples: &data.samples,
+            query: aabb,
+            radius: self.radius,
+            height_abs: f64::from(data.min).abs().max(f64::from(data.max).abs()),
+            resolution: self.chunk_resolution,
+        };
+        sparse.visit(
+            QuadCellRegion {
+                x0: 0,
+                x1: self.chunk_resolution - 1,
+                y0: 0,
+                y1: self.chunk_resolution - 1,
+            },
+            emit,
+        )
+    }
+
     /// Evaluate a candidate tile without holding the cache lock during
     /// callbacks; return false when the visitor requested an early exit.
     fn map_elements_in_chunk(
@@ -328,26 +357,9 @@ impl Planet {
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 < QUAD_INDEX_BUILD_AFTER_QUERIES
         {
-            // Most one-off collision queries touch only a handful of
-            // quads. Use conservative affine patch bounds and never build
-            // the entire vertex grid or index for these cold chunks.
-            let sparse = SparseQuadSearch {
-                patch: &patch,
-                samples: &data.samples,
-                query: aabb,
-                radius: self.radius,
-                height_abs: f64::from(data.min).abs().max(f64::from(data.max).abs()),
-                resolution: self.chunk_resolution,
-            };
-            if !sparse.visit(
-                QuadCellRegion {
-                    x0: 0,
-                    x1: side,
-                    y0: 0,
-                    y1: side,
-                },
-                &mut emit,
-            ) {
+            // Only inspect relevant quads; a frequently reused chunk
+            // subsequently promotes to the exact cached row/block index.
+            if !self.map_sparse_collision_quads(&patch, &data, aabb, &mut emit) {
                 return false;
             }
         } else if data.samples.len() <= MAX_CACHED_PROJECTION_VERTICES {
@@ -1557,7 +1569,7 @@ impl SparseQuadSearch<'_> {
     /// along that diagonal. The extrema of its coordinates over a rectangle
     /// occur at the four corners or the diagonal's boundary intersections.
     /// A displaced vertex is R*v + h*normalize(v), whose height contribution
-    /// lies component-wise within +/-max(|min_height|,|max_height|).
+    /// lies component-wise within `max(abs(min_height), abs(max_height))`.
     /// Convex combinations preserve this AABB for complete triangle interiors.
     fn conservative_bounds(&self, region: QuadCellRegion) -> Aabb {
         let scale = 1.0 / f64::from(self.resolution - 1);
