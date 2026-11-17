@@ -350,23 +350,22 @@ impl Planet {
             true
         };
         let side = self.chunk_resolution - 1;
-        if data.samples.len() <= MAX_CACHED_PROJECTION_VERTICES
-            && data.quad_bounds.get().is_none()
-            && data
-                .broadphase_queries
-                .fetch_add(1, AtomicOrdering::Relaxed)
+        if data.samples.len() <= MAX_CACHED_PROJECTION_VERTICES {
+            // A warm chunk takes the original cached-index path after one
+            // relaxed counter load; avoid repeated OnceLock checks and an
+            // extra chunk-size branch in the steady-state collision path.
+            if data.broadphase_queries.load(AtomicOrdering::Relaxed)
                 < QUAD_INDEX_BUILD_AFTER_QUERIES
-        {
-            // Only inspect relevant quads; a frequently reused chunk
-            // subsequently promotes to the exact cached row/block index.
-            if !self.map_sparse_collision_quads(&patch, &data, aabb, &mut emit) {
-                return false;
+                && data.quad_bounds.get().is_none()
+                && data
+                    .broadphase_queries
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    < QUAD_INDEX_BUILD_AFTER_QUERIES
+            {
+                return self.map_sparse_collision_quads(&patch, &data, aabb, &mut emit);
             }
-        } else if data.samples.len() <= MAX_CACHED_PROJECTION_VERTICES {
-            // Frequently reused chunks switch to exact cached quad AABBs
-            // and row/block summaries, preserving the warm fast path.
-            // A cache of exact quad AABBs rejects non-overlapping quads
-            // without reconstructing their displaced triangle geometry.
+            // Chunks receiving repeat queries retain the exact row/block
+            // index; extremely cold chunks do not allocate that index.
             let boxes = data.quad_bounds(self);
             let blocks_per_row = side.div_ceil(QUAD_BLOCK_WIDTH);
             for y in 0..side {
