@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use parry3d_f64::{
     math::{Pose, Vector},
     query::{PointQuery, QueryDispatcher, Ray, RayCast},
-    shape::Ball,
+    shape::{Ball, HalfSpace},
 };
 
 #[cfg(feature = "parry")]
@@ -134,6 +134,52 @@ fn collision(c: &mut Criterion) {
                 },
             );
             std::hint::black_box(count)
+        });
+    });
+
+    // Shape-to-planet minimum-separation queries cover the full cubemap
+    // hierarchy rather than only the collision AABB's current chunk.
+    let proximity_pose = Pose::translation(PLANET_RADIUS + 2.5, 0.2, -0.4);
+    c.bench_function("planet distance ball", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .distance(&proximity_pose, &planet, &ball)
+                    .unwrap(),
+            )
+        });
+    });
+    c.bench_function("planet closest points ball", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .closest_points(&proximity_pose, &planet, &ball, 10.0)
+                    .unwrap(),
+            )
+        });
+    });
+    c.bench_function("planet contact ball", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .contact(&proximity_pose, &planet, &ball, 3.0)
+                    .unwrap(),
+            )
+        });
+    });
+
+    // Infinite supporting planes have no finite bounding sphere; the
+    // directional region hierarchy must prune globally without scanning
+    // every tile on the 4096x4096 cubemap face.
+    let halfspace = HalfSpace::new(Vector::X);
+    let plane_pose = Pose::translation(-PLANET_RADIUS - 2.5, 0.0, 0.0);
+    c.bench_function("planet distance halfspace", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .distance(&plane_pose, &planet, &halfspace)
+                    .unwrap(),
+            )
         });
     });
 
