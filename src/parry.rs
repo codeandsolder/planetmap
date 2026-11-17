@@ -2317,6 +2317,15 @@ fn planet_halfspace_contact(
 struct PairPatch {
     region: ProjectionRegion,
     aabb: Aabb,
+    // Shape1 frame; the cone contains all displaced triangle interiors.
+    origin: Vector,
+    cone_axis: Vector,
+    cone_cos: f64,
+    radial_min: f64,
+    radial_max: f64,
+    sphere_center: Vector,
+    sphere_radius: f64,
+    padding: f64,
 }
 
 impl PairPatch {
@@ -2349,6 +2358,28 @@ impl PairPatch {
                 * f64::EPSILON
                 * (radial_max + planet.radius + pose.translation.abs().max_element()),
         );
+        // Convexity of the squared distance to a point on the cone axis
+        // makes the extremal radial value occur at an endpoint.
+        let cone_axis = pose.rotation * axis;
+        let (sphere_center, sphere_radius) = if radial_min <= 0.0 {
+            (pose.translation, radial_max + pad.x)
+        } else {
+            let center_radius = radial_min.midpoint(radial_max);
+            let radius_at = |radial: f64| {
+                radial
+                    .mul_add(
+                        radial,
+                        center_radius
+                            .mul_add(center_radius, -2.0 * radial * center_radius * min_cos),
+                    )
+                    .max(0.0)
+                    .sqrt()
+            };
+            (
+                pose.translation + cone_axis * center_radius,
+                radius_at(radial_min).max(radius_at(radial_max)) + pad.x,
+            )
+        };
         let aabb = if radial_min <= 0.0 {
             Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
         } else {
@@ -2395,7 +2426,53 @@ impl PairPatch {
                 lower_distance2: 0.0,
             },
             aabb,
+            origin: pose.translation,
+            cone_axis,
+            cone_cos: min_cos,
+            radial_min,
+            radial_max,
+            sphere_center,
+            sphere_radius,
+            padding: pad.x,
         }
+    }
+
+    /// Signed support interval enclosing every displaced triangle point
+    /// along a unit world direction. Inverted cones use the outer sphere.
+    fn support_interval(&self, direction: Vector) -> (f64, f64) {
+        let shift = self.origin.dot(direction);
+        if self.radial_min <= 0.0 {
+            return (
+                shift - self.radial_max - self.padding,
+                shift + self.radial_max + self.padding,
+            );
+        }
+        let cos_center = self.cone_axis.dot(direction).clamp(-1.0, 1.0);
+        let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt()
+            * self.cone_cos.mul_add(-self.cone_cos, 1.0).max(0.0).sqrt();
+        let min_direction = if -cos_center >= self.cone_cos {
+            -1.0
+        } else {
+            cos_center.mul_add(self.cone_cos, -transverse).max(-1.0)
+        };
+        let max_direction = if cos_center >= self.cone_cos {
+            1.0
+        } else {
+            cos_center.mul_add(self.cone_cos, transverse).min(1.0)
+        };
+        let low = min_direction
+            * if min_direction >= 0.0 {
+                self.radial_min
+            } else {
+                self.radial_max
+            };
+        let high = max_direction
+            * if max_direction >= 0.0 {
+                self.radial_max
+            } else {
+                self.radial_min
+            };
+        (shift + low - self.padding, shift + high + self.padding)
     }
 
     fn is_leaf(&self) -> bool {
@@ -2439,10 +2516,37 @@ impl PlanetPairRegion {
             first.aabb.mins - second.aabb.maxs,
             first.aabb.maxs - second.aabb.mins,
         );
+        let center_delta = second.sphere_center - first.sphere_center;
+        let center_distance = center_delta.length();
+        let sphere_bound = (center_distance - first.sphere_radius - second.sphere_radius).max(0.0);
+        let between_centers = second.origin - first.origin;
+        let axis = if center_distance > 0.0 {
+            center_delta / center_distance
+        } else if between_centers.length_squared() > 0.0 {
+            between_centers.normalize()
+        } else {
+            Vector::X
+        };
+        let (_, first_max) = first.support_interval(axis);
+        let (second_min, _) = second.support_interval(axis);
+        let separation = (second_min - first_max).max(0.0);
+        let global_delta = second.origin - first.origin;
+        let global_separation = if global_delta.length_squared() > 0.0 {
+            let global_axis = global_delta.normalize();
+            let (_, global_first_max) = first.support_interval(global_axis);
+            let (global_second_min, _) = second.support_interval(global_axis);
+            (global_second_min - global_first_max).max(0.0)
+        } else {
+            0.0
+        };
         Self {
             first,
             second,
-            lower: minkowski.distance_to_origin(),
+            lower: minkowski
+                .distance_to_origin()
+                .max(sphere_bound)
+                .max(separation)
+                .max(global_separation),
         }
     }
 }
@@ -5244,19 +5348,15 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         {
             let center = axis * (R1 + R2 + gap);
             let pose = Pose::translation(center.x, center.y, center.z);
-            let started = std::time::Instant::now();
-            eprintln!("large-pair case {case}: starting");
             let distance = PlanetDispatcher.distance(&pose, &first, &second).unwrap();
             assert!(
                 distance.distance >= gap - 1.0e-4 && distance.distance <= gap + 5.0,
                 "case={case},distance={distance:?},lower={gap}"
             );
-            eprintln!("large-pair case {case}: distance {:.3?}", started.elapsed());
             let reverse = PlanetDispatcher
                 .distance(&pose.inverse(), &second, &first)
                 .unwrap();
             assert!((distance.distance - reverse.distance).abs() < 1.0e-6);
-            eprintln!("large-pair case {case}: reverse {:.3?}", started.elapsed());
             let pair = PlanetDispatcher
                 .closest_points(&pose, &first, &second, gap + 10.0)
                 .unwrap();
@@ -5270,16 +5370,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     .unwrap(),
                 ClosestPoints::Disjoint
             );
-            eprintln!("large-pair case {case}: disjoint {:.3?}", started.elapsed());
             assert!(
                 !PlanetDispatcher
                     .intersection_test(&pose, &first, &second)
                     .unwrap()
                     .intersecting
-            );
-            eprintln!(
-                "large-pair case {case}: intersection {:.3?}",
-                started.elapsed()
             );
             // Per-shape IDs must refer to live cache slots immediately
             // after each query, even with capacity one on both planets.
@@ -5292,6 +5387,178 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     .slots
                     .iter()
                     .any(|(i, _)| i == slot));
+            }
+        }
+    }
+
+    #[test]
+    fn pair_region_bounds_enclose_every_triangle_in_variable_height_terrain() {
+        struct VaryingTerrain {
+            low: f32,
+            high: f32,
+        }
+        impl Terrain for VaryingTerrain {
+            fn sample(&self, at: &Coords, out: &mut [f32]) {
+                let values = [self.low, self.low * 0.5, 0.0, self.high * 0.5, self.high];
+                for (index, sample) in out.iter_mut().enumerate() {
+                    let hash = (at.face as u32)
+                        .wrapping_mul(17)
+                        .wrapping_add(at.x.wrapping_mul(7))
+                        .wrapping_add(at.y.wrapping_mul(11))
+                        .wrapping_add(u32::try_from(index).unwrap().wrapping_mul(23));
+                    *sample = values[(hash % 5) as usize];
+                }
+            }
+            fn face_resolution(&self) -> u32 {
+                2
+            }
+            fn chunk_resolution(&self) -> u32 {
+                3
+            }
+            fn min_height(&self) -> f32 {
+                self.low
+            }
+            fn max_height(&self) -> f32 {
+                self.high
+            }
+        }
+        let first = Planet::new(
+            Arc::new(VaryingTerrain {
+                low: -9.0,
+                high: 4.0,
+            }),
+            1,
+            10.0,
+        )
+        .unwrap();
+        let second = Planet::new(
+            Arc::new(VaryingTerrain {
+                low: -6.0,
+                high: 5.0,
+            }),
+            1,
+            7.0,
+        )
+        .unwrap();
+        let poses = [
+            Pose::translation(17.5, 1.3, -2.0),
+            Pose::translation(9.0, 8.5, 0.2)
+                * Pose::from_rotation(Rotation::from_axis_angle(Vector::Y, 0.43)),
+        ];
+        let directions = [
+            Vector::X,
+            Vector::Y,
+            Vector::Z,
+            Vector::new(1.0, 1.0, 0.0).normalize(),
+            Vector::new(-0.3, 0.5, -0.8).normalize(),
+        ];
+        let tile_mesh = |planet: &Planet| {
+            let mut tiles = Vec::new();
+            for face in Face::iter() {
+                for y in 0..2 {
+                    for x in 0..2 {
+                        let coords = Coords { face, x, y };
+                        let patch = Patch::new(&coords, 2);
+                        let samples = planet.sample(&coords);
+                        let tris: Vec<_> = patch
+                            .triangles(planet.radius, 3, &samples)
+                            .map(|(_, triangle)| triangle)
+                            .collect();
+                        tiles.push((coords, tris));
+                    }
+                }
+            }
+            tiles
+        };
+        let first_tiles = tile_mesh(&first);
+        let second_tiles = tile_mesh(&second);
+        for (planet, pose, tiles) in [
+            (&first, Pose::IDENTITY, &first_tiles),
+            (&second, poses[1], &second_tiles),
+        ] {
+            for face in Face::iter() {
+                for (x0, x1, y0, y1) in [
+                    (0, 2, 0, 2),
+                    (0, 1, 0, 1),
+                    (1, 2, 0, 1),
+                    (0, 1, 1, 2),
+                    (1, 2, 1, 2),
+                ] {
+                    let region = PairPatch::new(planet, &pose, face, x0, x1, y0, y1);
+                    for (coords, tris) in tiles {
+                        if coords.face != face
+                            || coords.x < x0
+                            || coords.x >= x1
+                            || coords.y < y0
+                            || coords.y >= y1
+                        {
+                            continue;
+                        }
+                        for tri in tris {
+                            for local in [tri.a, tri.b, tri.c, (tri.a + tri.b + tri.c) / 3.0] {
+                                let pt = pose * local;
+                                let inside_box = pt.x >= region.aabb.mins.x - 1.0e-9
+                                    && pt.x <= region.aabb.maxs.x + 1.0e-9
+                                    && pt.y >= region.aabb.mins.y - 1.0e-9
+                                    && pt.y <= region.aabb.maxs.y + 1.0e-9
+                                    && pt.z >= region.aabb.mins.z - 1.0e-9
+                                    && pt.z <= region.aabb.maxs.z + 1.0e-9;
+                                assert!(
+                                    inside_box,
+                                    "region {face:?} {x0}:{x1},{y0}:{y1}: AABB misses {pt:?}"
+                                );
+                                assert!(
+                                    pt.distance(region.sphere_center)
+                                        <= region.sphere_radius + 1.0e-9,
+                                    "region {face:?} {x0}:{x1},{y0}:{y1}: sphere misses {pt:?}"
+                                );
+                                for direction in directions {
+                                    let (low, high) = region.support_interval(direction);
+                                    let dot = pt.dot(direction);
+                                    assert!(dot>=low-1.0e-9 && dot<=high+1.0e-9,
+                                        "region {face:?} {x0}:{x1},{y0}:{y1}: dir={direction:?}, dot={dot}, bounds={low}..{high}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let dispatcher = DefaultQueryDispatcher;
+        for pose in poses {
+            for (at1, tris1) in &first_tiles {
+                let a = PairPatch::new(
+                    &first,
+                    &Pose::IDENTITY,
+                    at1.face,
+                    at1.x,
+                    at1.x + 1,
+                    at1.y,
+                    at1.y + 1,
+                );
+                for (at2, tris2) in &second_tiles {
+                    let b = PairPatch::new(
+                        &second,
+                        &pose,
+                        at2.face,
+                        at2.x,
+                        at2.x + 1,
+                        at2.y,
+                        at2.y + 1,
+                    );
+                    let lower = PlanetPairRegion::new(a, b).lower;
+                    let mut exact = f64::INFINITY;
+                    for tri1 in tris1 {
+                        for tri2 in tris2 {
+                            exact =
+                                exact.min(dispatcher.distance(&pose, tri1, tri2).unwrap().distance);
+                        }
+                    }
+                    assert!(
+                        lower <= exact + 1.0e-8,
+                        "pair {at1:?} {at2:?}: lower={lower}, exact={exact}"
+                    );
+                }
             }
         }
     }
