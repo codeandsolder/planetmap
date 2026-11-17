@@ -111,6 +111,24 @@ fn collision(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("hit raycast", |b| {
+        let ray = Ray {
+            origin: Vector::new(PLANET_RADIUS + 10.0, 1.0, 1.0),
+            dir: -Vector::X,
+        };
+        b.iter(|| planet.cast_local_ray(&ray, 100.0, true));
+    });
+
+    // A confirmed regression case at the intersection of three cube faces.
+    // The original origin-directed quad walk missed this existing triangle.
+    c.bench_function("corner seam raycast", |b| {
+        let ray = Ray {
+            origin: Vector::new(3678337.188936222, 3678238.6096734814, -3678337.1887390064),
+            dir: Vector::new(-0.5773554268532486, -0.577339953755108, 0.5773554268222935),
+        };
+        b.iter(|| planet.cast_local_ray(&ray, 20.0, true));
+    });
+
     c.bench_function("project point", |b| {
         b.iter(|| {
             planet.project_point(

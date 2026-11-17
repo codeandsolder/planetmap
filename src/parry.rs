@@ -24,13 +24,11 @@ use parry3d_f64::{
         RayIntersection, ShapeCastHit, ShapeCastOptions, ShapeDistance, ShapeIntersection,
         TypedWorkspaceData, Unsupported, WorkspaceData,
     },
-    shape::{
-        CompositeShape, FeatureId, HalfSpace, Shape, ShapeType, SubShapeId, Triangle, TypedShape,
-    },
+    shape::{CompositeShape, FeatureId, Shape, ShapeType, SubShapeId, Triangle, TypedShape},
     utils::PoseOpt,
 };
 
-use crate::cubemap::{Coords, Edge};
+use crate::cubemap::Coords;
 
 /// Convert a `parry` vector to the nalgebra type consumed by the `cubemap` module
 #[expect(
@@ -385,6 +383,262 @@ fn cast_triangle_ray_near_edge(tri: &Triangle, ray: &Ray, max_toi: f64) -> Optio
     Some(RayIntersection::new(time, normal, FeatureId::Face(face)))
 }
 
+/// A ray-overlapping cubemap rectangle ordered by its earliest possible TOI.
+/// AABB bounds enclose every displaced triangle interior, not just vertices.
+#[derive(Clone, Copy, Debug)]
+struct RayRegion {
+    region: ProjectionRegion,
+    lower_time: f64,
+}
+
+impl RayRegion {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Conservative bound depends on terrain extrema and grid rectangle"
+    )]
+    fn new(
+        face: crate::cubemap::Face,
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        y1: u32,
+        resolution: u32,
+        radius: f64,
+        min_height: f64,
+        max_height: f64,
+        ray: &Ray,
+        max_toi: f64,
+    ) -> Option<Self> {
+        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
+        let region = ProjectionRegion {
+            face,
+            x0,
+            x1,
+            y0,
+            y1,
+            lower_distance2: 0.0,
+        };
+        let min_height_projection = if min_height >= 0.0 {
+            min_height * min_cos
+        } else {
+            min_height
+        };
+        let radial_min = radius.mul_add(min_cos, min_height_projection);
+        let radial_max = radius + max_height;
+        let pad = Vector::splat(
+            256.0 * f64::EPSILON * (radial_max + ray.origin.abs().max_element() + radius),
+        );
+        let aabb = if radial_min <= 0.0 {
+            // An unusually deep inward displacement can invalidate angular
+            // bounds. A full containing cube remains correct and eventually
+            // subdivides to narrower, positive-radius regions.
+            Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
+        } else {
+            let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
+            let component_bounds = |component: f64| {
+                let perpendicular = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
+                let min_component = if -component >= min_cos {
+                    -1.0
+                } else {
+                    component.mul_add(min_cos, -perpendicular)
+                };
+                let max_component = if component >= min_cos {
+                    1.0
+                } else {
+                    component.mul_add(min_cos, perpendicular)
+                };
+                let lower = min_component
+                    * if min_component >= 0.0 {
+                        radial_min
+                    } else {
+                        radial_max
+                    };
+                let upper = max_component
+                    * if max_component >= 0.0 {
+                        radial_max
+                    } else {
+                        radial_min
+                    };
+                (lower, upper)
+            };
+            let (lx, ux) = component_bounds(axis.x);
+            let (ly, uy) = component_bounds(axis.y);
+            let (lz, uz) = component_bounds(axis.z);
+            Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
+        };
+        let lower_time = aabb.cast_local_ray(ray, max_toi, true)?;
+        Some(Self { region, lower_time })
+    }
+}
+
+impl PartialEq for RayRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.lower_time.total_cmp(&other.lower_time).is_eq() && self.region == other.region
+    }
+}
+impl Eq for RayRegion {}
+impl PartialOrd for RayRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RayRegion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .lower_time
+            .total_cmp(&self.lower_time)
+            .then_with(|| self.region.cmp(&other.region))
+    }
+}
+
+impl Planet {
+    /// Exact ray-triangle intersections inside one chunk, using displaced
+    /// quad AABBs only as a conservative early rejection.
+    fn cast_ray_in_chunk(
+        &self,
+        coords: Coords,
+        ray: &Ray,
+        max_toi: f64,
+        solid: bool,
+    ) -> Option<(u32, RayIntersection)> {
+        let (_, data) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        let patch = Patch::new(&coords, self.terrain.face_resolution());
+        let padding = Vector::splat(
+            256.0 * f64::EPSILON * (self.max_radius() + ray.origin.abs().max_element()),
+        );
+        let mut closest: Option<(u32, RayIntersection)> = None;
+        for quad in patch.quads(self.chunk_resolution) {
+            let displaced = quad.displace(self.radius, self.chunk_resolution, &data.samples);
+            let [a, b, c, d] = displaced.corners;
+            let lower = a.min(b).min(c).min(d) - padding;
+            let upper = a.max(b).max(c).max(d) + padding;
+            let limit = closest.as_ref().map_or(max_toi, |x| x.1.time_of_impact);
+            if Aabb::new(lower, upper)
+                .cast_local_ray(ray, limit, true)
+                .is_none()
+            {
+                continue;
+            }
+            for (tri_idx, triangle) in displaced.triangles().into_iter().enumerate() {
+                let Some(hit) = triangle
+                    .cast_local_ray_and_get_normal(ray, limit, solid)
+                    .or_else(|| cast_triangle_ray_near_edge(&triangle, ray, limit))
+                else {
+                    continue;
+                };
+                if closest
+                    .as_ref()
+                    .is_none_or(|best| hit.time_of_impact < best.1.time_of_impact)
+                {
+                    let index = (quad.index(self.chunk_resolution) << 1) | u32::from(tri_idx == 1);
+                    closest = Some((index, hit));
+                }
+            }
+        }
+        closest
+    }
+}
+
+impl Planet {
+    /// Fast path for a ray segment that provably remains within one
+    /// perspective quad. The four edge half-spaces define a convex cone, so
+    /// if both segment endpoints are strictly inside, *every* earlier hit
+    /// must be one of the quad's two triangles. Near seams, origin changes,
+    /// or deep inward displacements, the global hierarchy remains necessary.
+    fn cast_ray_inside_one_quad(
+        &self,
+        ray: &Ray,
+        max_toi: f64,
+        solid: bool,
+    ) -> Option<RayIntersection> {
+        if !max_toi.is_finite() || max_toi < 0.0 {
+            return None;
+        }
+        // When moving away from a planet we generally miss its surface;
+        // avoid constructing any local geometry in that common case.
+        if ray.origin.dot(ray.dir) >= 0.0 && ray.origin.length() > self.max_radius() {
+            return None;
+        }
+        if self.radius / 3.0_f64.sqrt() + f64::from(self.terrain.min_height()) <= 0.0 {
+            return None;
+        }
+        let end = ray.origin + ray.dir * max_toi;
+        if !end.is_finite() {
+            return None;
+        }
+        let coords = Coords::from_vector(self.terrain.face_resolution(), &na3f32(ray.origin));
+        let patch = Patch::new(&coords, self.terrain.face_resolution());
+        let quad_resolution = self.chunk_resolution - 1;
+        let uv = patch.project(&ray.origin) * f64::from(quad_resolution);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "The clamped normalized patch coordinate is within the u32 quad range"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "Patch coordinates are clamped nonnegative"
+        )]
+        let address = UVec2::new(
+            (uv.x.floor() as u32).min(quad_resolution - 1),
+            (uv.y.floor() as u32).min(quad_resolution - 1),
+        );
+        let quad = Quad::new(&patch, quad_resolution, address);
+        let [a, b, c, d] = quad.corners;
+        let margin = 512.0
+            * f64::EPSILON
+            * (self.max_radius() + ray.origin.abs().max_element() + end.abs().max_element());
+        // Inward normals of the four great-circle side planes.
+        for (v1, v2) in [(c, a), (a, b), (b, d), (d, c)] {
+            let normal = v1.cross(v2);
+            if normal.dot(ray.origin) <= margin * normal.length()
+                || normal.dot(end) <= margin * normal.length()
+            {
+                return None;
+            }
+        }
+        let (_, data) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        let mut closest: Option<(u32, RayIntersection)> = None;
+        for (i, triangle) in quad
+            .displace(self.radius, self.chunk_resolution, &data.samples)
+            .triangles()
+            .into_iter()
+            .enumerate()
+        {
+            let Some(hit) = triangle
+                .cast_local_ray_and_get_normal(ray, max_toi, solid)
+                .or_else(|| cast_triangle_ray_near_edge(&triangle, ray, max_toi))
+            else {
+                continue;
+            };
+            if closest
+                .as_ref()
+                .is_none_or(|x| hit.time_of_impact < x.1.time_of_impact)
+            {
+                closest = Some((
+                    (quad.index(self.chunk_resolution) << 1) | u32::from(i == 1),
+                    hit,
+                ));
+            }
+        }
+        let (triangle, mut hit) = closest?;
+        let (slot, _) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        hit.subshape = self.subshape_id(slot, triangle);
+        Some(hit)
+    }
+}
+
 impl RayCast for Planet {
     fn cast_local_ray_and_get_normal(
         &self,
@@ -392,105 +646,104 @@ impl RayCast for Planet {
         max_toi: Real,
         solid: bool,
     ) -> Option<RayIntersection> {
-        // Find the chunk containing the ray origin
-        let mut chunk = Coords::from_vector(self.terrain.face_resolution(), &na3f32(ray.origin));
-        let mut patch = Patch::new(&chunk, self.terrain.face_resolution());
-        let mut ray = *ray;
-        let mut traveled = 0.0;
-
-        // Walk along the ray until we hit something
-        let cache = &mut *self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            let remaining = max_toi - traveled;
-            if remaining < 0.0 {
-                return None;
+        if max_toi.is_nan()
+            || max_toi < 0.0
+            || !ray.origin.is_finite()
+            || !ray.dir.is_finite()
+            || ray.dir == Vector::ZERO
+        {
+            return None;
+        }
+        if let Some(hit) = self.cast_ray_inside_one_quad(ray, max_toi, solid) {
+            return Some(hit);
+        }
+        let resolution = self.terrain.face_resolution();
+        let min_height = f64::from(self.terrain.min_height());
+        let max_height = f64::from(self.terrain.max_height());
+        let mut candidates = BinaryHeap::new();
+        for face in crate::cubemap::Face::iter() {
+            if let Some(region) = RayRegion::new(
+                face,
+                0,
+                resolution,
+                0,
+                resolution,
+                resolution,
+                self.radius,
+                min_height,
+                max_height,
+                ray,
+                max_toi,
+            ) {
+                candidates.push(region);
             }
-            let (slot, data) = cache.get(self, &chunk);
-            // FIXME: Rays can sometimes slip between bounding planes and the outer edge of a
-            // quad. To avoid this, we should extend the quad to form a narrow skirt around the
-            // chunk, or check neighboring chunks when very close to a boundary.
-
-            let mut maybe_hit = None;
-            let edge = walk_patch(self.chunk_resolution - 1, &patch, &ray, remaining, |quad| {
-                let tris = quad
-                    .displace(self.radius, self.chunk_resolution, &data.samples)
-                    .triangles();
-                let Some((tri, mut hit)) = tris
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, t)| {
-                        let hit = t
-                            .cast_local_ray_and_get_normal(&ray, remaining, solid)
-                            .or_else(|| cast_triangle_ray_near_edge(&t, &ray, remaining))?;
-                        Some((i, hit))
-                    })
-                    .min_by(|a, b| a.1.time_of_impact.total_cmp(&b.1.time_of_impact))
-                else {
-                    return true;
-                };
-                let quad_index = quad.index(self.chunk_resolution);
-                let index = (quad_index << 1) | u32::from(tri == 1);
-                hit.subshape = self.subshape_id(slot, index);
-                maybe_hit = Some(hit);
-                false
-            });
-
-            if let Some(mut hit) = maybe_hit {
-                hit.time_of_impact += traveled;
-                return Some(hit);
+        }
+        // The LRU slot can be reassigned while visiting adjacent patches.
+        // Retain the winning tile and triangle until all possible earlier
+        // intersections have been excluded.
+        let mut closest: Option<(f64, Coords, u32, RayIntersection)> = None;
+        while let Some(candidate) = candidates.pop() {
+            let limit = closest.as_ref().map_or(max_toi, |x| x.0);
+            if candidate.lower_time > limit {
+                break;
             }
-
-            match edge {
-                None => return None,
-                Some((edge, toi)) => {
-                    if !toi.is_finite() || toi < 0.0 || toi > remaining {
-                        return None;
+            let ProjectionRegion {
+                face,
+                x0,
+                x1,
+                y0,
+                y1,
+                ..
+            } = candidate.region;
+            if x1 - x0 == 1 && y1 - y0 == 1 {
+                let coords = Coords { face, x: x0, y: y0 };
+                if let Some((idx, hit)) = self.cast_ray_in_chunk(coords, ray, limit, solid) {
+                    if closest
+                        .as_ref()
+                        .is_none_or(|best| hit.time_of_impact < best.0)
+                    {
+                        closest = Some((hit.time_of_impact, coords, idx, hit));
                     }
-                    traveled += toi;
-                    chunk = chunk.neighbors(self.terrain.face_resolution())[edge];
-                    patch = Patch::new(&chunk, self.terrain.face_resolution());
-                    ray.origin += ray.dir * toi;
+                }
+                continue;
+            }
+            let mid_x = x0 + (x1 - x0) / 2;
+            let mid_y = y0 + (y1 - y0) / 2;
+            for (a, b) in [(x0, mid_x), (mid_x, x1)] {
+                if a == b {
+                    continue;
+                }
+                for (c, d) in [(y0, mid_y), (mid_y, y1)] {
+                    if c == d {
+                        continue;
+                    }
+                    if let Some(region) = RayRegion::new(
+                        face,
+                        a,
+                        b,
+                        c,
+                        d,
+                        resolution,
+                        self.radius,
+                        min_height,
+                        max_height,
+                        ray,
+                        limit,
+                    ) {
+                        candidates.push(region);
+                    }
                 }
             }
         }
+        let (_, coords, tri_idx, mut hit) = closest?;
+        let (slot, _) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        hit.subshape = self.subshape_id(slot, tri_idx);
+        Some(hit)
     }
-}
-
-/// `quad` is row-major vectors from the origin
-fn raycast_quad_edges(
-    ray: &Ray,
-    [bottom_left, bottom_right, top_left, top_right]: &[Vector; 4],
-    max_toi: f64,
-) -> Option<(Edge, f64)> {
-    let edges: [(Edge, [Vector; 2]); 4] = [
-        (Edge::Nx, [*top_left, *bottom_left]),
-        (Edge::Ny, [*bottom_left, *bottom_right]),
-        (Edge::Px, [*bottom_right, *top_right]),
-        (Edge::Py, [*top_right, *top_left]),
-    ];
-
-    let mut closest = None;
-    for (edge, [v1, v2]) in edges {
-        // Construct inward-facing edge planes
-        let plane = HalfSpace {
-            normal: v1.cross(v2).normalize(),
-        };
-        // Eliminate planes behind the ray
-        if plane.normal.dot(ray.dir) >= 0.0 {
-            continue;
-        }
-        if let Some(hit) = plane.cast_local_ray(ray, max_toi, true) {
-            closest = Some(match closest {
-                None => (edge, hit),
-                Some((_, toi)) if hit < toi => (edge, hit),
-                Some(x) => x,
-            });
-        }
-    }
-    closest
 }
 
 /// A rectangular group of terrain patches in the cubemap, ordered by a
@@ -535,15 +788,17 @@ struct ProjectionQuery {
 }
 
 impl ProjectionRegion {
-    fn new(
+    /// Conservative cone of directions containing all displaced triangle
+    /// interiors of the cubemap rectangle, independent of terrain heights.
+    fn cone(
         face: crate::cubemap::Face,
         x0: u32,
         x1: u32,
         y0: u32,
         y1: u32,
-        query: &ProjectionQuery,
-    ) -> Self {
-        let scale = 2.0 / f64::from(query.resolution);
+        resolution: u32,
+    ) -> (Vector, f64) {
+        let scale = 2.0 / f64::from(resolution);
         let face_direction = |x: f64, y: f64| {
             let d = face.direction(&na::Point2::new(
                 x.mul_add(scale, -1.0),
@@ -569,6 +824,18 @@ impl ProjectionRegion {
         // Account for rounding of warp, the face rotation, and corner dot
         // products when using the bound to prune an entire subtree.
         min_cos = 64.0f64.mul_add(-f64::EPSILON, min_cos).clamp(0.0, 1.0);
+        (center, min_cos)
+    }
+
+    fn new(
+        face: crate::cubemap::Face,
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        y1: u32,
+        query: &ProjectionQuery,
+    ) -> Self {
+        let (center, min_cos) = Self::cone(face, x0, x1, y0, y1, query.resolution);
         // A displaced vertex is R*v + h*normalize(v), where v is a convex
         // combination of the face's unit corner directions. The dot product
         // with the cone axis is at least R*min_cos plus h*min_cos for h>=0
@@ -1813,44 +2080,6 @@ impl DisplacedQuad {
     }
 }
 
-/// Invoke `f` on the row-major corners of every quad in `patch` along `ray`, which much originate
-/// within `patch`. Returns the patch edge reached and the ray toi at which the edge was reached, if
-/// any.
-///
-/// - `ray` must start within `patch`
-/// - `f` returns whether to continue
-fn walk_patch(
-    quad_resolution: u32,
-    patch: &Patch,
-    ray: &Ray,
-    max_toi: f64,
-    mut f: impl FnMut(&Quad) -> bool,
-) -> Option<(Edge, f64)> {
-    let quad_resolution_f = f64::from(quad_resolution);
-    let start = patch.project(&ray.origin);
-    let mut quad = (start * quad_resolution_f)
-        .trunc()
-        .clamp(Vec2::ZERO, Vec2::splat(quad_resolution_f - 1.0));
-    loop {
-        let candidate = Quad::new(patch, quad_resolution, quad.as_uvec2());
-        if !f(&candidate) {
-            return None;
-        }
-        // Find the next quad along the ray
-        let (edge, toi) = raycast_quad_edges(ray, &candidate.corners, max_toi)?;
-        let step: na::Vector2<f64> = edge.direction().into_inner();
-        quad += Vec2::new(step.x, step.y);
-        if quad.x >= quad_resolution_f
-            || quad.y >= quad_resolution_f
-            || quad.x < 0.0
-            || quad.y < 0.0
-        {
-            // Reached the edge of the patch
-            return Some((edge, toi));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use approx::{assert_abs_diff_eq, assert_relative_eq};
@@ -1860,7 +2089,7 @@ mod tests {
         shape::{Ball, TriMesh},
     };
 
-    use crate::cubemap::Face;
+    use crate::cubemap::{Edge, Face};
 
     use super::*;
 
@@ -2757,6 +2986,306 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         assert_relative_eq!(hit.normal2, Vector::X);
     }
 
+    /// Reference for collision correctness; deliberately scans all six faces
+    /// and all triangles, independent of the ray's origin and movement.
+    fn exhaustive_ray_hit(planet: &Planet, ray: &Ray, max_toi: f64) -> Option<RayIntersection> {
+        let mut closest: Option<RayIntersection> = None;
+        for face in Face::iter() {
+            for y in 0..planet.terrain.face_resolution() {
+                for x in 0..planet.terrain.face_resolution() {
+                    let coords = Coords { x, y, face };
+                    let samples = planet.sample(&coords);
+                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    for (_, triangle) in
+                        patch.triangles(planet.radius, planet.chunk_resolution, &samples)
+                    {
+                        if let Some(hit) = triangle
+                            .cast_local_ray_and_get_normal(ray, max_toi, true)
+                            .or_else(|| cast_triangle_ray_near_edge(&triangle, ray, max_toi))
+                        {
+                            if closest
+                                .as_ref()
+                                .is_none_or(|old| hit.time_of_impact < old.time_of_impact)
+                            {
+                                closest = Some(hit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        closest
+    }
+
+    #[test]
+    fn raycast_matches_full_mesh_for_crossings_and_grazing_cases() {
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 3,
+            peak: None,
+            patterned: true,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(source, 3, 10.0).unwrap();
+        let rays = [
+            (Vector::new(20.0, 0.0, 0.0), -Vector::X),
+            (Vector::new(-20.0, 0.0, 0.0), Vector::X),
+            (
+                Vector::new(20.0, 20.0, 0.0),
+                Vector::new(-1.0, -1.0, 0.0).normalize(),
+            ),
+            (
+                Vector::new(20.0, 20.0, 0.0),
+                Vector::new(-1.0, -1.0, 0.0001).normalize(),
+            ),
+            (Vector::new(0.0, 0.0, 0.0), Vector::X),
+            (Vector::new(0.01, 0.0, 0.0), -Vector::X),
+            (Vector::new(0.01, 0.01, 0.01), -Vector::X),
+            (
+                Vector::new(1.0, 2.0, 3.0),
+                -Vector::new(1.0, 2.0, 3.0).normalize(),
+            ),
+            (Vector::new(20.0, 0.0, 0.0), Vector::X),
+            (
+                Vector::new(0.01, -0.01, 0.01),
+                Vector::new(1.0, -2.0, 3.0).normalize(),
+            ),
+            (Vector::new(5.0, 5.0, 5.0), Vector::X),
+            (Vector::new(15.0, 0.0, 0.0), Vector::Y),
+            (Vector::new(15.0, 0.0, 0.0), -Vector::Y),
+            (Vector::new(0.0, 0.0, 20.0), -Vector::Z),
+        ];
+        let mut state = 0xdead_beef_cafe_f00d_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 32) as u32) as f64 / f64::from(u32::MAX)
+        };
+        let random_rays = (0..100).map(|_| {
+            let origin = Vector::new(
+                next() * 40.0 - 20.0,
+                next() * 40.0 - 20.0,
+                next() * 40.0 - 20.0,
+            );
+            let direction =
+                Vector::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0, next() * 2.0 - 1.0).normalize();
+            Ray {
+                origin,
+                dir: direction,
+            }
+        });
+        for (i, ray) in rays
+            .into_iter()
+            .map(|(origin, dir)| Ray { origin, dir })
+            .chain(random_rays)
+            .enumerate()
+        {
+            let reference = exhaustive_ray_hit(&planet, &ray, 100.0);
+            let actual = planet.cast_local_ray_and_get_normal(&ray, 100.0, true);
+            assert_eq!(
+                actual.is_some(),
+                reference.is_some(),
+                "ray {i}: {ray:?}, expected {reference:?}, actual {actual:?}"
+            );
+            if let (Some(a), Some(b)) = (actual, reference) {
+                assert!(
+                    (a.time_of_impact - b.time_of_impact).abs() < 1.0e-7,
+                    "ray {i}: {ray:?}, expected {}, actual {}",
+                    b.time_of_impact,
+                    a.time_of_impact
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raycast_matches_full_mesh_for_targeted_triangle_interiors() {
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 3,
+            peak: None,
+            patterned: true,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(source, 1, 10.0).unwrap();
+        let mut count = 0;
+        for face in Face::iter() {
+            for y in 0..3 {
+                for x in 0..3 {
+                    let coords = Coords { x, y, face };
+                    let samples = planet.sample(&coords);
+                    let patch = Patch::new(&coords, 3);
+                    for quad in patch.quads(3) {
+                        for triangle in quad.displace(10.0, 3, &samples).triangles() {
+                            for weights in [[0.33, 0.33, 0.34], [0.000001, 0.499999, 0.5]] {
+                                let point = triangle.a * weights[0]
+                                    + triangle.b * weights[1]
+                                    + triangle.c * weights[2];
+                                let outward = point.normalize();
+                                for origin in
+                                    [point + outward * 10.0, point + Vector::new(8.0, -11.0, 9.0)]
+                                {
+                                    let ray = Ray {
+                                        origin,
+                                        dir: (point - origin).normalize(),
+                                    };
+                                    let expected = exhaustive_ray_hit(&planet, &ray, 50.0);
+                                    let actual =
+                                        planet.cast_local_ray_and_get_normal(&ray, 50.0, true);
+                                    assert_eq!(
+                                        actual.is_some(),
+                                        expected.is_some(),
+                                        "target ray {count}: {ray:?}"
+                                    );
+                                    if let (Some(a), Some(b)) = (actual, expected) {
+                                        assert!((a.time_of_impact - b.time_of_impact).abs() < 1.0e-7,
+                                            "target ray {count}: {ray:?}, actual={a:?}, expected={b:?}");
+                                    }
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 1728);
+    }
+
+    #[test]
+    fn raycast_deep_inward_displacements_match_exhaustive_reference() {
+        // Negative terrain height can make the root face cone's radial
+        // lower bound nonpositive even when every sampled vertex is valid.
+        // That region must use the full enclosing cube, not an unsafe cone.
+        struct InwardTerrain;
+        impl Terrain for InwardTerrain {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                out.fill(if coords.face == Face::Px { -9.0 } else { 0.0 });
+            }
+            fn face_resolution(&self) -> u32 {
+                2
+            }
+            fn chunk_resolution(&self) -> u32 {
+                3
+            }
+            fn min_height(&self) -> f32 {
+                -9.0
+            }
+            fn max_height(&self) -> f32 {
+                0.0
+            }
+        }
+        let planet = Planet::new(Arc::new(InwardTerrain), 1, 10.0).unwrap();
+        for origin in [
+            Vector::ZERO,
+            Vector::X * 2.0,
+            Vector::Y * 12.0,
+            Vector::new(20.0, -4.0, 2.0),
+            Vector::new(-14.0, 6.0, 0.1),
+        ] {
+            for dir in [
+                Vector::X,
+                -Vector::X,
+                Vector::Y,
+                -Vector::Y,
+                Vector::new(-1.0, 0.5, 0.25).normalize(),
+            ] {
+                let ray = Ray { origin, dir };
+                let expected = exhaustive_ray_hit(&planet, &ray, 100.0);
+                let actual = planet.cast_local_ray_and_get_normal(&ray, 100.0, true);
+                assert_eq!(actual.is_some(), expected.is_some(), "ray {ray:?}");
+                if let (Some(a), Some(b)) = (actual, expected) {
+                    assert!(
+                        (a.time_of_impact - b.time_of_impact).abs() < 1.0e-8,
+                        "ray {ray:?}, expected {b:?}, got {a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raycast_certified_quad_fast_path_only_applies_to_contained_segments() {
+        const RADIUS: f64 = 6_371_000.0;
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4096, 17).unwrap()), 2, RADIUS).unwrap();
+        let direct = Ray {
+            origin: Vector::new(RADIUS + 10.0, 1.0, 1.0),
+            dir: -Vector::X,
+        };
+        let fast_hit = planet
+            .cast_ray_inside_one_quad(&direct, 100.0, true)
+            .expect("radial ray entirely inside a single quad should use the fast path");
+        assert_relative_eq!(fast_hit.time_of_impact, 10.0, epsilon = 1.0e-3);
+        let actual = planet
+            .cast_local_ray_and_get_normal(&direct, 100.0, true)
+            .unwrap();
+        assert_relative_eq!(actual.time_of_impact, fast_hit.time_of_impact);
+        // A segment crossing the entire planet center cannot remain in one
+        // quad cone even when its starting direction lies near its middle.
+        let crossing = Ray {
+            origin: Vector::new(RADIUS + 10.0, 1.0, 1.0),
+            dir: -Vector::X,
+        };
+        assert!(planet
+            .cast_ray_inside_one_quad(&crossing, 2.0 * RADIUS + 40.0, true)
+            .is_none());
+        // Ray starting near a cube corner, for which the original walk
+        // missed a known triangle, must still be handled globally.
+        let seam = Ray {
+            origin: Vector::new(3678337.188936222, 3678238.6096734814, -3678337.1887390064),
+            dir: Vector::new(-0.5773554268532486, -0.577339953755108, 0.5773554268222935),
+        };
+        let global_hit = planet
+            .cast_local_ray_and_get_normal(&seam, 20.0, true)
+            .expect("cube-corner triangle must be found");
+        assert_relative_eq!(global_hit.time_of_impact, 10.0, epsilon = 1.0e-6);
+    }
+
+    #[test]
+    fn raycast_hits_targeted_face_seams_on_planetary_radius() {
+        const RADIUS: f64 = 6_371_000.0;
+        const RES: u32 = 4096;
+        let planet = Planet::new(Arc::new(FlatTerrain::new(RES, 17).unwrap()), 2, RADIUS).unwrap();
+        let mut count = 0;
+        for face in Face::iter() {
+            for x in [0, 1, RES / 2, RES - 2, RES - 1] {
+                for y in [0, 1, RES / 2, RES - 2, RES - 1] {
+                    let coords = Coords { x, y, face };
+                    let samples = planet.sample(&coords);
+                    let patch = Patch::new(&coords, RES);
+                    for xy in [UVec2::new(0, 0), UVec2::new(7, 7), UVec2::new(15, 15)] {
+                        for tri in Quad::new(&patch, 16, xy)
+                            .displace(RADIUS, 17, &samples)
+                            .triangles()
+                        {
+                            for weights in [[0.3, 0.3, 0.4], [0.000001, 0.499999, 0.5]] {
+                                let point =
+                                    tri.a * weights[0] + tri.b * weights[1] + tri.c * weights[2];
+                                let direction = (tri.b - tri.a).cross(tri.c - tri.a).normalize();
+                                for outward in [point.normalize(), direction] {
+                                    let origin = point + outward * 10.0;
+                                    let ray = Ray {
+                                        origin,
+                                        dir: -outward,
+                                    };
+                                    let direct = tri
+                                        .cast_local_ray_and_get_normal(&ray, 20.0, true)
+                                        .or_else(|| cast_triangle_ray_near_edge(&tri, &ray, 20.0))
+                                        .expect("ray must intersect targeted triangle");
+                                    let actual =
+                                        planet.cast_local_ray_and_get_normal(&ray, 20.0, true);
+                                    assert!(actual.is_some_and(|hit| hit.time_of_impact <= direct.time_of_impact + 0.0001),
+                                        "missed target {count}: face={face:?}, coords={coords:?}, ray={ray:?}, direct={direct:?}, planet={actual:?}");
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 3600);
+    }
+
     #[test]
     fn raycast_toi_is_relative_to_original_origin_across_patches() {
         let planet = Planet::new(
@@ -3022,79 +3551,5 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             Vec2::new(0.1, 0.9)
         );
         assert_abs_diff_eq!(patch.get(&Vec2::new(0.1, 0.9)), Vector::new(1.0, 1.1, 1.1));
-    }
-
-    #[test]
-    fn patch_raycast() {
-        const RESOLUTION: u32 = 2;
-        const Z: f64 = 1e6;
-        // RESOLUTION x RESOLUTION square at z=1
-        let patch = Patch {
-            a: [0.0, 0.0, Z].into(),
-            b: [RESOLUTION as f64, 0.0, Z].into(),
-            c: [0.0, RESOLUTION as f64, Z].into(),
-            d: [RESOLUTION as f64, RESOLUTION as f64, Z].into(),
-        };
-
-        let check_ray =
-            |origin: Vector, direction: Vector, expected_quads: &[UVec2], expected_edge| {
-                let mut i = 0;
-                let result = walk_patch(
-                    RESOLUTION,
-                    &patch,
-                    &Ray::new(origin, direction),
-                    100.0,
-                    |quad| {
-                        let expected =
-                            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]].map(|offset| {
-                                let q = expected_quads[i].as_dvec2() + Vec2::from(offset);
-                                Vector::new(q.x, q.y, Z)
-                            });
-                        i += 1;
-                        for (actual, expected) in quad.corners.into_iter().zip(&expected) {
-                            assert_abs_diff_eq!(actual, *expected);
-                        }
-                        true
-                    },
-                );
-                assert_eq!(result.map(|x| x.0), expected_edge);
-            };
-
-        check_ray(
-            Vector::new(0.5, 0.5, Z),
-            Vector::new(1.0, 0.0, 0.0),
-            &[UVec2::new(0, 0), UVec2::new(1, 0)],
-            Some(Edge::Px),
-        );
-        check_ray(
-            Vector::new(0.5, 0.5, Z),
-            Vector::new(-1.0, 0.0, 0.0),
-            &[UVec2::new(0, 0)],
-            Some(Edge::Nx),
-        );
-        check_ray(
-            Vector::new(1.5, 0.5, Z),
-            Vector::new(-1.0, 0.0, 0.0),
-            &[UVec2::new(1, 0), UVec2::new(0, 0)],
-            Some(Edge::Nx),
-        );
-        check_ray(
-            Vector::new(1.5, 1.5, Z),
-            Vector::new(-1.0, 0.0, 0.0),
-            &[UVec2::new(1, 1), UVec2::new(0, 1)],
-            Some(Edge::Nx),
-        );
-        check_ray(
-            Vector::new(1.5, 1.5, Z),
-            Vector::new(0.0, 1.0, 0.0),
-            &[UVec2::new(1, 1)],
-            Some(Edge::Py),
-        );
-        check_ray(
-            Vector::new(1.5, 1.5, Z),
-            Vector::new(0.0, -1.0, 0.0),
-            &[UVec2::new(1, 1), UVec2::new(1, 0)],
-            Some(Edge::Ny),
-        );
     }
 }
