@@ -27,7 +27,9 @@ use parry3d_f64::{
         RayIntersection, ShapeCastHit, ShapeCastOptions, ShapeDistance, ShapeIntersection,
         TypedWorkspaceData, Unsupported, WorkspaceData,
     },
-    shape::{CompositeShape, FeatureId, Shape, ShapeType, SubShapeId, Triangle, TypedShape},
+    shape::{
+        CompositeShape, FeatureId, HalfSpace, Shape, ShapeType, SubShapeId, Triangle, TypedShape,
+    },
     utils::PoseOpt,
 };
 
@@ -1756,7 +1758,683 @@ impl ChunkData {
 /// A [`PersistentQueryDispatcher`] that handles `Planet` shapes
 pub struct PlanetDispatcher;
 
-// TODO: Fill these in
+impl Planet {
+    /// Seed proximity from the perspective quad closest to the other shape
+    /// center, evaluating just two real triangles. Any valid candidate is a
+    /// global *upper* distance bound, never an assumption about which patch
+    /// wins; all closer faces are still visited by the proven hierarchy.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Validated normalized patch positions are clamped to the u32 quad grid"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Clamped normalized patch coordinates are never negative"
+    )]
+    fn visit_proximity_seed_quad(
+        &self,
+        center: Vector,
+        visitor: &mut impl FnMut(Coords, u32, &Triangle) -> bool,
+    ) -> bool {
+        let axis = if center.length_squared() > 0.0 {
+            center
+        } else {
+            Vector::X
+        };
+        let resolution = self.terrain.face_resolution();
+        let coords = Coords::from_vector(resolution, &na3f32(axis));
+        let patch = Patch::new(&coords, resolution);
+        let side = self.chunk_resolution - 1;
+        let uv = patch.project(&axis) * f64::from(side);
+        let quad = Quad::new(
+            &patch,
+            side,
+            UVec2::new(
+                (uv.x.floor() as u32).min(side - 1),
+                (uv.y.floor() as u32).min(side - 1),
+            ),
+        );
+        let (_, data) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        for (index, triangle) in quad
+            .displace(self.radius, self.chunk_resolution, &data.samples)
+            .triangles()
+            .into_iter()
+            .enumerate()
+        {
+            let triangle_id = (quad.index(self.chunk_resolution) << 1) | u32::from(index == 1);
+            if !visitor(coords, triangle_id, &triangle) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A locally complete fast path for positive-radius terrain: if a
+    /// triangle can beat the current minimum distance from the other shape,
+    /// it must lie within a Euclidean ball of (shape radius + best distance)
+    /// around that shape's bounding-sphere center. The angular cone of this
+    /// ball covers every possible winner, including across face seams.
+    /// Returns None when the cap cannot be certified; the global hierarchy
+    /// then remains the correctness-preserving fallback.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Only finite small angular cones are cast to f32, with 2e-6 radians padding"
+    )]
+    fn visit_proximity_cap(
+        &self,
+        bounds: &BoundingSphere,
+        other_aabb: &Aabb,
+        max_distance: &mut Real,
+        visitor: &mut impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
+    ) -> Option<bool> {
+        let distance = bounds.center().length();
+        let cap_radius = bounds.radius() + *max_distance;
+        let inscribed = self.radius / 3.0_f64.sqrt() + f64::from(self.terrain.min_height());
+        if inscribed <= 64.0 * f64::EPSILON * self.radius
+            || !distance.is_finite()
+            || distance <= cap_radius
+            || !cap_radius.is_finite()
+        {
+            return None;
+        }
+        let theta = (cap_radius / distance).asin();
+        if (theta + 2.0e-6) * f64::from(self.terrain.face_resolution()) > 2.0 {
+            return None;
+        }
+        let axis = na3f32(bounds.center() / distance);
+        let face_resolution = self.terrain.face_resolution();
+        for coords in Coords::neighborhood(face_resolution, axis, (theta + 2.0e-6) as f32) {
+            let rounding = 512.0
+                * f64::EPSILON
+                * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
+            let limit = (*max_distance + rounding).max(0.0);
+            let query_aabb = other_aabb.loosened(limit);
+            let query_bounds = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
+            let mut continue_search = true;
+            self.map_elements_in_chunk(
+                coords,
+                &query_bounds,
+                &query_aabb,
+                &mut |&at, _, index, triangle| {
+                    continue_search = visitor(at, index, triangle, max_distance);
+                    continue_search
+                },
+            );
+            if !continue_search {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Visit a region's single terrain chunk after distance pruning. A
+    /// finite bound allows exact AABB/sphere filtering; only an unsupported
+    /// or non-finite initial result forces transient full-chunk inspection.
+    fn visit_proximity_leaf(
+        &self,
+        coords: Coords,
+        bounds: &BoundingSphere,
+        other_aabb: &Aabb,
+        roundoff: f64,
+        max_distance: &mut Real,
+        visitor: &mut impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
+    ) -> bool {
+        if max_distance.is_infinite() {
+            let patch = Patch::new(&coords, self.terrain.face_resolution());
+            let (_, data) = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(self, &coords);
+            for quad in patch.quads(self.chunk_resolution) {
+                for (index, triangle) in quad
+                    .displace(self.radius, self.chunk_resolution, &data.samples)
+                    .triangles()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let triangle_id =
+                        (quad.index(self.chunk_resolution) << 1) | u32::from(index == 1);
+                    if !visitor(coords, triangle_id, &triangle, max_distance) {
+                        return false;
+                    }
+                }
+            }
+            true
+        } else {
+            let limit = (*max_distance + roundoff).max(0.0);
+            let search_aabb = other_aabb.loosened(limit);
+            let search_sphere = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
+            let mut continue_search = true;
+            self.map_elements_in_chunk(
+                coords,
+                &search_sphere,
+                &search_aabb,
+                &mut |&at, _, index, triangle| {
+                    continue_search = visitor(at, index, triangle, max_distance);
+                    continue_search
+                },
+            );
+            continue_search
+        }
+    }
+
+    /// Explore the complete surface for a shape-to-shape minimum-distance
+    /// query. Each region is bounded by its distance to the center of the
+    /// other shape's containing sphere, minus that sphere's radius. This is
+    /// conservative for *every* actual triangle, including face seams and
+    /// inward-flipped heights, and applies to nonconvex other shapes too.
+    /// `max_distance` is tightened by the callback as better pairs are found.
+    fn visit_proximity_triangles(
+        &self,
+        pos12: &Pose,
+        other: &dyn Shape,
+        max_distance: &mut Real,
+        mut visitor: impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
+    ) {
+        let bounds = other.compute_bounding_sphere(pos12);
+        let center = bounds.center();
+        let center_radius = center.length();
+        let query = ProjectionQuery {
+            resolution: self.terrain.face_resolution(),
+            query_axis: if center_radius > 0.0 {
+                center / center_radius
+            } else {
+                Vector::X
+            },
+            query_radius: center_radius,
+            planet_radius: self.radius,
+            min_height: f64::from(self.terrain.min_height()),
+            max_height: f64::from(self.terrain.max_height()),
+        };
+        // The two seed triangles establish a finite, geometrically valid
+        // upper bound without enumerating every triangle in a chunk.
+        if !self.visit_proximity_seed_quad(center, &mut |at, index, triangle| {
+            visitor(at, index, triangle, max_distance)
+        }) {
+            return;
+        }
+        let other_aabb = other.compute_aabb(pos12);
+        if self
+            .visit_proximity_cap(&bounds, &other_aabb, max_distance, &mut visitor)
+            .is_some()
+        {
+            return;
+        }
+        let roundoff = 512.0
+            * f64::EPSILON
+            * (self.max_radius() + center.abs().max_element() + bounds.radius());
+        let mut regions = BinaryHeap::new();
+        for face in crate::cubemap::Face::iter() {
+            regions.push(ProjectionRegion::new(
+                face,
+                0,
+                query.resolution,
+                0,
+                query.resolution,
+                &query,
+            ));
+        }
+        while let Some(region) = regions.pop() {
+            let threshold = bounds.radius() + *max_distance + roundoff;
+            if region.lower_distance2 > threshold * threshold {
+                break;
+            }
+            if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
+                let coords = Coords {
+                    face: region.face,
+                    x: region.x0,
+                    y: region.y0,
+                };
+                if !self.visit_proximity_leaf(
+                    coords,
+                    &bounds,
+                    &other_aabb,
+                    roundoff,
+                    max_distance,
+                    &mut visitor,
+                ) {
+                    return;
+                }
+                continue;
+            }
+            let mid_x = region.x0 + (region.x1 - region.x0) / 2;
+            let mid_y = region.y0 + (region.y1 - region.y0) / 2;
+            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
+                if x0 == x1 {
+                    continue;
+                }
+                for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
+                    if y0 == y1 {
+                        continue;
+                    }
+                    let next = ProjectionRegion::new(region.face, x0, x1, y0, y1, &query);
+                    if next.lower_distance2 <= threshold * threshold {
+                        regions.push(next);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the terrain subshape ID only once the winner is known; visiting
+    /// other chunks can recycle LRU slots, especially with capacity one.
+    fn stable_triangle_id(&self, coords: Coords, triangle: u32) -> SubShapeId {
+        let (slot, _) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self, &coords);
+        self.subshape_id(slot, triangle)
+    }
+}
+
+/// A best-first cubemap region ordered by the smallest possible vertex
+/// projection along a given plane normal. The bounds include all triangle
+/// interiors, and remain safe if large negative heights invert their rays.
+#[derive(Clone, Copy, Debug)]
+struct PlaneSupportRegion {
+    region: ProjectionRegion,
+    lower_dot: f64,
+}
+
+impl PlaneSupportRegion {
+    fn new(
+        planet: &Planet,
+        face: crate::cubemap::Face,
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        y1: u32,
+        normal: Vector,
+    ) -> Self {
+        let resolution = planet.terrain.face_resolution();
+        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
+        let min_height = f64::from(planet.terrain.min_height());
+        let min_height_projection = if min_height >= 0.0 {
+            min_height * min_cos
+        } else {
+            min_height
+        };
+        let min_radius = planet.radius.mul_add(min_cos, min_height_projection);
+        let max_radius = planet.max_radius();
+        let cos_center = axis.dot(normal).clamp(-1.0, 1.0);
+        let min_direction_dot = if -cos_center >= min_cos {
+            -1.0
+        } else {
+            let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
+            let aperture = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
+            cos_center
+                .mul_add(min_cos, -transverse * aperture)
+                .max(-1.0)
+        };
+        let minimum = if min_radius <= 0.0 {
+            // An inward-flipped triangle is no longer confined to this
+            // positive angular cone. The enclosing planet sphere remains
+            // a conservative bound on every possible projected component.
+            -max_radius
+        } else if min_direction_dot >= 0.0 {
+            min_direction_dot * min_radius
+        } else {
+            min_direction_dot * max_radius
+        };
+        let slack = 512.0 * f64::EPSILON * (max_radius + planet.radius);
+        Self {
+            region: ProjectionRegion {
+                face,
+                x0,
+                x1,
+                y0,
+                y1,
+                lower_distance2: 0.0,
+            },
+            lower_dot: minimum - slack,
+        }
+    }
+}
+impl PartialEq for PlaneSupportRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.lower_dot.total_cmp(&other.lower_dot).is_eq() && self.region == other.region
+    }
+}
+impl Eq for PlaneSupportRegion {}
+impl PartialOrd for PlaneSupportRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PlaneSupportRegion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .lower_dot
+            .total_cmp(&self.lower_dot)
+            .then_with(|| self.region.cmp(&other.region))
+    }
+}
+
+struct PlaneSupportWinner {
+    coords: Coords,
+    triangle: u32,
+    point: Vector,
+    dot: f64,
+}
+
+impl Planet {
+    fn update_plane_support(
+        winner: &mut Option<PlaneSupportWinner>,
+        normal: Vector,
+        coords: Coords,
+        triangle: u32,
+        shape: &Triangle,
+    ) {
+        for point in [shape.a, shape.b, shape.c] {
+            let dot = point.dot(normal);
+            if winner.as_ref().is_none_or(|best| dot < best.dot) {
+                *winner = Some(PlaneSupportWinner {
+                    coords,
+                    triangle,
+                    point,
+                    dot,
+                });
+            }
+        }
+    }
+
+    /// Find the supporting point of the entire triangulated terrain in the
+    /// negative plane-normal direction. Unlike finite shapes, `HalfSpace`
+    /// has a near-infinite Parry bounding sphere, so the general proximity
+    /// hierarchy cannot prune it. A global directional extremum is exact
+    /// and requires only a single supporting triangle witness.
+    fn supporting_terrain_point(&self, normal: Vector) -> Option<PlaneSupportWinner> {
+        let mut winner: Option<PlaneSupportWinner> = None;
+        let _ = self.visit_proximity_seed_quad(
+            -normal * self.radius,
+            &mut |coords, triangle, shape| {
+                Self::update_plane_support(&mut winner, normal, coords, triangle, shape);
+                true
+            },
+        );
+        let mut regions = BinaryHeap::new();
+        let resolution = self.terrain.face_resolution();
+        for face in crate::cubemap::Face::iter() {
+            regions.push(PlaneSupportRegion::new(
+                self, face, 0, resolution, 0, resolution, normal,
+            ));
+        }
+        while let Some(region) = regions.pop() {
+            if winner
+                .as_ref()
+                .is_some_and(|best| region.lower_dot > best.dot)
+            {
+                break;
+            }
+            if region.region.x1 - region.region.x0 == 1 && region.region.y1 - region.region.y0 == 1
+            {
+                let coords = Coords {
+                    face: region.region.face,
+                    x: region.region.x0,
+                    y: region.region.y0,
+                };
+                let (_, data) = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(self, &coords);
+                let patch = Patch::new(&coords, resolution);
+                for quad in patch.quads(self.chunk_resolution) {
+                    for (index, triangle) in quad
+                        .displace(self.radius, self.chunk_resolution, &data.samples)
+                        .triangles()
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let triangle_id =
+                            (quad.index(self.chunk_resolution) << 1) | u32::from(index == 1);
+                        Self::update_plane_support(
+                            &mut winner,
+                            normal,
+                            coords,
+                            triangle_id,
+                            &triangle,
+                        );
+                    }
+                }
+                continue;
+            }
+            let mid_x = region.region.x0 + (region.region.x1 - region.region.x0) / 2;
+            let mid_y = region.region.y0 + (region.region.y1 - region.region.y0) / 2;
+            for (x0, x1) in [(region.region.x0, mid_x), (mid_x, region.region.x1)] {
+                if x0 == x1 {
+                    continue;
+                }
+                for (y0, y1) in [(region.region.y0, mid_y), (mid_y, region.region.y1)] {
+                    if y0 == y1 {
+                        continue;
+                    }
+                    let candidate =
+                        PlaneSupportRegion::new(self, region.region.face, x0, x1, y0, y1, normal);
+                    if winner
+                        .as_ref()
+                        .is_none_or(|best| candidate.lower_dot <= best.dot)
+                    {
+                        regions.push(candidate);
+                    }
+                }
+            }
+        }
+        // Every validated planet has at least one populated triangle, and
+        // the seed evaluates both triangles of a valid quad.
+        winner
+    }
+}
+
+struct PlanetPlaneResult {
+    winner: PlaneSupportWinner,
+    signed: f64,
+    normal: Vector,
+}
+impl PlanetPlaneResult {
+    fn new(planet: &Planet, pose: &Pose, plane: &HalfSpace) -> Option<Self> {
+        let normal = pose.rotation * plane.normal;
+        let winner = planet.supporting_terrain_point(normal)?;
+        let signed = winner.dot - normal.dot(pose.translation);
+        Some(Self {
+            winner,
+            signed,
+            normal,
+        })
+    }
+}
+
+fn planet_halfspace_distance(
+    pose: &Pose,
+    planet: &Planet,
+    plane: &HalfSpace,
+) -> Result<ShapeDistance, Unsupported> {
+    let result = PlanetPlaneResult::new(planet, pose, plane).ok_or(Unsupported)?;
+    Ok(ShapeDistance::new(result.signed.max(0.0)).with_subshapes(
+        planet.stable_triangle_id(result.winner.coords, result.winner.triangle),
+        0,
+    ))
+}
+
+fn planet_halfspace_closest_points(
+    pose: &Pose,
+    planet: &Planet,
+    plane: &HalfSpace,
+    max_dist: Real,
+) -> Result<ClosestPoints, Unsupported> {
+    let result = PlanetPlaneResult::new(planet, pose, plane).ok_or(Unsupported)?;
+    if result.signed <= 0.0 {
+        Ok(ClosestPoints::Intersecting)
+    } else if result.signed <= max_dist {
+        let surface = result.winner.point;
+        let on_plane = surface - result.normal * result.signed;
+        Ok(ClosestPoints::WithinMargin(
+            surface,
+            pose.inverse_transform_point(on_plane),
+        ))
+    } else {
+        Ok(ClosestPoints::Disjoint)
+    }
+}
+
+fn planet_halfspace_contact(
+    pose: &Pose,
+    planet: &Planet,
+    plane: &HalfSpace,
+    prediction: Real,
+) -> Result<Option<Contact>, Unsupported> {
+    let result = PlanetPlaneResult::new(planet, pose, plane).ok_or(Unsupported)?;
+    if result.signed > prediction {
+        return Ok(None);
+    }
+    let surface = result.winner.point;
+    let on_plane = surface - result.normal * result.signed;
+    Ok(Some(
+        Contact::new(
+            surface,
+            pose.inverse_transform_point(on_plane),
+            -result.normal,
+            pose.rotation.inverse() * result.normal,
+            result.signed,
+        )
+        .with_subshapes(
+            planet.stable_triangle_id(result.winner.coords, result.winner.triangle),
+            0,
+        ),
+    ))
+}
+
+fn planet_shape_distance(
+    pos12: &Pose,
+    planet: &Planet,
+    other: &dyn Shape,
+) -> Result<ShapeDistance, Unsupported> {
+    if let Some(plane) = other.as_shape::<HalfSpace>() {
+        return planet_halfspace_distance(pos12, planet, plane);
+    }
+    let dispatcher = DefaultQueryDispatcher;
+    let mut max_distance = f64::INFINITY;
+    let mut best: Option<(Coords, u32, ShapeDistance)> = None;
+    let mut unsupported = false;
+    planet.visit_proximity_triangles(
+        pos12,
+        other,
+        &mut max_distance,
+        |coords, index, triangle, limit| {
+            dispatcher.distance(pos12, triangle, other).map_or_else(
+                |_| {
+                    unsupported = true;
+                    false
+                },
+                |result| {
+                    if best.is_none_or(|(_, _, previous)| result.distance < previous.distance) {
+                        *limit = result.distance;
+                        best = Some((coords, index, result));
+                    }
+                    *limit > 0.0
+                },
+            )
+        },
+    );
+    if unsupported {
+        return Err(Unsupported);
+    }
+    let Some((coords, index, mut result)) = best else {
+        return Err(Unsupported);
+    };
+    result.subshape1 = planet.stable_triangle_id(coords, index);
+    Ok(result)
+}
+
+fn planet_shape_closest_points(
+    pos12: &Pose,
+    planet: &Planet,
+    other: &dyn Shape,
+    max_dist: Real,
+) -> Result<ClosestPoints, Unsupported> {
+    if max_dist.is_nan() || max_dist < 0.0 {
+        return Err(Unsupported);
+    }
+    if let Some(plane) = other.as_shape::<HalfSpace>() {
+        return planet_halfspace_closest_points(pos12, planet, plane, max_dist);
+    }
+    let dispatcher = DefaultQueryDispatcher;
+    let mut limit = max_dist;
+    let mut best = ClosestPoints::Disjoint;
+    let mut unsupported = false;
+    planet.visit_proximity_triangles(pos12, other, &mut limit, |_, _, triangle, limit| {
+        match dispatcher.closest_points(pos12, triangle, other, *limit) {
+            Ok(ClosestPoints::Intersecting) => {
+                best = ClosestPoints::Intersecting;
+                false
+            }
+            Ok(ClosestPoints::WithinMargin(p1, p2)) => {
+                let distance = p1.distance(*pos12 * p2);
+                if matches!(best, ClosestPoints::Disjoint) || distance < *limit {
+                    *limit = distance;
+                    best = ClosestPoints::WithinMargin(p1, p2);
+                }
+                true
+            }
+            Ok(ClosestPoints::Disjoint) => true,
+            Err(_) => {
+                unsupported = true;
+                false
+            }
+        }
+    });
+    if unsupported {
+        Err(Unsupported)
+    } else {
+        Ok(best)
+    }
+}
+
+fn planet_shape_contact(
+    pos12: &Pose,
+    planet: &Planet,
+    other: &dyn Shape,
+    prediction: Real,
+) -> Result<Option<Contact>, Unsupported> {
+    if let Some(plane) = other.as_shape::<HalfSpace>() {
+        return planet_halfspace_contact(pos12, planet, plane, prediction);
+    }
+    let dispatcher = DefaultQueryDispatcher;
+    let envelope = other.compute_aabb(pos12).loosened(prediction.max(0.0));
+    let bound = envelope.bounding_sphere();
+    let mut best: Option<(Coords, u32, Contact)> = None;
+    let mut unsupported = false;
+    planet.map_elements_in_local_sphere(&bound, &envelope, |&coords, _, index, triangle| {
+        match dispatcher.contact(pos12, triangle, other, prediction) {
+            Ok(Some(contact)) => {
+                if best.is_none_or(|(_, _, previous)| contact.dist < previous.dist) {
+                    best = Some((coords, index, contact));
+                }
+                true
+            }
+            Ok(None) => true,
+            Err(_) => {
+                unsupported = true;
+                false
+            }
+        }
+    });
+    if unsupported {
+        return Err(Unsupported);
+    }
+    let Some((coords, index, mut contact)) = best else {
+        return Ok(None);
+    };
+    contact.subshape1 = planet.stable_triangle_id(coords, index);
+    Ok(Some(contact))
+}
+
 impl QueryDispatcher for PlanetDispatcher {
     fn intersection_test(
         &self,
@@ -1775,30 +2453,50 @@ impl QueryDispatcher for PlanetDispatcher {
 
     fn distance(
         &self,
-        _pos12: &Pose,
-        _g1: &dyn Shape,
-        _g2: &dyn Shape,
+        pos12: &Pose,
+        g1: &dyn Shape,
+        g2: &dyn Shape,
     ) -> Result<ShapeDistance, Unsupported> {
+        if let Some(planet) = g1.as_shape::<Planet>() {
+            return planet_shape_distance(pos12, planet, g2);
+        }
+        if let Some(planet) = g2.as_shape::<Planet>() {
+            return planet_shape_distance(&pos12.inverse(), planet, g1).map(ShapeDistance::swapped);
+        }
         Err(Unsupported)
     }
 
     fn contact(
         &self,
-        _pos12: &Pose,
-        _g1: &dyn Shape,
-        _g2: &dyn Shape,
-        _prediction: Real,
+        pos12: &Pose,
+        g1: &dyn Shape,
+        g2: &dyn Shape,
+        prediction: Real,
     ) -> Result<Option<Contact>, Unsupported> {
+        if let Some(planet) = g1.as_shape::<Planet>() {
+            return planet_shape_contact(pos12, planet, g2, prediction);
+        }
+        if let Some(planet) = g2.as_shape::<Planet>() {
+            return planet_shape_contact(&pos12.inverse(), planet, g1, prediction)
+                .map(|contact| contact.map(Contact::flipped));
+        }
         Err(Unsupported)
     }
 
     fn closest_points(
         &self,
-        _pos12: &Pose,
-        _g1: &dyn Shape,
-        _g2: &dyn Shape,
-        _max_dist: Real,
+        pos12: &Pose,
+        g1: &dyn Shape,
+        g2: &dyn Shape,
+        max_dist: Real,
     ) -> Result<ClosestPoints, Unsupported> {
+        if let Some(planet) = g1.as_shape::<Planet>() {
+            return planet_shape_closest_points(pos12, planet, g2, max_dist);
+        }
+        if let Some(planet) = g2.as_shape::<Planet>() {
+            return planet_shape_closest_points(&pos12.inverse(), planet, g1, max_dist)
+                .map(|points| points.flipped());
+        }
         Err(Unsupported)
     }
 
@@ -3794,6 +4492,557 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             }
             assert!(query_count > 50);
         }
+    }
+
+    #[test]
+    fn planet_dispatcher_supports_three_proximity_queries_in_both_orders() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 1, 10.0).unwrap();
+        let ball = Ball::new(0.3);
+        let center = 10.0 / 3.0_f64.sqrt() + 1.3;
+        let pose = Pose::translation(center, 0.0, 0.0);
+        let dispatcher = PlanetDispatcher;
+        let distance = dispatcher
+            .distance(&pose, &planet, &ball)
+            .expect("Planet/Ball distance must be supported");
+        assert!(distance.distance > 0.0);
+        let reverse_distance = dispatcher
+            .distance(&pose.inverse(), &ball, &planet)
+            .expect("Ball/Planet distance must be supported");
+        assert!((distance.distance - reverse_distance.distance).abs() < 1.0e-9);
+        let closest = dispatcher
+            .closest_points(&pose, &planet, &ball, 3.0)
+            .expect("Planet/Ball closest points must be supported");
+        assert!(matches!(closest, ClosestPoints::WithinMargin(_, _)));
+        let reversed = dispatcher
+            .closest_points(&pose.inverse(), &ball, &planet, 3.0)
+            .expect("Ball/Planet closest points must be supported");
+        assert!(matches!(reversed, ClosestPoints::WithinMargin(_, _)));
+        let contact = dispatcher
+            .contact(&pose, &planet, &ball, 3.0)
+            .expect("Planet/Ball contact must be supported");
+        assert!(contact.is_some());
+        let reverse_contact = dispatcher
+            .contact(&pose.inverse(), &ball, &planet, 3.0)
+            .expect("Ball/Planet contact must be supported");
+        assert!(reverse_contact.is_some());
+    }
+
+    /// Independent exact reference over all six cube faces, without reusing
+    /// the dispatcher traversal or any of its spatial pruning.
+    fn exhaustive_proximity_reference(
+        planet: &Planet,
+        other: &dyn Shape,
+        pos12: &Pose,
+        prediction: f64,
+    ) -> (f64, ClosestPoints, Option<Contact>) {
+        let dispatcher = DefaultQueryDispatcher;
+        let mut min_dist = f64::INFINITY;
+        let mut closest = ClosestPoints::Disjoint;
+        let mut contact: Option<Contact> = None;
+        for face in Face::iter() {
+            for y in 0..planet.terrain.face_resolution() {
+                for x in 0..planet.terrain.face_resolution() {
+                    let coords = Coords { face, x, y };
+                    let samples = planet.sample(&coords);
+                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    for (_, triangle) in
+                        patch.triangles(planet.radius, planet.chunk_resolution, &samples)
+                    {
+                        let dist = dispatcher
+                            .distance(pos12, &triangle, other)
+                            .unwrap()
+                            .distance;
+                        min_dist = min_dist.min(dist);
+                        match dispatcher.closest_points(pos12, &triangle, other, f64::MAX) {
+                            Ok(ClosestPoints::Intersecting) => {
+                                closest = ClosestPoints::Intersecting;
+                            }
+                            Ok(ClosestPoints::WithinMargin(p1, p2))
+                                if !matches!(closest, ClosestPoints::Intersecting) =>
+                            {
+                                let d = p1.distance(*pos12 * p2);
+                                let existing = match closest {
+                                    ClosestPoints::WithinMargin(a, b) => a.distance(*pos12 * b),
+                                    _ => f64::INFINITY,
+                                };
+                                if d < existing {
+                                    closest = ClosestPoints::WithinMargin(p1, p2);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if let Some(candidate) = dispatcher
+                            .contact(pos12, &triangle, other, prediction)
+                            .unwrap()
+                        {
+                            if contact.is_none_or(|previous| candidate.dist < previous.dist) {
+                                contact = Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (min_dist, closest, contact)
+    }
+
+    #[test]
+    fn proximity_queries_match_exhaustive_all_face_references() {
+        for patterned in [false, true] {
+            let terrain = Arc::new(ProjectionTerrain {
+                face_resolution: 2,
+                peak: None,
+                patterned,
+                samples: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let planet = Planet::new(terrain, 1, 10.0).unwrap();
+            let ball = Ball::new(0.4);
+            let positions = [
+                Vector::X * 5.2,
+                Vector::X * 6.2,
+                Vector::X * 12.0,
+                Vector::new(5.1, 4.9, -5.3),
+                Vector::new(-7.0, 7.4, 0.1),
+                Vector::new(2.0, -8.3, 9.5),
+                Vector::ZERO,
+                Vector::new(-20.0, 4.0, 3.0),
+            ];
+            for (case, center) in positions.into_iter().enumerate() {
+                let pose = Pose::translation(center.x, center.y, center.z);
+                let (expected_dist, expected_pts, expected_contact) =
+                    exhaustive_proximity_reference(&planet, &ball, &pose, 3.0);
+                let distance = PlanetDispatcher.distance(&pose, &planet, &ball).unwrap();
+                assert!(
+                    (distance.distance - expected_dist).abs() < 1.0e-8,
+                    "patterned={patterned},case={case},dist={distance:?},expected={expected_dist}"
+                );
+                let swapped = PlanetDispatcher
+                    .distance(&pose.inverse(), &ball, &planet)
+                    .unwrap();
+                assert!((swapped.distance - expected_dist).abs() < 1.0e-8);
+                assert_eq!(distance.subshape1, swapped.subshape2);
+                let points = PlanetDispatcher
+                    .closest_points(&pose, &planet, &ball, 100.0)
+                    .unwrap();
+                let reverse_points = PlanetDispatcher
+                    .closest_points(&pose.inverse(), &ball, &planet, 100.0)
+                    .unwrap();
+                assert_eq!(points, reverse_points.flipped());
+                if matches!(expected_pts, ClosestPoints::Intersecting) {
+                    assert_eq!(points, ClosestPoints::Intersecting);
+                } else if let ClosestPoints::WithinMargin(p1, p2) = points {
+                    assert!((p1.distance(pose*p2)-expected_dist).abs() < 1.0e-8,
+                        "patterned={patterned},case={case},closest={points:?},expected={expected_pts:?}");
+                } else {
+                    panic!("missing witness points: {points:?}");
+                }
+                let contact = PlanetDispatcher
+                    .contact(&pose, &planet, &ball, 3.0)
+                    .unwrap();
+                assert_eq!(contact.is_some(), expected_contact.is_some());
+                if let (Some(actual), Some(expected)) = (contact, expected_contact) {
+                    assert!(
+                        (actual.dist - expected.dist).abs() < 1.0e-8,
+                        "patterned={patterned},case={case},actual={actual:?},expected={expected:?}"
+                    );
+                }
+                let reverse = PlanetDispatcher
+                    .contact(&pose.inverse(), &ball, &planet, 3.0)
+                    .unwrap();
+                assert_eq!(reverse.is_some(), contact.is_some());
+                if let (Some(a), Some(b)) = (contact, reverse) {
+                    assert!((a.dist - b.dist).abs() < 1.0e-8);
+                    assert_eq!(a.subshape1, b.subshape2);
+                }
+                // The cache has one slot: the final terrain subshape ID
+                // must describe the resident chunk after the whole search.
+                let triangle_count = planet.triangles_per_chunk();
+                let slot = distance.subshape1 / triangle_count;
+                assert!(
+                    planet
+                        .cache
+                        .lock()
+                        .unwrap()
+                        .slots
+                        .iter()
+                        .any(|(id, _)| id == slot),
+                    "winner was already evicted"
+                );
+                let cutoff = (expected_dist - 0.1).max(0.0);
+                let result = PlanetDispatcher
+                    .closest_points(&pose, &planet, &ball, cutoff)
+                    .unwrap();
+                if expected_dist > cutoff {
+                    assert_eq!(result, ClosestPoints::Disjoint);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn proximity_queries_match_exhaustive_rotated_cuboid() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(2, 4).unwrap()), 1, 10.0).unwrap();
+        let box_shape = Cuboid::new(Vector::new(0.3, 0.5, 0.8));
+        for (case, center) in [
+            Vector::new(7.0, 0.3, 0.2),
+            Vector::new(5.2, 0.5, -0.7),
+            Vector::new(7.2, 7.2, 0.1),
+            Vector::new(-9.0, 4.0, -2.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let angle = 0.37 * (f64::from(u32::try_from(case).unwrap()) + 1.0);
+            let pose = Pose::translation(center.x, center.y, center.z)
+                * Pose::from_rotation(Rotation::from_axis_angle(Vector::Y, angle));
+            let (expected_dist, _, expected_contact) =
+                exhaustive_proximity_reference(&planet, &box_shape, &pose, 2.0);
+            let actual = PlanetDispatcher
+                .distance(&pose, &planet, &box_shape)
+                .unwrap();
+            assert!((actual.distance - expected_dist).abs() < 1.0e-8);
+            let points = PlanetDispatcher
+                .closest_points(&pose, &planet, &box_shape, 20.0)
+                .unwrap();
+            if let ClosestPoints::WithinMargin(a, b) = points {
+                assert!((a.distance(pose * b) - expected_dist).abs() < 1.0e-8);
+            } else {
+                assert_eq!(points, ClosestPoints::Intersecting);
+            }
+            let actual_contact = PlanetDispatcher
+                .contact(&pose, &planet, &box_shape, 2.0)
+                .unwrap();
+            assert_eq!(actual_contact.is_some(), expected_contact.is_some());
+            if let (Some(a), Some(b)) = (actual_contact, expected_contact) {
+                assert!((a.dist - b.dist).abs() < 1.0e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn planetary_radius_proximity_matches_independent_surface_projection() {
+        const RADIUS: f64 = 6_371_000.0;
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4096, 17).unwrap()), 1, RADIUS).unwrap();
+        let ball = Ball::new(0.3);
+        for (case, axis) in [
+            Vector::X,
+            Vector::new(1.0, 1.0, 0.0002).normalize(),
+            Vector::new(0.0001, -1.0, 1.0).normalize(),
+            Vector::new(-1.0, -1.0, -1.0).normalize(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for offset in [-0.4, 0.3, 1.7, 8.0] {
+                let point = axis * (RADIUS + offset);
+                let pose = Pose::translation(point.x, point.y, point.z);
+                let projection = planet.project_local_point(point, false);
+                let expected = (projection.point.distance(point) - ball.radius).max(0.0);
+                let result = PlanetDispatcher.distance(&pose, &planet, &ball).unwrap();
+                assert!(
+                    (result.distance - expected).abs() < 1.0e-5,
+                    "case={case},offset={offset},distance={result:?},expected={expected}"
+                );
+                let closest = PlanetDispatcher
+                    .closest_points(&pose, &planet, &ball, 12.0)
+                    .unwrap();
+                if expected > 0.0 {
+                    let ClosestPoints::WithinMargin(a, b) = closest else {
+                        panic!("missing planetary closest point: {case}, {offset}: {closest:?}");
+                    };
+                    assert!((a.distance(pose * b) - expected).abs() < 1.0e-5);
+                } else {
+                    assert_eq!(closest, ClosestPoints::Intersecting);
+                }
+                if expected > 0.1 {
+                    let cutoff = expected * 0.5;
+                    let disjoint = PlanetDispatcher
+                        .closest_points(&pose, &planet, &ball, cutoff)
+                        .unwrap();
+                    assert_eq!(disjoint, ClosestPoints::Disjoint);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contact_normals_and_subshape_ids_follow_shape_local_coordinates() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 4).unwrap()), 1, 10.0).unwrap();
+        let ball = Ball::new(0.55);
+        for center in [
+            Vector::new(9.7, 0.2, -0.1),
+            Vector::new(10.2, -0.3, 0.2),
+            Vector::new(-0.1, -0.2, 10.1),
+        ] {
+            let pose = Pose::translation(center.x, center.y, center.z);
+            let actual = PlanetDispatcher
+                .contact(&pose, &planet, &ball, 1.5)
+                .unwrap()
+                .unwrap();
+            let reverse = PlanetDispatcher
+                .contact(&pose.inverse(), &ball, &planet, 1.5)
+                .unwrap()
+                .unwrap();
+            assert!((actual.dist - reverse.dist).abs() < 1.0e-10);
+            assert!((actual.point1 - reverse.point2).length() < 1.0e-10);
+            assert!((actual.point2 - reverse.point1).length() < 1.0e-10);
+            assert!((actual.normal1 - reverse.normal2).length() < 1.0e-10);
+            assert!((actual.normal2 - reverse.normal1).length() < 1.0e-10);
+            assert_eq!(actual.subshape1, reverse.subshape2);
+            assert_eq!(actual.subshape2, reverse.subshape1);
+            assert!((actual.normal1.length() - 1.0).abs() < 1.0e-9);
+            assert!((actual.normal2.length() - 1.0).abs() < 1.0e-9);
+            assert!((actual.normal1 + pose.rotation * actual.normal2).length() < 1.0e-9);
+            // Subshape IDs are meaningful immediately on return, even if
+            // the global search evicted the geometrically best chunk.
+            let slot = actual.subshape1 / planet.triangles_per_chunk();
+            assert!(planet
+                .cache
+                .lock()
+                .unwrap()
+                .slots
+                .iter()
+                .any(|(id, _)| id == slot));
+        }
+    }
+
+    #[test]
+    fn proximity_queries_preserve_other_composite_part_ids() {
+        use parry3d_f64::shape::{Compound, SharedShape};
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 1, 10.0).unwrap();
+        let other = Compound::new(vec![
+            (Pose::translation(-1.0, 0.0, 0.0), SharedShape::ball(0.5)),
+            (Pose::translation(2.0, 0.0, 0.0), SharedShape::ball(0.25)),
+        ]);
+        let pose = Pose::translation(7.5, 0.1, -0.2);
+        let (expected, _, expected_contact) =
+            exhaustive_proximity_reference(&planet, &other, &pose, 2.0);
+        let distance = PlanetDispatcher.distance(&pose, &planet, &other).unwrap();
+        assert!((distance.distance - expected).abs() < 1.0e-9);
+        assert_eq!(distance.subshape2, 0);
+        let reversed = PlanetDispatcher
+            .distance(&pose.inverse(), &other, &planet)
+            .unwrap();
+        assert_eq!(reversed.subshape1, 0);
+        assert!((reversed.distance - expected).abs() < 1.0e-9);
+        let closest = PlanetDispatcher
+            .closest_points(&pose, &planet, &other, 5.0)
+            .unwrap();
+        let ClosestPoints::WithinMargin(a, b) = closest else {
+            panic!("expected composite witness pair, got {closest:?}");
+        };
+        assert!((a.distance(pose * b) - expected).abs() < 1.0e-9);
+        let contact = PlanetDispatcher
+            .contact(&pose, &planet, &other, 2.0)
+            .unwrap();
+        assert_eq!(contact.is_some(), expected_contact.is_some());
+        if let Some(contact) = contact {
+            assert_eq!(contact.subshape2, 0);
+            assert!((contact.dist - expected_contact.unwrap().dist).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn infinite_halfspace_proximity_matches_exhaustive_surface_support() {
+        for patterned in [false, true] {
+            let terrain = Arc::new(ProjectionTerrain {
+                face_resolution: 2,
+                peak: None,
+                patterned,
+                samples: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let planet = Planet::new(terrain, 1, 10.0).unwrap();
+            let plane = HalfSpace::new(Vector::X);
+            for (case, (center, angle)) in [
+                (Vector::new(-12.0, 0.0, 0.0), 0.0),
+                (Vector::new(12.0, 0.0, 0.0), 0.0),
+                (Vector::new(-4.0, 3.0, 2.0), 0.47),
+                (Vector::new(0.0, -6.0, 0.0), -0.9),
+                (Vector::ZERO, 1.1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let pose = Pose::translation(center.x, center.y, center.z)
+                    * Pose::from_rotation(Rotation::from_axis_angle(Vector::Z, angle));
+                let (min_dist, expected_pts, _) =
+                    exhaustive_proximity_reference(&planet, &plane, &pose, 40.0);
+                // The exact supporting-plane reference must use real
+                // displaced geometry. Parry 0.31 triangle/HalfSpace contact
+                // may report a signed depth inconsistent with its points
+                // when the HalfSpace is translated; do not perpetuate that.
+                let normal = pose.rotation * plane.normal;
+                let mut expected_signed = f64::INFINITY;
+                for face in Face::iter() {
+                    for y in 0..planet.terrain.face_resolution() {
+                        for x in 0..planet.terrain.face_resolution() {
+                            let coords = Coords { face, x, y };
+                            let samples = planet.sample(&coords);
+                            let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                            for (_, triangle) in
+                                patch.triangles(planet.radius, planet.chunk_resolution, &samples)
+                            {
+                                for vertex in [triangle.a, triangle.b, triangle.c] {
+                                    expected_signed =
+                                        expected_signed.min(normal.dot(vertex - pose.translation));
+                                }
+                            }
+                        }
+                    }
+                }
+                let dist = PlanetDispatcher.distance(&pose, &planet, &plane).unwrap();
+                assert!(
+                    (dist.distance - min_dist).abs() < 1.0e-9,
+                    "patterned={patterned},case={case},distance={dist:?},expected={min_dist}"
+                );
+                let reverse = PlanetDispatcher
+                    .distance(&pose.inverse(), &plane, &planet)
+                    .unwrap();
+                assert!((reverse.distance - min_dist).abs() < 1.0e-9);
+                assert_eq!(dist.subshape1, reverse.subshape2);
+                let closest = PlanetDispatcher
+                    .closest_points(&pose, &planet, &plane, 40.0)
+                    .unwrap();
+                let reversed = PlanetDispatcher
+                    .closest_points(&pose.inverse(), &plane, &planet, 40.0)
+                    .unwrap();
+                assert_eq!(closest, reversed.flipped());
+                if matches!(expected_pts, ClosestPoints::Intersecting) {
+                    assert_eq!(closest, ClosestPoints::Intersecting);
+                } else {
+                    let ClosestPoints::WithinMargin(a, b) = closest else {
+                        panic!("expected separated witness points: {closest:?}");
+                    };
+                    assert!((a.distance(pose * b) - min_dist).abs() < 1.0e-9);
+                }
+                let actual = PlanetDispatcher
+                    .contact(&pose, &planet, &plane, 40.0)
+                    .unwrap();
+                assert_eq!(actual.is_some(), expected_signed <= 40.0);
+                if let Some(a) = actual {
+                    assert!(
+                        (a.dist - expected_signed).abs() < 1.0e-9,
+                        "patterned={patterned},case={case},contact={a:?},reference={expected_signed}"
+                    );
+                    let flipped = PlanetDispatcher
+                        .contact(&pose.inverse(), &plane, &planet, 40.0)
+                        .unwrap()
+                        .unwrap();
+                    assert!((a.dist - flipped.dist).abs() < 1.0e-9);
+                    assert_eq!(a.subshape1, flipped.subshape2);
+                    assert!((a.point1 - flipped.point2).length() < 1.0e-9);
+                    assert!((a.normal1 - flipped.normal2).length() < 1.0e-9);
+                }
+                if min_dist > 0.1 {
+                    let disjoint = PlanetDispatcher
+                        .closest_points(&pose, &planet, &plane, min_dist / 2.0)
+                        .unwrap();
+                    assert_eq!(disjoint, ClosestPoints::Disjoint);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inward_inverted_halfspace_support_matches_exhaustive_vertices() {
+        struct InvertedHeight;
+        impl Terrain for InvertedHeight {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                let level = if coords.face == Face::Px {
+                    -9.0
+                } else if coords.face == Face::Nz {
+                    -5.0
+                } else {
+                    0.0
+                };
+                out.fill(level);
+            }
+            fn face_resolution(&self) -> u32 {
+                2
+            }
+            fn chunk_resolution(&self) -> u32 {
+                3
+            }
+            fn min_height(&self) -> f32 {
+                -9.0
+            }
+            fn max_height(&self) -> f32 {
+                0.0
+            }
+        }
+        let planet = Planet::new(Arc::new(InvertedHeight), 1, 10.0).unwrap();
+        let plane = HalfSpace::new(Vector::X);
+        for (case, (center, axis)) in [
+            (Vector::new(-0.4, 0.2, 0.0), Vector::X),
+            (
+                Vector::new(-4.0, 2.0, 3.0),
+                Vector::new(-1.0, 1.0, 1.0).normalize(),
+            ),
+            (
+                Vector::new(8.0, -2.0, 3.0),
+                Vector::new(0.1, -1.0, 0.4).normalize(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rotation = Rotation::from_rotation_arc(Vector::X, axis);
+            let pose =
+                Pose::translation(center.x, center.y, center.z) * Pose::from_rotation(rotation);
+            let normal = pose.rotation * plane.normal;
+            let mut minimum = f64::INFINITY;
+            for face in Face::iter() {
+                for y in 0..2 {
+                    for x in 0..2 {
+                        let coords = Coords { face, x, y };
+                        let samples = planet.sample(&coords);
+                        let patch = Patch::new(&coords, 2);
+                        for (_, triangle) in patch.triangles(10.0, 3, &samples) {
+                            for vertex in [triangle.a, triangle.b, triangle.c] {
+                                minimum = minimum.min(normal.dot(vertex - pose.translation));
+                            }
+                        }
+                    }
+                }
+            }
+            let actual = PlanetDispatcher
+                .contact(&pose, &planet, &plane, 20.0)
+                .unwrap()
+                .unwrap();
+            assert!(
+                (actual.dist - minimum).abs() < 1.0e-9,
+                "inversion case={case},expected={minimum},actual={actual:?}"
+            );
+            assert_eq!(
+                PlanetDispatcher
+                    .distance(&pose, &planet, &plane)
+                    .unwrap()
+                    .distance,
+                minimum.max(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn large_planet_halfspace_distance_prunes_all_six_faces() {
+        const RADIUS: f64 = 6_371_000.0;
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4096, 17).unwrap()), 1, RADIUS).unwrap();
+        let plane = HalfSpace::new(Vector::X);
+        let pose = Pose::translation(-RADIUS - 2.5, 0.0, 0.0);
+        let result = PlanetDispatcher.distance(&pose, &planet, &plane).unwrap();
+        assert!((result.distance - 2.5).abs() < 1.0e-5, "{result:?}");
+        let closest = PlanetDispatcher
+            .closest_points(&pose, &planet, &plane, 3.0)
+            .unwrap();
+        let ClosestPoints::WithinMargin(point1, point2) = closest else {
+            panic!("unexpected closest points to halfspace: {closest:?}");
+        };
+        assert!((point1.distance(pose * point2) - 2.5).abs() < 1.0e-5);
+        let contact = PlanetDispatcher
+            .contact(&pose, &planet, &plane, 3.0)
+            .unwrap()
+            .unwrap();
+        assert!((contact.dist - 2.5).abs() < 1.0e-5);
     }
 
     #[test]
