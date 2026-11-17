@@ -223,9 +223,6 @@ impl Planet {
     fn max_radius(&self) -> f64 {
         self.radius + f64::from(self.terrain.max_height())
     }
-    fn min_radius(&self) -> f64 {
-        self.radius + f64::from(self.terrain.min_height())
-    }
 
     fn sample(&self, coords: &Coords) -> Box<[f32]> {
         let mut samples =
@@ -1059,16 +1056,61 @@ impl Planet {
     }
 }
 
-impl PointQuery for Planet {
-    fn project_local_point(&self, pt: Vector, solid: bool) -> PointProjection {
-        if solid && pt.length_squared() < self.min_radius() * self.min_radius() {
-            return PointProjection::new(true, pt);
+impl Planet {
+    /// Classify the radial solid under the *actual triangulated* terrain.
+    /// Vertex radii alone are not valid interior bounds: triangles are
+    /// chords and may be much closer to the origin than their vertices.
+    fn contains_terrain_point(&self, pt: Vector) -> bool {
+        if !pt.is_finite() {
+            return false;
         }
-        // TODO: Handle `solid` near the surface
-        self.project_local_point_and_get_feature(pt).0
+        let radius = pt.length();
+        let max_radius = self.max_radius();
+        // Exact mesh vertices may round a few ULPs outside the nominal
+        // maximum vertex radius, especially at three-face cube corners.
+        let error = 256.0 * f64::EPSILON * max_radius;
+        if !radius.is_finite() || radius > max_radius + error {
+            return false;
+        }
+        // Every warped cubemap vertex lies in one of the six face cones
+        // with axis projection at least 1/sqrt(3). This is also true of
+        // convexly interpolated triangle interiors. For negative heights,
+        // the worst possible projected height is the entire negative
+        // displacement; for positive heights it is scaled by 1/sqrt(3).
+        let min_height = f64::from(self.terrain.min_height());
+        let inscribed = self.radius / 3.0_f64.sqrt()
+            + if min_height >= 0.0 {
+                min_height / 3.0_f64.sqrt()
+            } else {
+                min_height
+            };
+        if radius + error < inscribed {
+            return true;
+        }
+        // For a radial heightfield with positive vertex/triangle radii,
+        // each ray through the origin crosses its surface exactly once.
+        // Query from pt outwards: a crossing means the point lies beneath
+        // the surface, even at cube-face seams or near the actual mesh.
+        // Reuse the same globally exact raycast as other collision queries.
+        let axis = if radius > 0.0 { pt / radius } else { Vector::X };
+        // Starting exactly on a vertex shared by two or three cube faces
+        // can lose a zero-TOI hit to floating-point cancellation. Shift
+        // inward by a few hundred ULPs and compare *where* the surface was
+        // hit, not merely whether an intersection exists. This also keeps
+        // points just outside the terrain classified outside.
+        let ray = Ray {
+            origin: pt - axis * error,
+            dir: axis,
+        };
+        self.cast_local_ray_and_get_normal(&ray, 2.0_f64.mul_add(error, max_radius - radius), true)
+            .is_some_and(|hit| {
+                hit.time_of_impact >= (16.0 * f64::EPSILON).mul_add(-max_radius, error)
+            })
     }
+}
 
-    fn project_local_point_and_get_feature(&self, pt: Vector) -> (PointProjection, FeatureId) {
+impl Planet {
+    fn project_surface_point_and_get_feature(&self, pt: Vector) -> (PointProjection, FeatureId) {
         // Search the actual nearest triangle, not merely the tile intersected
         // by the ray from the planet center through the query. Tall cliffs,
         // patch boundaries, and points near the center can all have their
@@ -1149,14 +1191,40 @@ impl PointQuery for Planet {
         else {
             return (PointProjection::new(false, pt), FeatureId::Unknown);
         };
-        // The winning slot could have been evicted even when the geometry Arc
-        // stayed valid for the projection. Reacquire it to return a current ID.
+        // Classifying containment can sample a different chunk and evict
+        // the nearest projection triangle from a small LRU. Assign its live
+        // subshape only after all containment raycasts have completed.
         let (slot, _) = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(self, &coords);
         projection.subshape = self.subshape_id(slot, triangle);
+        (projection, feature)
+    }
+}
+
+impl PointQuery for Planet {
+    fn project_local_point(&self, pt: Vector, solid: bool) -> PointProjection {
+        let inside = self.contains_terrain_point(pt);
+        if solid && inside {
+            return PointProjection::new(true, pt);
+        }
+        let (mut projection, _) = self.project_surface_point_and_get_feature(pt);
+        projection.is_inside = inside;
+        projection
+    }
+
+    fn contains_local_point(&self, pt: Vector) -> bool {
+        self.contains_terrain_point(pt)
+    }
+
+    fn project_local_point_and_get_feature(&self, pt: Vector) -> (PointProjection, FeatureId) {
+        // Containment can touch other tiles: perform it before the nearest
+        // surface search, so returned subshape IDs remain live under eviction.
+        let inside = self.contains_terrain_point(pt);
+        let (mut projection, feature) = self.project_surface_point_and_get_feature(pt);
+        projection.is_inside = inside;
         (projection, feature)
     }
 }
@@ -2189,6 +2257,315 @@ mod tests {
             }
         }
         winner.expect("nonempty terrain mesh")
+    }
+
+    #[test]
+    fn solid_classification_handles_extreme_positive_and_negative_heights() {
+        struct ConstantHeight(f32);
+        impl Terrain for ConstantHeight {
+            fn sample(&self, _: &Coords, out: &mut [f32]) {
+                out.fill(self.0);
+            }
+            fn face_resolution(&self) -> u32 {
+                1
+            }
+            fn chunk_resolution(&self) -> u32 {
+                2
+            }
+            fn min_height(&self) -> f32 {
+                self.0
+            }
+            fn max_height(&self) -> f32 {
+                self.0
+            }
+        }
+        for height in [-9.0, -4.0, 0.0, 5.0] {
+            let planet = Planet::new(Arc::new(ConstantHeight(height)), 1, 10.0).unwrap();
+            let face = (10.0 + f64::from(height)) / 3.0_f64.sqrt();
+            for (radius, inside) in [
+                (0.0, true),
+                (face * 0.9, true),
+                (face * 1.1, false),
+                (10.0 + f64::from(height) + 0.1, false),
+            ] {
+                let pt = Vector::X * radius;
+                assert_eq!(
+                    planet.contains_local_point(pt),
+                    inside,
+                    "height={height}, pt={pt:?}, actual face={face}"
+                );
+                let proj = planet.project_local_point(pt, false);
+                assert_eq!(proj.is_inside, inside);
+                assert_relative_eq!(
+                    proj.point.distance(pt),
+                    (radius - face).abs(),
+                    epsilon = 1.0e-9
+                );
+                let solid = planet.project_local_point(pt, true);
+                assert_eq!(solid.is_inside, inside);
+                if inside {
+                    assert_eq!(solid.point, pt);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_query_surface_points_count_as_inside() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 10.0).unwrap();
+        let face_distance = 10.0 / 3.0_f64.sqrt();
+        for pt in [
+            Vector::X * face_distance,
+            Vector::Y * face_distance,
+            Vector::Z * face_distance,
+            Vector::new(face_distance, face_distance, 0.0),
+        ] {
+            let solid = planet.project_local_point(pt, true);
+            assert!(
+                solid.is_inside,
+                "on-surface point {pt:?} returned {solid:?}"
+            );
+            assert_eq!(solid.point, pt);
+            let hollow = planet.project_local_point(pt, false);
+            assert!(
+                hollow.is_inside,
+                "on-surface hollow query {pt:?}: {hollow:?}"
+            );
+            assert!(hollow.point.distance(pt) < 1.0e-10);
+            assert_eq!(planet.distance_to_local_point(pt, true), 0.0);
+        }
+    }
+
+    #[test]
+    fn solid_classification_matches_exhaustive_radial_mesh() {
+        for face_resolution in [1, 2, 3] {
+            for patterned in [false, true] {
+                let source = Arc::new(ProjectionTerrain {
+                    face_resolution,
+                    peak: None,
+                    patterned,
+                    samples: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let planet = Planet::new(source, 1, 10.0).unwrap();
+                let mut seed = 0x4141_0505_c3f0_0155_u64;
+                let mut next = || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 32) as u32) as f64 / f64::from(u32::MAX)
+                };
+                for index in 0..144 {
+                    let axis =
+                        Vector::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0, next() * 2.0 - 1.0)
+                            .normalize();
+                    let ray = Ray {
+                        origin: Vector::ZERO,
+                        dir: axis,
+                    };
+                    let boundary = exhaustive_ray_hit(&planet, &ray, 50.0)
+                        .expect("positive radial terrain must have one intersection from origin")
+                        .time_of_impact;
+                    let near_point = if index % 3 == 0 {
+                        boundary - 0.0001
+                    } else if index % 3 == 1 {
+                        boundary + 0.0001
+                    } else {
+                        boundary + 5.0
+                    };
+                    let point = axis * near_point;
+                    let expected_inside = near_point < boundary;
+                    assert_eq!(planet.contains_local_point(point), expected_inside,
+                        "face_resolution={face_resolution}, patterned={patterned}, index={index}, radius={near_point}, boundary={boundary}, point={point:?}");
+                    let projected = planet.project_local_point(point, true);
+                    assert_eq!(projected.is_inside, expected_inside);
+                    if expected_inside {
+                        assert_eq!(projected.point, point);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solid_classification_preserves_cube_edges_and_three_face_corners() {
+        for (radius, delta) in [(10.0, 0.001), (6_371_000.0, 0.1)] {
+            let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, radius).unwrap();
+            for face in Face::iter() {
+                let coords = Coords { face, x: 0, y: 0 };
+                let corners = Quad::new(&Patch::new(&coords, 1), 1, UVec2::ZERO)
+                    .displace(radius, 2, &planet.sample(&coords))
+                    .corners;
+                let [a, b, c, d] = corners;
+                for surface in [
+                    a,
+                    b,
+                    c,
+                    d,
+                    (a + b) * 0.5,
+                    (a + c) * 0.5,
+                    (b + d) * 0.5,
+                    (c + d) * 0.5,
+                ] {
+                    let outward = surface.normalize();
+                    let inside = surface - outward * delta;
+                    let outside = surface + outward * delta;
+                    assert!(
+                        planet.contains_local_point(inside),
+                        "missing seam interior: face={face:?}, radius={radius}, point={inside:?}"
+                    );
+                    assert!(
+                        !planet.contains_local_point(outside),
+                        "false seam interior: face={face:?}, radius={radius}, point={outside:?}"
+                    );
+                    assert!(planet.contains_local_point(surface),
+                        "on-surface cube edge/corner must be contained: face={face:?}, point={surface:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solid_classification_tracks_face_and_quad_triangle_offsets() {
+        for (radius, displacement) in [(10.0, 1.0e-4), (6_371_000.0, 0.01)] {
+            let planet = Planet::new(Arc::new(FlatTerrain::new(3, 5).unwrap()), 1, radius).unwrap();
+            for face in Face::iter() {
+                for (x, y) in [(0, 0), (1, 1), (2, 2), (0, 2), (2, 0)] {
+                    let coords = Coords { face, x, y };
+                    let patch = Patch::new(&coords, 3);
+                    let samples = planet.sample(&coords);
+                    for position in [UVec2::new(0, 0), UVec2::new(3, 3)] {
+                        let quad = Quad::new(&patch, 4, position);
+                        for triangle in quad.displace(radius, 5, &samples).triangles() {
+                            let point = triangle.a * 0.25 + triangle.b * 0.35 + triangle.c * 0.40;
+                            let outward = (triangle.b - triangle.a)
+                                .cross(triangle.c - triangle.a)
+                                .normalize();
+                            assert!(point.dot(outward) > 0.0);
+                            for (sign, inside) in [(-1.0, true), (1.0, false)] {
+                                let query = point + outward * (sign * displacement);
+                                let solid = planet.project_local_point(query, true);
+                                let hollow = planet.project_local_point(query, false);
+                                assert_eq!(solid.is_inside, inside,
+                                    "radius={radius}, coords={coords:?}, query={query:?}, point={point:?}");
+                                assert_eq!(
+                                    hollow.is_inside, inside,
+                                    "radius={radius}, coords={coords:?}, query={query:?}"
+                                );
+                                assert_eq!(planet.contains_local_point(query), inside);
+                                assert!(
+                                    (hollow.point.distance(query) - displacement).abs()
+                                        < displacement * 0.05
+                                );
+                                if inside {
+                                    assert_eq!(solid.point, query);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contained_point_feature_keeps_winning_chunk_live_after_ray_classification() {
+        // The closest surface is in a deep adjacent depression, but the
+        // radial containment ray intersects the original higher patch.
+        // With a one-slot LRU, the containment query can evict the winning
+        // projection chunk and invalidate its previously allocated subshape.
+        struct Depression(Coords);
+        impl Terrain for Depression {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                out.fill(if *coords == self.0 { -8.0 } else { 0.0 });
+            }
+            fn face_resolution(&self) -> u32 {
+                4
+            }
+            fn chunk_resolution(&self) -> u32 {
+                3
+            }
+            fn min_height(&self) -> f32 {
+                -8.0
+            }
+            fn max_height(&self) -> f32 {
+                0.0
+            }
+        }
+        let depressed = Coords {
+            face: Face::Pz,
+            x: 2,
+            y: 1,
+        };
+        let low = Coords {
+            face: Face::Pz,
+            x: 1,
+            y: 1,
+        };
+        let planet = Planet::new(Arc::new(Depression(depressed)), 1, 10.0).unwrap();
+        let direction = low.direction(4, &na::Point2::new(0.999, 0.5)).into_inner();
+        let query = Vector::new(direction.x, direction.y, direction.z) * 3.0;
+        assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+        let (_, expected_surface, winner) = brute_force_projection(&planet, query);
+        assert_eq!(winner, depressed);
+        let (projection, _) = planet.project_local_point_and_get_feature(query);
+        assert_relative_eq!(projection.point, expected_surface, epsilon = 1.0e-9);
+        let cache = planet.cache.lock().unwrap();
+        let slot = projection.subshape / planet.triangles_per_chunk();
+        let data = cache
+            .slots
+            .iter()
+            .find(|(index, _)| *index == slot)
+            .expect("projected subshape must refer to a live cache slot")
+            .1;
+        assert_eq!(
+            data.coords, winner,
+            "subshape ID must remain attached to the winning chunk"
+        );
+    }
+
+    #[test]
+    fn point_query_solid_classifies_triangle_interiors_not_vertex_radius() {
+        // Six cubemap faces with one quad each form an inscribed cube. Its
+        // vertices have radius 10, but the +X face lies at 10/sqrt(3).
+        // Vertex radius is *not* the planet's inscribed solid radius.
+        let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 10.0).unwrap();
+        let face = 10.0 / 3.0_f64.sqrt();
+        for (coordinate, inside) in [
+            (8.0, false),
+            (0.0, true),
+            (face - 0.1, true),
+            (face + 0.1, false),
+            (15.0, false),
+        ] {
+            let point = Vector::X * coordinate;
+            let solid = planet.project_local_point(point, true);
+            let hollow = planet.project_local_point(point, false);
+            let (with_feature, _) = planet.project_local_point_and_get_feature(point);
+            assert_eq!(solid.is_inside, inside, "solid {point:?}: {solid:?}");
+            assert_eq!(hollow.is_inside, inside, "hollow {point:?}: {hollow:?}");
+            assert_eq!(with_feature.is_inside, inside, "feature {point:?}");
+            assert_eq!(
+                planet.contains_local_point(point),
+                inside,
+                "contains {point:?}"
+            );
+            if coordinate > 0.0 {
+                assert_relative_eq!(hollow.point.x, face, epsilon = 1.0e-10);
+            } else {
+                assert_relative_eq!(hollow.point.length(), face, epsilon = 1.0e-10);
+            }
+            if inside {
+                assert_eq!(
+                    solid.point, point,
+                    "solid projection should retain an interior point"
+                );
+                assert!(planet.distance_to_local_point(point, false) < 0.0);
+                assert_eq!(planet.distance_to_local_point(point, true), 0.0);
+            } else {
+                assert_relative_eq!(solid.point.x, face, epsilon = 1.0e-10);
+                assert!(planet.distance_to_local_point(point, false) > 0.0);
+            }
+        }
     }
 
     #[test]
