@@ -3403,6 +3403,94 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
     }
 
     #[test]
+    fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
+        // Different heights at every *vertex*, rather than only one height
+        // per chunk, including negative values that reverse radial vectors.
+        struct VaryingHeight {
+            face_resolution: u32,
+            chunk_resolution: u32,
+        }
+        impl Terrain for VaryingHeight {
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                for (index, sample) in out.iter_mut().enumerate() {
+                    let modulus = (index * 31
+                        + usize::try_from(coords.x).unwrap() * 13
+                        + usize::try_from(coords.y).unwrap() * 11
+                        + usize::from(coords.face as u8) * 17)
+                        % 101;
+                    *sample = f32::from(u8::try_from(modulus).unwrap()).mul_add(0.14, -9.0);
+                }
+            }
+            fn face_resolution(&self) -> u32 {
+                self.face_resolution
+            }
+            fn chunk_resolution(&self) -> u32 {
+                self.chunk_resolution
+            }
+            fn min_height(&self) -> f32 {
+                -9.0
+            }
+            fn max_height(&self) -> f32 {
+                5.0
+            }
+        }
+        for (face_resolution, resolution) in [(1, 9), (2, 5), (3, 4)] {
+            let planet = Planet::new(
+                Arc::new(VaryingHeight {
+                    face_resolution,
+                    chunk_resolution: resolution,
+                }),
+                1,
+                10.0,
+            )
+            .unwrap();
+            let mut triangles = Vec::new();
+            for face in Face::iter() {
+                for y in 0..face_resolution {
+                    for x in 0..face_resolution {
+                        let coords = Coords { face, x, y };
+                        let samples = planet.sample(&coords);
+                        let patch = Patch::new(&coords, face_resolution);
+                        for (index, triangle) in patch.triangles(10.0, resolution, &samples) {
+                            triangles.push((coords, index, triangle));
+                        }
+                    }
+                }
+            }
+            for case in 0..72 {
+                let (_, _, seed) = triangles[(case * 101 + 7) % triangles.len()];
+                let center = seed.a * 0.2 + seed.b * 0.3 + seed.c * 0.5;
+                let extent = [0.02, 0.2, 1.0, 4.0][case % 4];
+                let aabb = Aabb::from_half_extents(center, Vector::splat(extent));
+                let mut found = std::collections::HashSet::new();
+                planet.map_elements_in_local_sphere(
+                    &aabb.bounding_sphere(),
+                    &aabb,
+                    |&coords, _, index, _| {
+                        found.insert((coords, index));
+                        true
+                    },
+                );
+                let cuboid = Cuboid::new(Vector::splat(extent));
+                let pos12 = Pose::translation(center.x, center.y, center.z);
+                let missing: Vec<_> = triangles
+                    .iter()
+                    .filter(|(coords, index, triangle)| {
+                        triangle.compute_local_aabb().intersects(&aabb)
+                            && !found.contains(&(*coords, *index))
+                            && DefaultQueryDispatcher
+                                .intersection_test(&pos12, triangle, &cuboid)
+                                .unwrap()
+                                .intersecting
+                    })
+                    .map(|(coords, index, _)| (*coords, *index))
+                    .collect();
+                assert!(missing.is_empty(), "face_resolution={face_resolution},resolution={resolution},case={case},center={center:?},missing={missing:?}");
+            }
+        }
+    }
+
+    #[test]
     fn cached_displaced_quad_boxes_match_actual_quad_geometry() {
         let planet = Planet::new(Arc::new(FlatTerrain::new(3, 17).unwrap()), 1, 10.0).unwrap();
         for face in Face::iter() {
