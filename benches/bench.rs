@@ -129,6 +129,30 @@ fn collision(c: &mut Criterion) {
         b.iter(|| planet.cast_local_ray(&ray, 20.0, true));
     });
 
+    // Containment is used by contact and signed-distance queries; measure
+    // exact near-surface classification separately from guaranteed-core hits.
+    let near_inside = Vector::new(PLANET_RADIUS - 1.0, 0.5, 0.5);
+    let near_outside = Vector::new(PLANET_RADIUS + 1.0, 0.5, 0.5);
+    let core = Vector::new(PLANET_RADIUS * 0.5, 0.0, 0.0);
+    c.bench_function("point contains near inside", |b| {
+        b.iter(|| planet.contains_local_point(near_inside));
+    });
+    c.bench_function("point contains near outside", |b| {
+        b.iter(|| planet.contains_local_point(near_outside));
+    });
+    c.bench_function("point contains core", |b| {
+        b.iter(|| planet.contains_local_point(core));
+    });
+    c.bench_function("point solid near inside", |b| {
+        b.iter(|| planet.project_local_point(near_inside, true));
+    });
+    c.bench_function("point hollow near inside", |b| {
+        b.iter(|| planet.project_local_point(near_inside, false));
+    });
+    c.bench_function("point solid near outside", |b| {
+        b.iter(|| planet.project_local_point(near_outside, true));
+    });
+
     c.bench_function("project point", |b| {
         b.iter(|| {
             planet.project_point(
