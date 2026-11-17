@@ -2679,6 +2679,45 @@ fn visit_planet_pair_triangles(
     }
 }
 
+/// Two independent Planets each own their LRU, but a Planet compared
+/// with itself shares a single slot table. Resolve both winning triangles
+/// while holding one cache lock so the second lookup cannot evict the
+/// first. With capacity one and different winning chunks there is no
+/// representable pair of simultaneously live Parry subshape IDs.
+fn stable_planet_pair_ids(
+    first: &Planet,
+    at1: Coords,
+    tri1: u32,
+    second: &Planet,
+    at2: Coords,
+    tri2: u32,
+) -> Result<(SubShapeId, SubShapeId), Unsupported> {
+    if std::ptr::eq(first, second) {
+        let mut cache = first
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at1 != at2 && cache.max_size < 2 {
+            return Err(Unsupported);
+        }
+        let (slot1, _) = cache.get(first, &at1);
+        let slot2 = if at1 == at2 {
+            slot1
+        } else {
+            cache.get(first, &at2).0
+        };
+        Ok((
+            first.subshape_id(slot1, tri1),
+            first.subshape_id(slot2, tri2),
+        ))
+    } else {
+        Ok((
+            first.stable_triangle_id(at1, tri1),
+            second.stable_triangle_id(at2, tri2),
+        ))
+    }
+}
+
 fn planet_planet_distance(
     pos12: &Pose,
     first: &Planet,
@@ -2718,8 +2757,8 @@ fn planet_planet_distance(
     let Some((at1, id1, at2, id2, mut result)) = best else {
         return Err(Unsupported);
     };
-    result.subshape1 = first.stable_triangle_id(at1, id1);
-    result.subshape2 = second.stable_triangle_id(at2, id2);
+    (result.subshape1, result.subshape2) =
+        stable_planet_pair_ids(first, at1, id1, second, at2, id2)?;
     Ok(result)
 }
 
@@ -2815,8 +2854,8 @@ fn planet_planet_contact(
     let Some((at1, id1, at2, id2, mut contact)) = best else {
         return Ok(None);
     };
-    contact.subshape1 = first.stable_triangle_id(at1, id1);
-    contact.subshape2 = second.stable_triangle_id(at2, id2);
+    (contact.subshape1, contact.subshape2) =
+        stable_planet_pair_ids(first, at1, id1, second, at2, id2)?;
     Ok(Some(contact))
 }
 
@@ -2849,15 +2888,11 @@ fn planet_planet_intersection(
     if unsupported {
         return Err(Unsupported);
     }
-    Ok(best.map_or_else(
-        || ShapeIntersection::new(false),
-        |(at1, id1, at2, id2)| {
-            ShapeIntersection::new(true).with_subshapes(
-                first.stable_triangle_id(at1, id1),
-                second.stable_triangle_id(at2, id2),
-            )
-        },
-    ))
+    let Some((at1, id1, at2, id2)) = best else {
+        return Ok(ShapeIntersection::new(false));
+    };
+    let (id1, id2) = stable_planet_pair_ids(first, at1, id1, second, at2, id2)?;
+    Ok(ShapeIntersection::new(true).with_subshapes(id1, id2))
 }
 
 fn planet_shape_distance(
@@ -5093,8 +5128,14 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let reversed = dispatcher
             .closest_points(&pose.inverse(), &second, &first, 20.0)
             .expect("Planet/Planet reversed closest points should be supported");
-        assert_eq!(pts, reversed.flipped());
-        assert!(matches!(pts, ClosestPoints::WithinMargin(_, _)));
+        // Flat parallel faces have infinitely many equally valid witness
+        // pairs; reversal need not choose the same point on the face.
+        for pair in [pts, reversed.flipped()] {
+            let ClosestPoints::WithinMargin(a, b) = pair else {
+                panic!("expected separated witnesses: {pair:?}");
+            };
+            assert!((a.distance(pose * b) - d1.distance).abs() < 1.0e-10);
+        }
         assert!(dispatcher
             .contact(&pose, &first, &second, 20.0)
             .expect("Planet/Planet predicted contact should be supported")
@@ -5561,6 +5602,37 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 }
             }
         }
+    }
+
+    #[test]
+    fn planet_pair_same_instance_cache_ids_never_alias_evicted_chunks() {
+        let one = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 1, 10.0).unwrap();
+        let two = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 2, 10.0).unwrap();
+        let pose = Pose::translation(12.5, 0.1, 0.2);
+        // The first shape is one planet physically compared with its
+        // translated copy; the winning triangles lie on opposite faces.
+        // Capacity one cannot hold both subshapes' live IDs.
+        assert!(PlanetDispatcher.distance(&pose, &one, &one).is_err());
+        assert!(PlanetDispatcher.contact(&pose, &one, &one, 3.0).is_err());
+        assert!(matches!(
+            PlanetDispatcher
+                .closest_points(&pose, &one, &one, 3.0)
+                .unwrap(),
+            ClosestPoints::WithinMargin(_, _)
+        ));
+        let distance = PlanetDispatcher.distance(&pose, &two, &two).unwrap();
+        let n = two.triangles_per_chunk();
+        assert_ne!(distance.subshape1 / n, distance.subshape2 / n);
+        let cache = two.cache.lock().unwrap();
+        for slot in [distance.subshape1 / n, distance.subshape2 / n] {
+            assert!(cache.slots.iter().any(|(id, _)| id == slot));
+        }
+        drop(cache);
+        let contact = PlanetDispatcher
+            .contact(&pose, &two, &two, 3.0)
+            .unwrap()
+            .unwrap();
+        assert_ne!(contact.subshape1 / n, contact.subshape2 / n);
     }
 
     #[test]
