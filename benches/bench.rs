@@ -85,6 +85,58 @@ fn collision(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("collision broadphase near seam", |b| {
+        use parry3d_f64::bounding_volume::Aabb;
+        let center = Vector::new(0.0, PLANET_RADIUS + 0.1, 0.0);
+        let aabb = Aabb::from_half_extents(center, Vector::splat(1.0));
+        let sphere = aabb.bounding_sphere();
+        b.iter(|| {
+            let mut count = 0;
+            planet.map_elements_in_local_sphere(&sphere, &aabb, |_, _, _, _| {
+                count += 1;
+                true
+            });
+            std::hint::black_box(count)
+        });
+    });
+
+    // Alternating opposite faces with a one-slot cache measures the cost
+    // of sampling/building new collision chunks, not only warm traversal.
+    let churn = Planet::new(
+        Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid benchmark terrain")),
+        1,
+        PLANET_RADIUS,
+    )
+    .expect("valid benchmark planet");
+    let churn_boxes = [
+        parry3d_f64::bounding_volume::Aabb::from_half_extents(
+            Vector::new(PLANET_RADIUS + 0.1, 1.0, 1.0),
+            Vector::splat(1.0),
+        ),
+        parry3d_f64::bounding_volume::Aabb::from_half_extents(
+            Vector::new(-PLANET_RADIUS - 0.1, 1.0, 1.0),
+            Vector::splat(1.0),
+        ),
+    ];
+    let churn_spheres = churn_boxes.map(|aabb| aabb.bounding_sphere());
+    let mut next_face = 0;
+    c.bench_function("collision broadphase cache churn", |b| {
+        b.iter(|| {
+            let index = next_face;
+            next_face ^= 1;
+            let mut count = 0;
+            churn.map_elements_in_local_sphere(
+                &churn_spheres[index],
+                &churn_boxes[index],
+                |_, _, _, _| {
+                    count += 1;
+                    true
+                },
+            );
+            std::hint::black_box(count)
+        });
+    });
+
     c.bench_function("short raycast", |b| {
         b.iter(|| {
             planet.cast_local_ray(
