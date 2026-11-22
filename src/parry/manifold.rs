@@ -114,6 +114,7 @@ fn assign_manifold_subshapes<ManifoldData, ContactData>(
             manifold.subshape1 = subshape;
         }
     }
+    drop(cache);
     Ok(())
 }
 

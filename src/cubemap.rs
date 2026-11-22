@@ -435,7 +435,7 @@ impl Face {
     /// On edge and corner ties, the later axis in X, Y, Z order wins.
     #[must_use = "Use the returned face to locate the direction or handle an invalid direction"]
     pub fn from_vector<N: RealField + Copy>(x: &na::Vector3<N>) -> Option<Self> {
-        if !x.iter().all(|component| component.is_finite()) {
+        if !x.iter().all(na::ComplexField::is_finite) {
             return None;
         }
         let (mut value, mut axis) = (x.x, Self::Px);
