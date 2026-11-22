@@ -74,13 +74,13 @@ impl Config {
     }
 
     /// Maximum quadtree depth that can be selected for a viewpoint.
-    #[must_use]
+    #[must_use = "Use the configured maximum depth for selection"]
     pub const fn max_depth(&self) -> u8 {
         self.max_depth
     }
 
     /// Maximum amount of `LoD` coarsening reported across a shared edge.
-    #[must_use]
+    #[must_use = "Use the configured neighbor delta for selection"]
     pub const fn max_neighbor_delta(&self) -> u8 {
         self.max_neighbor_delta
     }
@@ -88,7 +88,7 @@ impl Config {
     /// Number of slots required to retain every chunk selected by these viewpoints,
     /// including all ancestors and the six roots. Returns `None` if the count
     /// cannot be represented as a `usize`.
-    #[must_use]
+    #[must_use = "Use the checked slot count when sizing the cache"]
     pub fn slots_needed(&self, viewpoints: &[na::Point3<f64>]) -> Option<usize> {
         Face::iter()
             .map(Chunk::root)
@@ -125,7 +125,7 @@ pub struct Allocation {
 
 impl Allocation {
     /// Physical slot to which the caller writes the terrain data.
-    #[must_use]
+    #[must_use = "Use this slot index when writing the allocated terrain data"]
     pub const fn slot(self) -> u32 {
         self.slot
     }
@@ -269,7 +269,7 @@ impl Manager {
 
     /// Chunks that can be rendered immediately, with their `LoD` neighborhood and slot index
     #[inline]
-    #[must_use]
+    #[must_use = "Use the returned chunks and slots to render terrain"]
     pub fn renderable(&self) -> &[(Chunk, Neighborhood, u32)] {
         &self.render
     }
