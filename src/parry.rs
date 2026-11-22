@@ -2329,10 +2329,6 @@ struct PairPatch {
 }
 
 impl PairPatch {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Bounded cubemap rectangle requires four grid edges and its rigid pose"
-    )]
     fn new(
         planet: &Planet,
         pose: &Pose,
@@ -2475,11 +2471,13 @@ impl PairPatch {
         (shift + low - self.padding, shift + high + self.padding)
     }
 
-    fn is_leaf(&self) -> bool {
+    const fn is_leaf(&self) -> bool {
         self.region.x1 - self.region.x0 == 1 && self.region.y1 - self.region.y0 == 1
     }
 
-    fn children(&self) -> [Option<(crate::cubemap::Face, u32, u32, u32, u32)>; 4] {
+    /// Generate ready-to-use child bounds, dropping empty rectangles
+    /// before evaluating costly angular cone geometry.
+    fn children<'a>(&self, planet: &'a Planet, pose: &'a Pose) -> impl Iterator<Item = Self> + 'a {
         let r = self.region;
         let mid_x = r.x0 + (r.x1 - r.x0) / 2;
         let mid_y = r.y0 + (r.y1 - r.y0) / 2;
@@ -2489,13 +2487,9 @@ impl PairPatch {
             (r.x0, mid_x, mid_y, r.y1),
             (mid_x, r.x1, mid_y, r.y1),
         ]
-        .map(|(x0, x1, y0, y1)| {
-            if x0 == x1 || y0 == y1 {
-                None
-            } else {
-                Some((r.face, x0, x1, y0, y1))
-            }
-        })
+        .into_iter()
+        .filter(|(x0, x1, y0, y1)| x0 < x1 && y0 < y1)
+        .map(move |(x0, x1, y0, y1)| Self::new(planet, pose, r.face, x0, x1, y0, y1))
     }
 
     fn extent_squared(&self) -> f64 {
@@ -2660,16 +2654,14 @@ fn visit_planet_pair_triangles(
             && (candidate.second.is_leaf()
                 || candidate.first.extent_squared() >= candidate.second.extent_squared());
         if split_first {
-            for (face, x0, x1, y0, y1) in candidate.first.children().into_iter().flatten() {
-                let a = PairPatch::new(first, &Pose::IDENTITY, face, x0, x1, y0, y1);
+            for a in candidate.first.children(first, &Pose::IDENTITY) {
                 let child = PlanetPairRegion::new(a, candidate.second);
                 if child.lower <= *limit + roundoff {
                     queue.push(child);
                 }
             }
         } else {
-            for (face, x0, x1, y0, y1) in candidate.second.children().into_iter().flatten() {
-                let b = PairPatch::new(second, pos12, face, x0, x1, y0, y1);
+            for b in candidate.second.children(second, pos12) {
                 let child = PlanetPairRegion::new(candidate.first, b);
                 if child.lower <= *limit + roundoff {
                     queue.push(child);
