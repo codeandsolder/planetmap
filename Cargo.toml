@@ -10,12 +10,11 @@ readme = "README.md"
 all-features = true
 
 [features]
-parry = ["parry3d-f64", "lru-slab", "glam"]
+parry = ["parry3d-f64", "lru-slab"]
 fearless_simd = ["dep:fearless_simd"]
 
 [dependencies]
 na = { package = "nalgebra", version = "0.35.0" }
-glam = { version = "0.33", optional = true, default-features = false, features = ["float-types", "integer-types"] }
 slab = "0.4.2"
 hashbrown = "0.17"
 parry3d-f64 = { version = "0.31.1", optional = true }
@@ -25,8 +24,6 @@ fearless_simd = { version = "1.1.0", optional = true }
 [dev-dependencies]
 criterion = "0.8.0"
 approx = "0.5"
-# Enable glam's approx impls for use with the `approx` crate in tests
-glam = { version = "0.33", features = ["approx"] }
 fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
 
 [[bench]]

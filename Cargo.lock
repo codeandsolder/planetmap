@@ -606,7 +606,6 @@ dependencies = [
  "approx",
  "criterion",
  "fearless_simd",
- "glam 0.33.12",
  "hashbrown 0.17.1",
  "lru-slab",
  "nalgebra",
