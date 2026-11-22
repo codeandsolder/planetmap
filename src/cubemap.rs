@@ -1,7 +1,9 @@
+use std::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ops::{Index, IndexMut, Neg};
+use std::ptr::NonNull;
 use std::{alloc, fmt, mem, ptr};
 
 #[cfg(feature = "fearless_simd")]
@@ -25,21 +27,38 @@ pub struct CubeMap<T> {
     data: [T],
 }
 
-/// Owns the partly initialized DST allocation until it can safely become a Box.
-struct InitializationGuard<T> {
-    base: *mut u8,
-    data: *mut T,
+/// Owns the allocation independently of element destruction.
+struct AllocationGuard {
+    base: NonNull<u8>,
     layout: alloc::Layout,
+}
+
+impl Drop for AllocationGuard {
+    fn drop(&mut self) {
+        // SAFETY: base was returned from Global.allocate with this exact
+        // layout, and ownership has not been transferred to a Box.
+        unsafe { Global.deallocate(self.base, self.layout) };
+    }
+}
+
+/// Owns the initialized prefix until the complete DST becomes a Box.
+/// The backing allocation is released by field drop glue even if a
+/// destructor in the initialized prefix unwinds.
+struct InitializationGuard<T> {
+    allocation: AllocationGuard,
+    data: NonNull<T>,
     initialized: usize,
 }
 
 impl<T> Drop for InitializationGuard<T> {
     fn drop(&mut self) {
-        // SAFETY: the prefix of initialized T values is fully valid, and the
-        // header/payload allocation was made with exactly self.layout.
+        // SAFETY: initialized counts only successfully written T values;
+        // the allocation remains live until the field drop glue runs.
         unsafe {
-            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.data, self.initialized));
-            alloc::dealloc(self.base, self.layout);
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                self.data.as_ptr(),
+                self.initialized,
+            ));
         }
     }
 }
@@ -103,32 +122,33 @@ impl<T> CubeMap<T> {
         let (layout, offset) = alloc::Layout::new::<u32>().extend(payload_layout).ok()?;
         let layout = layout.pad_to_align();
 
-        // SAFETY: Layout::extend ensures both the u32 header and the T payload are
-        // aligned and fit in the allocated region. InitializationGuard owns the
-        // allocation until all T elements are initialized, even if initialize
-        // returns None or panics. Afterwards Box owns the exact DST layout.
-        unsafe {
-            let base = alloc::alloc(layout);
-            if base.is_null() {
-                return None;
-            }
-            let mut guard = InitializationGuard {
-                base,
-                data: base.add(offset).cast::<T>(),
-                layout,
-                initialized: 0,
-            };
-            base.cast::<u32>().write(resolution);
-            for i in 0..len {
-                let value = initialize(i)?;
-                guard.data.add(i).write(value);
-                guard.initialized += 1;
-            }
-
-            let raw = ptr::slice_from_raw_parts_mut(base, len) as *mut Self;
-            mem::forget(guard);
-            Some(Box::from_raw(raw))
+        let base = Global.allocate(layout).ok()?.cast::<u8>();
+        let allocation = AllocationGuard { base, layout };
+        // SAFETY: Layout::extend proves offset is in or one past the
+        // allocation and aligned for T, including zero-length/ZST payloads.
+        let data = unsafe { base.add(offset).cast::<T>() };
+        let mut guard = InitializationGuard {
+            allocation,
+            data,
+            initialized: 0,
+        };
+        // SAFETY: the allocation begins with an aligned u32 header.
+        unsafe { base.cast::<u32>().write(resolution) };
+        for i in 0..len {
+            let value = initialize(i)?;
+            // SAFETY: i is in the allocated payload and has not yet been
+            // initialized. No caller-controlled code runs before the count
+            // advances to account for this element.
+            unsafe { guard.data.add(i).write(value) };
+            guard.initialized += 1;
         }
+
+        let raw = ptr::slice_from_raw_parts_mut(guard.allocation.base.as_ptr(), len) as *mut Self;
+        mem::forget(guard);
+        // SAFETY: all elements and the header are now initialized. The
+        // pointer has the correct DST metadata and exact padded Global
+        // allocation layout, and ownership was transferred from the guard.
+        Some(unsafe { Box::from_raw(raw) })
     }
 
     /// Construct a cube map with faces containing `resolution * resolution` slots, each
@@ -166,16 +186,19 @@ impl<T> CubeMap<T> {
         Self::allocate_with(resolution, |i| get_dir(resolution, i).map(&mut f))
     }
 
+    /// Number of cells along each face edge, zero for an empty map.
     #[must_use = "Use the resolution to interpret grid addresses"]
     pub const fn resolution(&self) -> u32 {
         self.resolution
     }
 
+    /// Iterate over cell-center directions and values in face/row/column order.
     #[must_use = "The iterator must be consumed to visit the cells"]
     pub fn iter(&self) -> Iter<'_, T> {
         self.into_iter()
     }
 
+    /// Iterate over cell-center directions and disjoint mutable values.
     #[must_use = "The iterator must be consumed to visit the mutable cells"]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         self.into_iter()
@@ -1124,7 +1147,7 @@ impl<N: RealField + Copy> ExactSizeIterator for SampleIter<N> {
 
 /// Iterator over sample points distributed in a regular grid across a chunk, including its edges
 ///
-/// Hand-vectorized, returning batches of each dimension in a separate register.
+/// Returns batches of component vectors, padding the final batch with the last valid sample.
 #[derive(Debug)]
 #[cfg(feature = "fearless_simd")]
 pub struct SampleIterSimd<S> {
@@ -1204,8 +1227,8 @@ impl<S: Simd> ExactSizeIterator for SampleIterSimd<S> {
     }
 }
 
-/// Map real coordinates in [0, 1)^2 to integer coordinates in [0, n)^2 such that each integer
-/// covers exactly the same distance
+/// Map normalized coordinates to cells, clamping finite inputs to [0, 1].
+/// Nonfinite components select index zero; an empty grid returns (0, 0).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "The normalized f64 grid position is bounded before converting to a u32 cell index"
@@ -1293,7 +1316,7 @@ mod test {
     }
 
     #[test]
-    fn mutable_iterator_retains_disjoint_references() {
+    fn memory_mutable_iterator_retains_disjoint_references() {
         let mut map = CubeMap::new(2, 0_u32).unwrap();
         let mut refs: Vec<_> = map.iter_mut().map(|(_, value)| value).collect();
         for (index, value) in refs.iter_mut().enumerate() {
@@ -1388,7 +1411,7 @@ mod test {
     }
 
     #[test]
-    fn cubemap_aligned_elements() {
+    fn memory_cubemap_aligned_elements() {
         #[repr(align(64))]
         #[derive(Clone)]
         struct Aligned(u64);
@@ -1397,12 +1420,12 @@ mod test {
         assert_eq!(map.as_ref().as_ref().len(), 24);
         for element in map.as_ref().as_ref() {
             assert_eq!(element.0, 7);
-            assert_eq!((std::ptr::from_ref(element) as usize) % 64, 0);
+            assert_eq!(std::ptr::from_ref(element).addr() % 64, 0);
         }
     }
 
     #[test]
-    fn allocation_guard_drops_initialized_prefix_on_panic() {
+    fn memory_allocation_guard_drops_initialized_prefix_on_panic() {
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -1431,7 +1454,75 @@ mod test {
     }
 
     #[test]
-    fn invalid_cubemap_dimensions_rejected() {
+    fn memory_fallible_initializer_and_destructor_unwind() {
+        use std::cell::Cell;
+
+        struct Tracked<'a> {
+            count: &'a Cell<usize>,
+            panics: bool,
+        }
+        impl Drop for Tracked<'_> {
+            fn drop(&mut self) {
+                self.count.set(self.count.get() + 1);
+                assert!(!self.panics, "intentional destructor panic");
+            }
+        }
+
+        let dropped = Cell::new(0);
+        let result = CubeMap::allocate_with(2, |i| {
+            (i < 5).then(|| Tracked {
+                count: &dropped,
+                panics: false,
+            })
+        });
+        assert!(result.is_none());
+        assert_eq!(dropped.get(), 5);
+
+        dropped.set(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CubeMap::allocate_with(2, |i| {
+                (i < 5).then(|| Tracked {
+                    count: &dropped,
+                    panics: i == 2,
+                })
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(dropped.get(), 5);
+    }
+
+    #[test]
+    fn memory_zero_sized_and_empty_high_alignment_payloads() {
+        #[repr(align(128))]
+        #[derive(Clone)]
+        struct AlignedZst;
+
+        for resolution in [0, 1, 3] {
+            let mut map = CubeMap::new(resolution, AlignedZst).unwrap();
+            assert_eq!(
+                map.as_ref().as_ref().len(),
+                (6 * resolution * resolution) as usize
+            );
+            for (_, cell) in &mut *map {
+                assert_eq!(std::ptr::from_mut(cell).addr() % 128, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_raw_exclusive_access_matches_external_storage() {
+        let mut data = [1u32, 10, 20, 30, 40, 50, 60];
+        {
+            // SAFETY: u32 header and six initialized u32 values form this
+            // resolution-one repr(C) DST, with exclusive access to storage.
+            let map = unsafe { CubeMap::<u32>::from_raw_mut(data.as_mut_ptr()) };
+            map[Coords::root(Face::Nz)] = 99;
+        }
+        assert_eq!(data, [1, 10, 20, 30, 40, 50, 99]);
+    }
+
+    #[test]
+    fn memory_invalid_cubemap_dimensions_rejected() {
         assert!(CubeMap::<u32>::new(u32::MAX, 0).is_none());
         assert!(CubeMap::<u32>::from_slice(2, &[0; 6]).is_none());
         assert!(CubeMap::<u32>::from_fn(u32::MAX, |_| 0).is_none());
@@ -1662,8 +1753,10 @@ mod test {
     }
 
     #[test]
-    fn from_raw() {
+    fn memory_from_raw() {
         let data = [1, 0, 1, 2, 3, 4, 5];
+        // SAFETY: the aligned array holds the header and six initialized
+        // u32 cells, with no mutation during the returned shared borrow.
         let x = unsafe { CubeMap::<u32>::from_raw(data.as_ptr()) };
         assert_eq!(x.resolution(), 1);
         assert_eq!(x.as_ref().len(), 6);
