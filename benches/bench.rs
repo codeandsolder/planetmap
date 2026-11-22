@@ -173,6 +173,53 @@ fn collision(c: &mut Criterion) {
     // every tile on the 4096x4096 cubemap face.
     let halfspace = HalfSpace::new(Vector::X);
     let plane_pose = Pose::translation(-PLANET_RADIUS - 2.5, 0.0, 0.0);
+    // Dual cubemap branch-and-bound over both independently streamed
+    // planetary triangle meshes, without materializing either full mesh.
+    let moon = Planet::new(
+        Arc::new(FlatTerrain::new(2u32.pow(12), 17).expect("valid benchmark terrain")),
+        32,
+        500_000.0,
+    )
+    .expect("valid benchmark moon");
+    let moon_pose = Pose::translation(PLANET_RADIUS + 500_000.0 + 2.5, 0.0, 0.0);
+    c.bench_function("planet pair distance near axis", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .distance(&moon_pose, &planet, &moon)
+                    .unwrap(),
+            )
+        });
+    });
+    c.bench_function("planet pair closest points near axis", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .closest_points(&moon_pose, &planet, &moon, 10.0)
+                    .unwrap(),
+            )
+        });
+    });
+    c.bench_function("planet pair contact near axis", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .contact(&moon_pose, &planet, &moon, 3.0)
+                    .unwrap(),
+            )
+        });
+    });
+    let distant_moon_pose = Pose::translation(9_000_000.0, 0.0, 0.0);
+    c.bench_function("planet pair distance far separated", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                PlanetDispatcher
+                    .distance(&distant_moon_pose, &planet, &moon)
+                    .unwrap(),
+            )
+        });
+    });
+
     c.bench_function("planet distance halfspace", |b| {
         b.iter(|| {
             std::hint::black_box(
