@@ -2306,7 +2306,7 @@ fn planet_halfspace_contact(
 /// The bounds enclose displaced triangle interiors, including seams and
 /// deeply negative terrain; they are the same cone bounds as the ray BVH.
 #[derive(Clone, Copy, Debug)]
-struct PairPatch {
+struct PatchBounds {
     region: ProjectionRegion,
     aabb: Aabb,
     // Shape1 frame; the cone contains all displaced triangle interiors.
@@ -2320,7 +2320,7 @@ struct PairPatch {
     padding: f64,
 }
 
-impl PairPatch {
+impl PatchBounds {
     fn new(
         planet: &Planet,
         pose: &Pose,
@@ -2456,13 +2456,13 @@ impl PairPatch {
 
 #[derive(Clone, Copy, Debug)]
 struct PlanetPairRegion {
-    first: PairPatch,
-    second: PairPatch,
+    first: PatchBounds,
+    second: PatchBounds,
     lower: f64,
 }
 
 impl PlanetPairRegion {
-    fn new(first: PairPatch, second: PairPatch) -> Self {
+    fn new(first: PatchBounds, second: PatchBounds) -> Self {
         let minkowski = Aabb::new(
             first.aabb.mins - second.aabb.maxs,
             first.aabb.maxs - second.aabb.mins,
@@ -2559,9 +2559,9 @@ fn visit_planet_pair_triangles(
     let res1 = first.face_resolution;
     let res2 = second.face_resolution;
     for f1 in crate::cubemap::Face::iter() {
-        let a = PairPatch::new(first, &Pose::IDENTITY, f1, 0, res1, 0, res1);
+        let a = PatchBounds::new(first, &Pose::IDENTITY, f1, 0, res1, 0, res1);
         for f2 in crate::cubemap::Face::iter() {
-            let b = PairPatch::new(second, pos12, f2, 0, res2, 0, res2);
+            let b = PatchBounds::new(second, pos12, f2, 0, res2, 0, res2);
             let candidate = PlanetPairRegion::new(a, b);
             if candidate.lower <= *limit + roundoff {
                 queue.push(candidate);
@@ -3212,6 +3212,38 @@ fn swept_translation_bounds(
     Some(first.merged(&last).loosened(margin))
 }
 
+/// A long, thin sweep may have a bounding sphere encompassing the entire
+/// planet. Traverse the cubemap hierarchy using its conservative displaced
+/// AABBs instead of enumerating every tile in that sphere.
+fn visit_swept_triangles(
+    planet: &Planet,
+    aabb: &Aabb,
+    mut visit: impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+) {
+    let bounds = aabb.bounding_sphere();
+    let resolution = planet.face_resolution;
+    let mut stack: Vec<_> = crate::cubemap::Face::iter()
+        .map(|face| PatchBounds::new(planet, &Pose::IDENTITY, face, 0, resolution, 0, resolution))
+        .collect();
+    while let Some(patch) = stack.pop() {
+        if !patch.aabb.intersects(aabb) {
+            continue;
+        }
+        if patch.is_leaf() {
+            let coords = Coords {
+                face: patch.region.face,
+                x: patch.region.x0,
+                y: patch.region.y0,
+            };
+            if !planet.map_elements_in_chunk(coords, &bounds, aabb, &mut visit) {
+                return;
+            }
+        } else {
+            stack.extend(patch.children(planet, &Pose::IDENTITY));
+        }
+    }
+}
+
 /// Select the earliest narrow-phase result, retaining its geometric address
 /// until all visits have finished. Cache slots may be recycled mid-search.
 fn earliest_cast(
@@ -3221,10 +3253,8 @@ fn earliest_cast(
 ) -> Result<Option<ShapeCastHit>, Unsupported> {
     let mut closest: Option<(Coords, u32, ShapeCastHit)> = None;
     let mut unsupported = false;
-    planet.map_elements_in_local_sphere(
-        &aabb.bounding_sphere(),
-        aabb,
-        |&coords, _, index, triangle| match cast(triangle) {
+    visit_swept_triangles(planet, aabb, |&coords, _, index, triangle| {
+        match cast(triangle) {
             Ok(Some(hit)) => {
                 if closest.is_none_or(|(_, _, old)| hit.time_of_impact < old.time_of_impact) {
                     closest = Some((coords, index, hit));
@@ -3236,8 +3266,8 @@ fn earliest_cast(
                 unsupported = true;
                 false
             }
-        },
-    );
+        }
+    });
     if unsupported {
         return Err(Unsupported);
     }
@@ -5564,7 +5594,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     (0, 1, 1, 2),
                     (1, 2, 1, 2),
                 ] {
-                    let region = PairPatch::new(planet, &pose, face, x0, x1, y0, y1);
+                    let region = PatchBounds::new(planet, &pose, face, x0, x1, y0, y1);
                     for (coords, tris) in tiles {
                         if coords.face != face
                             || coords.x < x0
@@ -5609,7 +5639,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let dispatcher = DefaultQueryDispatcher;
         for pose in poses {
             for (at1, tris1) in &first_tiles {
-                let a = PairPatch::new(
+                let a = PatchBounds::new(
                     &first,
                     &Pose::IDENTITY,
                     at1.face,
@@ -5619,7 +5649,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     at1.y + 1,
                 );
                 for (at2, tris2) in &second_tiles {
-                    let b = PairPatch::new(
+                    let b = PatchBounds::new(
                         &second,
                         &pose,
                         at2.face,
@@ -6652,6 +6682,34 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             .unwrap()
             .unwrap();
         assert_eq!(hit.time_of_impact, 0.0);
+    }
+
+    #[test]
+    fn planetary_unbounded_cast_prunes_long_thin_sweep() {
+        const RADIUS: f64 = 6_371_000.0;
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 4096,
+            peak: None,
+            patterned: false,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(source.clone(), 8, RADIUS).unwrap();
+        let hit = PlanetDispatcher
+            .cast_shapes(
+                &Pose::translation(RADIUS + 10.0, 0.0, 0.0),
+                -Vector::X,
+                &planet,
+                &Ball { radius: 1.0 },
+                ShapeCastOptions::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_relative_eq!(hit.time_of_impact, 9.0, epsilon = 1e-5);
+        let samples = source.samples.load(AtomicOrdering::Relaxed);
+        assert!(
+            samples < 128,
+            "narrow planetary sweep sampled {samples} patches"
+        );
     }
 
     #[test]
