@@ -15,7 +15,6 @@ use std::{
 use hashbrown::hash_map;
 use hashbrown::HashMap;
 use lru_slab::LruSlab;
-use parry3d_f64::glamx::glam::UVec2;
 use parry3d_f64::{
     bounding_volume::{Aabb, BoundingSphere, BoundingVolume},
     mass_properties::MassProperties,
@@ -382,7 +381,7 @@ impl Planet {
                     for x in x_start..(x_start + QUAD_BLOCK_WIDTH).min(side) {
                         let i = (y * side + x) as usize;
                         if boxes.quads[i].intersects(aabb)
-                            && !emit(Quad::new(&patch, side, UVec2::new(x, y)))
+                            && !emit(Quad::new(&patch, side, na::Vector2::new(x, y)))
                         {
                             return false;
                         }
@@ -806,7 +805,7 @@ impl Planet {
             clippy::cast_sign_loss,
             reason = "Patch coordinates are clamped nonnegative"
         )]
-        let address = UVec2::new(
+        let address = na::Vector2::new(
             (uv.x.floor() as u32).min(quad_resolution - 1),
             (uv.y.floor() as u32).min(quad_resolution - 1),
         );
@@ -1635,7 +1634,7 @@ impl SparseQuadSearch<'_> {
             let quad = Quad::new(
                 self.patch,
                 self.resolution - 1,
-                UVec2::new(region.x0, region.y0),
+                na::Vector2::new(region.x0, region.y0),
             );
             let displaced = quad.displace(self.radius, self.resolution, self.samples);
             let [top_left, top_right, bottom_left, bottom_right] = displaced.corners;
@@ -1800,7 +1799,7 @@ impl Planet {
         let quad = Quad::new(
             &patch,
             side,
-            UVec2::new(
+            na::Vector2::new(
                 (uv.x.floor() as u32).min(side - 1),
                 (uv.y.floor() as u32).min(side - 1),
             ),
@@ -3684,7 +3683,8 @@ impl Patch {
     fn quads(&self, chunk_resolution: u32) -> impl Iterator<Item = Quad> + '_ {
         let quad_resolution = chunk_resolution - 1;
         (0..quad_resolution).flat_map(move |y| {
-            (0..quad_resolution).map(move |x| Quad::new(self, quad_resolution, UVec2::new(x, y)))
+            (0..quad_resolution)
+                .map(move |x| Quad::new(self, quad_resolution, na::Vector2::new(x, y)))
         })
     }
 
@@ -3710,13 +3710,13 @@ impl Patch {
 struct Quad {
     /// Row-major order
     corners: [Vector; 4],
-    position: UVec2,
+    position: na::Vector2<u32>,
 }
 
 impl Quad {
-    fn new(patch: &Patch, resolution: u32, position: UVec2) -> Self {
+    fn new(patch: &Patch, resolution: u32, position: na::Vector2<u32>) -> Self {
         let offsets = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-        let position_f = position.as_dvec2();
+        let position_f = Vec2::new(f64::from(position.x), f64::from(position.y));
         Self {
             corners: offsets
                 .map(|x| patch.get(&((position_f + Vec2::from(x)) / f64::from(resolution)))),
@@ -3724,7 +3724,7 @@ impl Quad {
         }
     }
 
-    const fn index(&self, chunk_resolution: u32) -> u32 {
+    fn index(&self, chunk_resolution: u32) -> u32 {
         self.position.y * (chunk_resolution - 1) + self.position.x
     }
 
@@ -3732,7 +3732,7 @@ impl Quad {
         let offsets = [[0, 0], [1, 0], [0, 1], [1, 1]];
         let mut result = self.corners;
         for (v, offset) in result.iter_mut().zip(offsets) {
-            let sample = self.position + UVec2::from(offset);
+            let sample = self.position + na::Vector2::from(offset);
             let displacement = chunk_samples[(sample.y * chunk_resolution + sample.x) as usize];
             // We deliberately don't normalize `v` in `v * radius` because we're displacing a
             // subdivided patch, not the surface of the sphere directly.
@@ -3998,7 +3998,7 @@ mod tests {
             let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, radius).unwrap();
             for face in Face::iter() {
                 let coords = Coords { face, x: 0, y: 0 };
-                let corners = Quad::new(&Patch::new(&coords, 1), 1, UVec2::ZERO)
+                let corners = Quad::new(&Patch::new(&coords, 1), 1, na::Vector2::zeros())
                     .displace(radius, 2, &planet.sample(&coords))
                     .corners;
                 let [a, b, c, d] = corners;
@@ -4039,7 +4039,7 @@ mod tests {
                     let coords = Coords { face, x, y };
                     let patch = Patch::new(&coords, 3);
                     let samples = planet.sample(&coords);
-                    for position in [UVec2::new(0, 0), UVec2::new(3, 3)] {
+                    for position in [na::Vector2::new(0, 0), na::Vector2::new(3, 3)] {
                         let quad = Quad::new(&patch, 4, position);
                         for triangle in quad.displace(radius, 5, &samples).triangles() {
                             let point = triangle.a * 0.25 + triangle.b * 0.35 + triangle.c * 0.40;
@@ -4595,7 +4595,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         };
         let patch = Patch::new(&coords, 1);
         let samples = planet.sample(&coords);
-        let triangle = Quad::new(&patch, 16, UVec2::new(8, 8))
+        let triangle = Quad::new(&patch, 16, na::Vector2::new(8, 8))
             .displace(10.0, 17, &samples)
             .triangles()[0];
         let center = (triangle.a + triangle.b + triangle.c) / 3.0;
@@ -4681,7 +4681,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                         let bound = search.conservative_bounds(region);
                         for row in y0..y1 {
                             for col in x0..x1 {
-                                let quad = Quad::new(&patch, side, UVec2::new(col, row));
+                                let quad = Quad::new(&patch, side, na::Vector2::new(col, row));
                                 for vertex in quad.displace(radius, resolution, &samples).corners {
                                     assert!(vertex.cmpge(bound.mins).all() && vertex.cmple(bound.maxs).all(),
                                         "radius={radius},res={resolution},face={face:?},case={case},region={region:?},vertex={vertex:?},bound={bound:?}");
@@ -4888,7 +4888,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     let coords = Coords { face, x, y };
                     let patch = Patch::new(&coords, RES);
                     let samples = planet.sample(&coords);
-                    for xy in [UVec2::new(0, 0), UVec2::new(7, 7), UVec2::new(15, 15)] {
+                    for xy in [
+                        na::Vector2::new(0, 0),
+                        na::Vector2::new(7, 7),
+                        na::Vector2::new(15, 15),
+                    ] {
                         let quad = Quad::new(&patch, 16, xy);
                         for (i, triangle) in quad
                             .displace(RADIUS, 17, &samples)
@@ -6899,7 +6903,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     let coords = Coords { x, y, face };
                     let samples = planet.sample(&coords);
                     let patch = Patch::new(&coords, RES);
-                    for xy in [UVec2::new(0, 0), UVec2::new(7, 7), UVec2::new(15, 15)] {
+                    for xy in [
+                        na::Vector2::new(0, 0),
+                        na::Vector2::new(7, 7),
+                        na::Vector2::new(15, 15),
+                    ] {
                         for tri in Quad::new(&patch, 16, xy)
                             .displace(RADIUS, 17, &samples)
                             .triangles()
