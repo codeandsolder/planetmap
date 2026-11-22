@@ -11,7 +11,6 @@ use parry3d_f64::query::{
     ShapeCastHit, ShapeCastOptions, ShapeDistance, ShapeIntersection, Unsupported,
 };
 use parry3d_f64::shape::{HalfSpace, Shape, SubShapeId, Triangle};
-use parry3d_f64::utils::PoseOpt;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
@@ -870,7 +869,7 @@ fn planet_shape_closest_points(
     }
 }
 
-fn planet_shape_contact(
+pub(super) fn planet_shape_contact(
     pos12: &Pose,
     planet: &Planet,
     other: &dyn Shape,

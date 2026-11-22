@@ -1,4 +1,5 @@
 use super::Planet;
+use super::discrete::planet_shape_contact;
 use crate::cubemap::Coords;
 use parry3d_f64::bounding_volume::{Aabb, BoundingVolume};
 use parry3d_f64::math::{Pose, Real, Vector};
