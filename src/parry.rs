@@ -219,9 +219,11 @@ impl Planet {
         // Every cached slot owns two triangles per quad. The maximum
         // identifier, including the last slot, must fit in SubShapeId=u32.
         let quads_per_edge = u64::from(chunk_resolution - 1);
-        let triangles_per_chunk = 2 * quads_per_edge * quads_per_edge;
-        let total = u64::from(cache_size) * triangles_per_chunk;
-        if total > u64::from(u32::MAX) + 1 {
+        let triangles_per_chunk = quads_per_edge
+            .checked_mul(quads_per_edge)
+            .and_then(|quads| quads.checked_mul(2))
+            .ok_or(PlanetConfigError::SubshapeIdOverflow)?;
+        if triangles_per_chunk > (u64::from(u32::MAX) + 1) / u64::from(cache_size) {
             return Err(PlanetConfigError::SubshapeIdOverflow);
         }
         Ok(Self {
@@ -1520,14 +1522,15 @@ impl Cache {
         let (slot, old) = match self.index.entry(*coords) {
             hash_map::Entry::Occupied(e) => (*e.get(), None),
             hash_map::Entry::Vacant(e) => {
+                // Terrain sampling invokes user code and may unwind. Complete it
+                // before changing the slot table or its reverse index.
+                let data = Arc::new(ChunkData::new(*coords, planet.sample(coords)));
                 let old = if self.slots.len() == self.max_size {
                     self.slots.lru().map(|lru| self.slots.remove(lru).coords)
                 } else {
                     None
                 };
-                let slot = self
-                    .slots
-                    .insert(Arc::new(ChunkData::new(*coords, planet.sample(coords))));
+                let slot = self.slots.insert(data);
                 e.insert(slot);
                 (slot, old)
             }
@@ -2999,10 +3002,10 @@ impl QueryDispatcher for PlanetDispatcher {
             return planet_planet_intersection(pos12, first, second);
         }
         if let Some(p1) = g1.as_shape::<Planet>() {
-            return Ok(intersects(pos12, p1, g2));
+            return intersects(pos12, p1, g2);
         }
         if let Some(p2) = g2.as_shape::<Planet>() {
-            return Ok(intersects(&pos12.inverse(), p2, g1).swapped());
+            return intersects(&pos12.inverse(), p2, g1).map(ShapeIntersection::swapped);
         }
         Err(Unsupported)
     }
@@ -3080,10 +3083,17 @@ impl QueryDispatcher for PlanetDispatcher {
             return Err(Unsupported);
         }
         if let Some(p1) = g1.as_shape::<Planet>() {
-            return Ok(compute_toi(pos12, vel12, p1, g2, options, false));
+            return compute_toi(pos12, vel12, p1, g2, options);
         }
         if let Some(p2) = g2.as_shape::<Planet>() {
-            return Ok(compute_toi(&pos12.inverse(), -vel12, p2, g1, options, true));
+            return compute_toi(
+                &pos12.inverse(),
+                pos12.rotation.inverse() * -vel12,
+                p2,
+                g1,
+                options,
+            )
+            .map(|hit| hit.map(ShapeCastHit::swapped));
         }
         Err(Unsupported)
     }
@@ -3105,7 +3115,7 @@ impl QueryDispatcher for PlanetDispatcher {
             return Err(Unsupported);
         }
         if let Some(p1) = g1.as_shape::<Planet>() {
-            return Ok(compute_nonlinear_toi(
+            return compute_nonlinear_toi(
                 motion1,
                 p1,
                 motion2,
@@ -3114,10 +3124,10 @@ impl QueryDispatcher for PlanetDispatcher {
                 end_time,
                 stop_at_penetration,
                 false,
-            ));
+            );
         }
         if let Some(p2) = g2.as_shape::<Planet>() {
-            return Ok(compute_nonlinear_toi(
+            return compute_nonlinear_toi(
                 motion2,
                 p2,
                 motion1,
@@ -3126,32 +3136,128 @@ impl QueryDispatcher for PlanetDispatcher {
                 end_time,
                 stop_at_penetration,
                 true,
-            ));
+            );
         }
         Err(Unsupported)
     }
 }
 
 /// Reports whether `other` intersects `planet`, along with the sub-shapes of both that intersect.
-fn intersects(pos12: &Pose, planet: &Planet, other: &dyn Shape) -> ShapeIntersection {
-    // TODO after https://github.com/dimforge/parry/issues/8
+fn intersects(
+    pos12: &Pose,
+    planet: &Planet,
+    other: &dyn Shape,
+) -> Result<ShapeIntersection, Unsupported> {
+    if let Some(plane) = other.as_shape::<HalfSpace>() {
+        let result = PlanetPlaneResult::new(planet, pos12, plane).ok_or(Unsupported)?;
+        return Ok(if result.signed <= 0.0 {
+            ShapeIntersection::new(true).with_subshapes(
+                planet.stable_triangle_id(result.winner.coords, result.winner.triangle),
+                0,
+            )
+        } else {
+            ShapeIntersection::new(false)
+        });
+    }
     let dispatcher = DefaultQueryDispatcher;
     let bounds = other.compute_bounding_sphere(pos12);
     let aabb = other.compute_aabb(pos12);
-    let mut hit = ShapeIntersection::new(false);
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |_, slot, index, triangle| {
+    let mut hit = Ok(ShapeIntersection::new(false));
+    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, index, triangle| {
         match dispatcher.intersection_test(pos12, triangle, other) {
             Ok(mut result) if result.intersecting => {
-                // The triangle is shape 1 and `other` is shape 2, so `result.subshape2` already
-                // identifies the part of `other` that was hit, if it's a composite shape.
-                result.subshape1 = planet.subshape_id(slot, index);
-                hit = result;
+                result.subshape1 = planet.stable_triangle_id(coords, index);
+                hit = Ok(result);
                 false
             }
-            _ => true,
+            Ok(_) => true,
+            Err(error) => {
+                hit = Err(error);
+                false
+            }
         }
     });
     hit
+}
+
+/// Intersect the translational path with the Minkowski AABB of the shape
+/// and the entire planet. This also bounds casts with an unlimited horizon.
+fn swept_translation_bounds(
+    planet: &Planet,
+    start: Aabb,
+    velocity: Vector,
+    options: ShapeCastOptions,
+) -> Option<Aabb> {
+    let scale = planet
+        .max_radius()
+        .max(start.mins.abs().max_element())
+        .max(start.maxs.abs().max_element());
+    let margin = options.target_distance + 128.0 * f64::EPSILON * scale;
+    let outer = planet.compute_local_aabb().loosened(margin);
+    let mut lo = 0.0_f64;
+    let mut hi = options.max_time_of_impact.min(f64::MAX);
+    for axis in 0..3 {
+        let lower = outer.mins[axis] - start.maxs[axis];
+        let upper = outer.maxs[axis] - start.mins[axis];
+        let speed = velocity[axis];
+        if speed == 0.0 {
+            if lower > 0.0 || upper < 0.0 {
+                return None;
+            }
+        } else {
+            let a = lower / speed;
+            let b = upper / speed;
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+            if lo > hi {
+                return None;
+            }
+        }
+    }
+    let first = start.transform_by(&Pose::from_translation(velocity * lo));
+    // Multiplying an infinite horizon by zero would generate NaNs. A
+    // stationary shape needs only its original bounds.
+    let last = if velocity == Vector::ZERO {
+        first
+    } else {
+        start.transform_by(&Pose::from_translation(velocity * hi))
+    };
+    Some(first.merged(&last).loosened(margin))
+}
+
+/// Select the earliest narrow-phase result, retaining its geometric address
+/// until all visits have finished. Cache slots may be recycled mid-search.
+fn earliest_cast(
+    planet: &Planet,
+    aabb: &Aabb,
+    mut cast: impl FnMut(&Triangle) -> Result<Option<ShapeCastHit>, Unsupported>,
+) -> Result<Option<ShapeCastHit>, Unsupported> {
+    let mut closest: Option<(Coords, u32, ShapeCastHit)> = None;
+    let mut unsupported = false;
+    planet.map_elements_in_local_sphere(
+        &aabb.bounding_sphere(),
+        aabb,
+        |&coords, _, index, triangle| match cast(triangle) {
+            Ok(Some(hit)) => {
+                if closest.is_none_or(|(_, _, old)| hit.time_of_impact < old.time_of_impact) {
+                    closest = Some((coords, index, hit));
+                }
+                true
+            }
+            Ok(None) => true,
+            Err(_) => {
+                unsupported = true;
+                false
+            }
+        },
+    );
+    if unsupported {
+        return Err(Unsupported);
+    }
+    Ok(closest.map(|(coords, index, mut hit)| {
+        hit.subshape1 = planet.stable_triangle_id(coords, index);
+        hit
+    }))
 }
 
 fn compute_toi(
@@ -3160,43 +3266,69 @@ fn compute_toi(
     planet: &Planet,
     other: &dyn Shape,
     options: ShapeCastOptions,
-    flipped: bool,
-) -> Option<ShapeCastHit> {
-    // TODO after https://github.com/dimforge/parry/issues/8
-    let dispatcher = DefaultQueryDispatcher;
-    // TODO: Raycast vs. minkowski sum of chunk bounds and bounding sphere?
-    let aabb = {
-        let start = other.compute_aabb(pos12);
-        let end = start.transform_by(&Pose::from_translation(options.max_time_of_impact * vel12));
-        start.merged(&end)
+) -> Result<Option<ShapeCastHit>, Unsupported> {
+    if options.max_time_of_impact.is_nan()
+        || options.max_time_of_impact < 0.0
+        || !options.target_distance.is_finite()
+        || options.target_distance < 0.0
+        || !vel12.is_finite()
+    {
+        return Err(Unsupported);
+    }
+    let start = other.compute_aabb(pos12);
+    if !start.mins.is_finite() || !start.maxs.is_finite() {
+        return Err(Unsupported);
+    }
+    let Some(aabb) = swept_translation_bounds(planet, start, vel12, options) else {
+        return Ok(None);
     };
-    let mut closest = None::<ShapeCastHit>;
-    planet.map_elements_in_local_sphere(
-        &aabb.bounding_sphere(),
-        &aabb,
-        |_, slot, index, triangle| {
-            let impact = if flipped {
-                dispatcher.cast_shapes(&pos12.inverse(), -vel12, other, triangle, options)
-            } else {
-                dispatcher.cast_shapes(pos12, vel12, triangle, other, options)
-            };
-            if let Ok(Some(mut impact)) = impact {
-                let subshape = planet.subshape_id(slot, index);
-                if flipped {
-                    impact.subshape2 = subshape;
-                } else {
-                    impact.subshape1 = subshape;
-                }
-                closest = Some(match closest {
-                    None => impact,
-                    Some(x) if impact.time_of_impact < x.time_of_impact => impact,
-                    Some(x) => x,
-                });
-            }
-            true
-        },
-    );
-    closest
+    if !aabb.mins.is_finite() || !aabb.maxs.is_finite() {
+        return Err(Unsupported);
+    }
+    earliest_cast(planet, &aabb, |triangle| {
+        DefaultQueryDispatcher.cast_shapes(pos12, vel12, triangle, other, options)
+    })
+}
+
+/// Bound the entire relative motion, not just the endpoint poses.
+/// World-space rotation centers move linearly. In the planet frame the
+/// interpolated endpoint positions can differ from the true path by at
+/// most the rotation of their center separation and of the shape's
+/// offset from its own rotation center (each chord is bounded by its arc
+/// length and by twice the radius).
+fn nonlinear_swept_bounds(
+    motion_planet: &NonlinearRigidMotion,
+    motion_other: &NonlinearRigidMotion,
+    other: &dyn Shape,
+    start_time: Real,
+    end_time: Real,
+) -> Aabb {
+    let start_pos = motion_planet.position_at_time(start_time).inverse()
+        * motion_other.position_at_time(start_time);
+    let end_pos = motion_planet.position_at_time(end_time).inverse()
+        * motion_other.position_at_time(end_time);
+    let endpoints = other
+        .compute_aabb(&start_pos)
+        .merged(&other.compute_aabb(&end_pos));
+    let planet_rate = motion_planet.angvel.length();
+    let other_rate = motion_other.angvel.length();
+    if planet_rate == 0.0 && other_rate == 0.0 {
+        return endpoints;
+    }
+    let duration = end_time - start_time;
+    let relative_center = |time| {
+        (motion_other.position_at_time(time) * motion_other.local_center)
+            - (motion_planet.position_at_time(time) * motion_planet.local_center)
+    };
+    let max_separation = relative_center(start_time)
+        .length()
+        .max(relative_center(end_time).length());
+    let sphere = other.compute_local_bounding_sphere();
+    let radius = (sphere.center() - motion_other.local_center).length() + sphere.radius();
+    // Convex interpolation of endpoint bounds: 2*u*(1-u) <= 1/2.
+    let pad = max_separation * (planet_rate * duration * 0.5).min(2.0)
+        + radius * ((planet_rate + other_rate) * duration * 0.5).min(2.0);
+    endpoints.loosened(pad)
 }
 
 #[expect(
@@ -3212,26 +3344,18 @@ fn compute_nonlinear_toi(
     end_time: Real,
     stop_at_penetration: bool,
     flipped: bool,
-) -> Option<ShapeCastHit> {
-    // TODO after https://github.com/dimforge/parry/issues/8
-    let dispatcher = DefaultQueryDispatcher;
-    // TODO: Select chunks/triangles more conservatively, as discussed in compute_toi
-    let aabb = {
-        let start_pos = motion_planet.position_at_time(start_time).inverse()
-            * motion_other.position_at_time(start_time);
-        let end_pos = motion_planet.position_at_time(end_time).inverse()
-            * motion_other.position_at_time(end_time);
-        let start = other.compute_aabb(&start_pos);
-        let end = other.compute_aabb(&end_pos);
-        start.merged(&end)
-    };
-    let mut closest = None::<ShapeCastHit>;
-    planet.map_elements_in_local_sphere(
-        &aabb.bounding_sphere(),
-        &aabb,
-        |_, slot, index, triangle| {
-            let impact = if flipped {
-                dispatcher.cast_shapes_nonlinear(
+) -> Result<Option<ShapeCastHit>, Unsupported> {
+    if !start_time.is_finite() || !end_time.is_finite() || end_time < start_time {
+        return Err(Unsupported);
+    }
+    let aabb = nonlinear_swept_bounds(motion_planet, motion_other, other, start_time, end_time);
+    if !aabb.mins.is_finite() || !aabb.maxs.is_finite() {
+        return Err(Unsupported);
+    }
+    let hit = earliest_cast(planet, &aabb, |triangle| {
+        if flipped {
+            DefaultQueryDispatcher
+                .cast_shapes_nonlinear(
                     motion_other,
                     other,
                     motion_planet,
@@ -3240,34 +3364,24 @@ fn compute_nonlinear_toi(
                     end_time,
                     stop_at_penetration,
                 )
-            } else {
-                dispatcher.cast_shapes_nonlinear(
-                    motion_planet,
-                    triangle,
-                    motion_other,
-                    other,
-                    start_time,
-                    end_time,
-                    stop_at_penetration,
-                )
-            };
-            if let Ok(Some(mut impact)) = impact {
-                let subshape = planet.subshape_id(slot, index);
-                if flipped {
-                    impact.subshape2 = subshape;
-                } else {
-                    impact.subshape1 = subshape;
-                }
-                closest = Some(match closest {
-                    None => impact,
-                    Some(x) if impact.time_of_impact < x.time_of_impact => impact,
-                    Some(x) => x,
-                });
-            }
-            true
-        },
-    );
-    closest
+                .map(|hit| hit.map(ShapeCastHit::swapped))
+        } else {
+            DefaultQueryDispatcher.cast_shapes_nonlinear(
+                motion_planet,
+                triangle,
+                motion_other,
+                other,
+                start_time,
+                end_time,
+                stop_at_penetration,
+            )
+        }
+    })?;
+    Ok(if flipped {
+        hit.map(ShapeCastHit::swapped)
+    } else {
+        hit
+    })
 }
 
 impl<ManifoldData, ContactData> PersistentQueryDispatcher<ManifoldData, ContactData>
@@ -6296,6 +6410,61 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
     }
 
     #[test]
+    fn planet_rejects_overflowing_subshape_geometry() {
+        let chunk = 100_000;
+        if let Ok(terrain) = FlatTerrain::new(1, chunk) {
+            assert!(matches!(
+                Planet::new(Arc::new(terrain), u32::MAX, 10.0),
+                Err(PlanetConfigError::SubshapeIdOverflow)
+            ));
+        }
+    }
+
+    #[test]
+    fn terrain_sample_panic_does_not_invalidate_existing_cache_entry() {
+        struct PanickingTerrain;
+        impl Terrain for PanickingTerrain {
+            fn face_resolution(&self) -> u32 {
+                1
+            }
+            fn chunk_resolution(&self) -> u32 {
+                2
+            }
+            fn min_height(&self) -> f32 {
+                0.0
+            }
+            fn max_height(&self) -> f32 {
+                0.0
+            }
+            fn sample(&self, coords: &Coords, out: &mut [f32]) {
+                assert_ne!(coords.face, Face::Nx, "intentional sample panic");
+                out.fill(0.0);
+            }
+        }
+        let planet = Planet::new(Arc::new(PanickingTerrain), 1, 10.0).unwrap();
+        let first = Coords {
+            x: 0,
+            y: 0,
+            face: Face::Px,
+        };
+        let failed = Coords {
+            face: Face::Nx,
+            ..first
+        };
+        let mut cache = planet.cache.lock().unwrap();
+        let (slot, data) = cache.get(&planet, &first);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get(&planet, &failed);
+        }));
+        assert!(failure.is_err());
+        let (recovered_slot, recovered_data) = cache.get(&planet, &first);
+        assert_eq!(slot, recovered_slot);
+        assert!(Arc::ptr_eq(&data, &recovered_data));
+        assert_eq!(cache.slots.len(), 1);
+        assert_eq!(cache.index.len(), 1);
+    }
+
+    #[test]
     fn planet_subshape_ids_fit_exactly_and_cache_capacity_is_lazy() {
         // Two triangles per chunk; the full 32-bit ID range fits exactly.
         let terrain = Arc::new(FlatTerrain::new(1, 2).unwrap());
@@ -6472,6 +6641,144 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         assert_relative_eq!(impact.witness2, Vector::new(-ball.radius, 0.0, 0.0));
         assert_relative_eq!(impact.normal1, Vector::X);
         assert_relative_eq!(impact.normal2, -Vector::X);
+    }
+
+    #[test]
+    fn linear_cast_target_distance_and_reversed_rotated_frame() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 3).unwrap()), 4, 10.0).unwrap();
+        let ball = Ball { radius: 1.0 };
+        let pose = Pose::new(
+            Vector::new(13.0, 0.0, 0.0),
+            Vector::Z * std::f64::consts::FRAC_PI_2,
+        );
+        let options = ShapeCastOptions {
+            max_time_of_impact: 1.5,
+            target_distance: 1.0,
+            ..Default::default()
+        };
+        let forward = PlanetDispatcher
+            .cast_shapes(&pose, -Vector::X, &planet, &ball, options)
+            .unwrap()
+            .unwrap();
+        let reverse = PlanetDispatcher
+            .cast_shapes(
+                &pose.inverse(),
+                pose.rotation.inverse() * Vector::X,
+                &ball,
+                &planet,
+                options,
+            )
+            .unwrap()
+            .unwrap();
+        assert_relative_eq!(forward.time_of_impact, 1.0, epsilon = 1e-6);
+        assert_relative_eq!(
+            forward.time_of_impact,
+            reverse.time_of_impact,
+            epsilon = 1e-6
+        );
+        assert_relative_eq!(forward.witness1, reverse.witness2, epsilon = 1e-6);
+        assert_relative_eq!(forward.witness2, reverse.witness1, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn stationary_cast_can_hit_within_target_distance() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 3).unwrap()), 4, 10.0).unwrap();
+        let ball = Ball { radius: 1.0 };
+        let hit = PlanetDispatcher
+            .cast_shapes(
+                &Pose::translation(11.5, 0.0, 0.0),
+                Vector::ZERO,
+                &planet,
+                &ball,
+                ShapeCastOptions {
+                    target_distance: 0.75,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.time_of_impact, 0.0);
+    }
+
+    #[test]
+    fn nonlinear_envelope_contains_rotating_shape_at_intermediate_times() {
+        let shape = Cuboid::new(Vector::new(1.0, 2.0, 3.0));
+        let planet_motion = NonlinearRigidMotion::new(
+            Pose::translation(1.0, -2.0, 0.0),
+            Vector::new(2.0, 0.0, -1.0),
+            Vector::new(1.0, 0.2, 0.0),
+            Vector::new(0.0, 0.0, 0.6),
+        );
+        let other_motion = NonlinearRigidMotion::new(
+            Pose::translation(14.0, 5.0, 3.0),
+            Vector::new(0.0, -5.0, 1.0),
+            Vector::new(-0.1, 5.0, 0.3),
+            Vector::new(0.3, 0.6, 2.0),
+        );
+        for (p, o) in [(planet_motion, other_motion), (other_motion, planet_motion)] {
+            let bound = nonlinear_swept_bounds(&p, &o, &shape, -0.5, 1.2);
+            for step in 0..=100 {
+                let time = f64::from(step).mul_add(0.017, -0.5);
+                let pose = p.position_at_time(time).inverse() * o.position_at_time(time);
+                let exact = shape.compute_aabb(&pose);
+                assert!(
+                    bound.mins.cmple(exact.mins).all() && bound.maxs.cmpge(exact.maxs).all(),
+                    "time={time}: {exact:?} outside {bound:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nonlinear_cast_checks_rotational_arc_not_just_endpoints() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 3).unwrap()), 4, 10.0).unwrap();
+        let ball = Ball { radius: 1.0 };
+        let stationary = NonlinearRigidMotion::constant_position(Pose::IDENTITY);
+        let moving = NonlinearRigidMotion::new(
+            Pose::translation(14.0, 5.0, 0.0),
+            Vector::new(0.0, -5.0, 0.0),
+            Vector::ZERO,
+            Vector::Z * std::f64::consts::PI,
+        );
+        let broad = nonlinear_swept_bounds(&stationary, &moving, &ball, 0.0, 1.0);
+        assert!(broad.mins.x <= 8.0 && broad.maxs.x >= 15.0);
+        let actual = PlanetDispatcher
+            .cast_shapes_nonlinear(&stationary, &planet, &moving, &ball, 0.0, 1.0, true)
+            .unwrap();
+        let mut reference: Option<ShapeCastHit> = None;
+        for face in Face::iter() {
+            for y in 0..3 {
+                for x in 0..3 {
+                    let coords = Coords { x, y, face };
+                    let patch = Patch::new(&coords, 3);
+                    let samples = planet.sample(&coords);
+                    for (_, triangle) in patch.triangles(10.0, 3, &samples) {
+                        if let Some(hit) = DefaultQueryDispatcher
+                            .cast_shapes_nonlinear(
+                                &stationary,
+                                &triangle,
+                                &moving,
+                                &ball,
+                                0.0,
+                                1.0,
+                                true,
+                            )
+                            .unwrap()
+                        {
+                            if reference.is_none_or(|old| hit.time_of_impact < old.time_of_impact) {
+                                reference = Some(hit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let reference = reference.expect("arc crosses the planet");
+        assert_relative_eq!(
+            actual.unwrap().time_of_impact,
+            reference.time_of_impact,
+            epsilon = 1e-8
+        );
     }
 
     #[test]

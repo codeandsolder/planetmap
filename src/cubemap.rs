@@ -109,7 +109,7 @@ impl<T> CubeMap<T> {
         unsafe {
             let base = alloc::alloc(layout);
             if base.is_null() {
-                alloc::handle_alloc_error(layout);
+                return None;
             }
             let mut guard = InitializationGuard {
                 base,
@@ -131,7 +131,7 @@ impl<T> CubeMap<T> {
     }
 
     /// Construct a cube map with faces containing `resolution * resolution` slots, each
-    /// initialized to `value`. Returns `None` if the dimensions cannot be represented.
+    /// initialized to `value`. Returns `None` if dimensions or allocation cannot be represented.
     #[must_use]
     pub fn new(resolution: u32, value: T) -> Option<Box<Self>>
     where
@@ -143,7 +143,7 @@ impl<T> CubeMap<T> {
     /// Copy a cube map from a contiguous slice of `resolution` by `resolution` data, in +X,
     /// -X, +Y, -Y, +Z, -Z order.
     ///
-    /// Returns `None` for mismatched data length or dimensions that cannot be represented.
+    /// Returns `None` for mismatched data length, unrepresentable dimensions or allocation failure.
     #[must_use]
     pub fn from_slice(resolution: u32, data: &[T]) -> Option<Box<Self>>
     where
@@ -156,7 +156,7 @@ impl<T> CubeMap<T> {
     }
 
     /// Compute a cube map based on the direction of each slot. Returns `None`
-    /// if the dimensions cannot be represented.
+    /// if the dimensions cannot be represented or allocation fails.
     #[must_use]
     pub fn from_fn(
         resolution: u32,
@@ -303,37 +303,31 @@ impl<'a, T> IntoIterator for &'a mut CubeMap<T> {
     fn into_iter(self) -> Self::IntoIter {
         IterMut {
             resolution: self.resolution,
-            data: &mut self.data,
-            index: 0,
+            data: self.data.iter_mut().enumerate(),
         }
     }
 }
 
 pub struct IterMut<'a, T> {
     resolution: u32,
-    data: &'a mut [T],
-    index: usize,
+    data: std::iter::Enumerate<std::slice::IterMut<'a, T>>,
 }
 
 impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = (na::Unit<na::Vector3<f32>>, &'a mut T);
     fn next(&mut self) -> Option<Self::Item> {
-        let dir = get_dir(self.resolution, self.index)?;
-        let value = ptr::from_mut(&mut self.data[self.index]);
-        self.index += 1;
-        // SAFETY: self.index is strictly incremented, so each returned element is unique.
-        Some((dir, unsafe { &mut *value }))
+        let (index, value) = self.data.next()?;
+        Some((get_dir(self.resolution, index)?, value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.data.len().saturating_sub(self.index);
-        (remaining, Some(remaining))
+        self.data.size_hint()
     }
 }
 
 impl<T> ExactSizeIterator for IterMut<'_, T> {
     fn len(&self) -> usize {
-        self.data.len().saturating_sub(self.index)
+        self.data.len()
     }
 }
 
@@ -538,7 +532,17 @@ impl Coords {
         let (face, coords) = Face::coords(vector);
         let coords = coords * 0.5 + na::Vector2::new(0.5, 0.5);
         let (x, y) = discretize(resolution, coords);
-        (Self { x, y, face }, coords)
+        let local = if resolution == 0 {
+            na::Point2::origin()
+        } else {
+            let scale = f64::from(resolution);
+            na::Point2::new(
+                (f64::from(coords.x) * scale - f64::from(x)).clamp(0.0, 1.0),
+                (f64::from(coords.y) * scale - f64::from(y)).clamp(0.0, 1.0),
+            )
+            .cast()
+        };
+        (Self { x, y, face }, local)
     }
 
     #[must_use]
@@ -716,13 +720,10 @@ impl Coords {
     /// The approximate direction represented by these coordinates
     #[must_use]
     pub fn center<N: RealField + Copy>(&self, resolution: u32) -> na::Unit<na::Vector3<N>> {
-        let texcoord = if resolution == 1 {
-            na::Point2::new(0.5, 0.5)
-        } else {
-            na::Point2::new(f64::from(self.x), f64::from(self.y)) / (f64::from(resolution - 1))
-        };
-        let on_z = texcoord * 2.0 - na::Vector2::new(1.0, 1.0);
-        self.face.direction(&on_z.cast())
+        let denominator = f64::from(resolution);
+        let centered = |index| (f64::from(index).mul_add(2.0, 1.0) - denominator) / denominator;
+        self.face
+            .direction(&na::Point2::new(centered(self.x), centered(self.y)).cast())
     }
 
     /// Compute the direction identified by a point in the [0..1]^2 area covered by these
@@ -1133,6 +1134,19 @@ mod test {
     }
 
     #[test]
+    fn mutable_iterator_retains_disjoint_references() {
+        let mut map = CubeMap::new(2, 0_u32).unwrap();
+        let mut refs: Vec<_> = map.iter_mut().map(|(_, value)| value).collect();
+        for (index, value) in refs.iter_mut().enumerate() {
+            **value = u32::try_from(index).unwrap();
+        }
+        assert!(map
+            .iter()
+            .enumerate()
+            .all(|(index, (_, value))| { usize::try_from(*value) == Ok(index) }));
+    }
+
+    #[test]
     fn invalid_coordinate_never_aliases_adjacent_cells_or_faces() {
         let mut map = CubeMap::new(2, 0_u32).unwrap();
         let valid = Coords {
@@ -1233,6 +1247,33 @@ mod test {
             let index = index(RES, dir);
             let out = get_dir(RES, index).unwrap();
             assert_eq!(dir, &out);
+        }
+    }
+
+    #[test]
+    fn every_dense_cell_center_roundtrips_without_face_aliasing() {
+        for resolution in [1, 2, 3, 8, 19] {
+            let count = (6 * resolution * resolution) as usize;
+            for i in 0..count {
+                let direction = get_dir(resolution, i).unwrap();
+                assert_eq!(index(resolution, &direction), i);
+                let (coords, local) = Coords::from_vector_with_coords(resolution, &direction);
+                assert!((local.x - 0.5).abs() < 1.0e-5);
+                assert!((local.y - 0.5).abs() < 1.0e-5);
+                assert_abs_diff_eq!(coords.center::<f32>(resolution), direction);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_lookup_returns_local_coordinates_within_selected_cell() {
+        for face in Face::iter() {
+            let coords = Coords { x: 2, y: 5, face };
+            let local = na::Point2::new(0.2_f32, 0.8);
+            let direction = coords.direction(8, &local);
+            let (actual, uv) = Coords::from_vector_with_coords(8, &direction);
+            assert_eq!(coords, actual);
+            assert_abs_diff_eq!(uv, local, epsilon = 1.0e-5);
         }
     }
 
