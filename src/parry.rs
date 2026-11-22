@@ -31,13 +31,9 @@ use parry3d_f64::{
 
 use crate::cubemap::Coords;
 
-/// Convert a `parry` vector to the nalgebra type consumed by the `cubemap` module
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Parry uses f64 world-space vectors, but terrain sampling is intentionally f32"
-)]
-const fn na3f32(v: Vector) -> na::Vector3<f32> {
-    na::Vector3::new(v.x as f32, v.y as f32, v.z as f32)
+/// Convert between the collision engine and cubemap vector representations.
+const fn cube_vector(v: Vector) -> na::Vector3<f64> {
+    na::Vector3::new(v.x, v.y, v.z)
 }
 
 /// Height data source for `Planet`.
@@ -436,10 +432,6 @@ impl Planet {
     /// Positive-radius radial terrain supports fast angular neighborhood
     /// discovery. Inward-displaced triangles and query spheres centered at
     /// the origin instead use conservative best-first global region bounds.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "The angular neighborhood uses f32 with a conservative 1e-6-radian pad"
-    )]
     pub fn map_elements_in_local_sphere(
         &self,
         bounds: &BoundingSphere,
@@ -459,21 +451,21 @@ impl Planet {
             } else {
                 min_height
             };
-        let direction32 = na3f32(dir);
+        let direction = cube_vector(dir);
         if inscribed > 256.0 * f64::EPSILON * self.radius
             && distance.is_finite()
             && distance > 0.0
-            && direction32.iter().all(|v| v.is_finite())
-            && direction32.norm_squared() > 0.0
+            && direction.iter().all(|v| v.is_finite())
+            && direction.norm_squared() > 0.0
         {
             // A query bounding sphere at distance d subtends asin(r/d);
-            // Coords::neighborhood adds 1e-6 radians for f32 discretization.
+            // Coords::neighborhood includes numerical boundary slack.
             let theta = if distance > bounds.radius() {
                 (bounds.radius() / distance).asin()
             } else {
                 std::f64::consts::PI
             };
-            for coords in Coords::neighborhood(face_resolution, direction32, theta as f32) {
+            for coords in Coords::neighborhood(face_resolution, direction, theta) {
                 if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
                     return;
                 }
@@ -813,7 +805,7 @@ impl Planet {
         if !end.is_finite() {
             return None;
         }
-        let coords = Coords::from_vector(self.face_resolution, &na3f32(ray.origin));
+        let coords = Coords::from_vector(self.face_resolution, &cube_vector(ray.origin));
         let patch = Patch::new(&coords, self.face_resolution);
         let quad_resolution = self.chunk_resolution - 1;
         let uv = patch.project(&ray.origin) * f64::from(quad_resolution);
@@ -1374,7 +1366,7 @@ impl Planet {
         // a handful of cells. More demanding queries use the hierarchy below.
         let mut cap_searched = false;
         if query_radius > 0.0 {
-            let source_direction = na3f32(query.query_axis);
+            let source_direction = cube_vector(query.query_axis);
             let seed = Coords::from_vector(face_resolution, &source_direction);
             self.update_projection_from_patch(seed, pt, query_radius, &mut nearest);
             let distance = nearest
@@ -1385,14 +1377,7 @@ impl Planet {
                     > self.radius * 64.0 * f64::EPSILON
             {
                 let theta = (distance / query_radius).asin();
-                // Leave space for cubemap angular and f32 conversion slack;
-                // Coords::neighborhood also pads its cone by 1e-6 radians.
-                if (theta + 2.0e-6) * f64::from(face_resolution) <= 2.0 {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "The validated near-surface cone is much smaller than pi radians"
-                    )]
-                    let theta = (theta + 2.0e-6) as f32;
+                if theta * f64::from(face_resolution) <= 2.0 {
                     for coords in Coords::neighborhood(face_resolution, source_direction, theta) {
                         if coords != seed {
                             self.update_projection_from_patch(
@@ -1790,7 +1775,7 @@ impl Planet {
             Vector::X
         };
         let resolution = self.face_resolution;
-        let coords = Coords::from_vector(resolution, &na3f32(axis));
+        let coords = Coords::from_vector(resolution, &cube_vector(axis));
         let patch = Patch::new(&coords, resolution);
         let side = self.chunk_resolution - 1;
         let uv = patch.project(&axis) * f64::from(side);
@@ -1824,10 +1809,6 @@ impl Planet {
     /// ball covers every possible winner, including across face seams.
     /// Returns None when the cap cannot be certified; the global hierarchy
     /// then remains the correctness-preserving fallback.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Only finite small angular cones are cast to f32, with 2e-6 radians padding"
-    )]
     fn visit_proximity_cap(
         &self,
         bounds: &BoundingSphere,
@@ -1846,12 +1827,12 @@ impl Planet {
             return None;
         }
         let theta = (cap_radius / distance).asin();
-        if (theta + 2.0e-6) * f64::from(self.face_resolution) > 2.0 {
+        if theta * f64::from(self.face_resolution) > 2.0 {
             return None;
         }
-        let axis = na3f32(bounds.center() / distance);
+        let axis = cube_vector(bounds.center() / distance);
         let face_resolution = self.face_resolution;
-        for coords in Coords::neighborhood(face_resolution, axis, (theta + 2.0e-6) as f32) {
+        for coords in Coords::neighborhood(face_resolution, axis, theta) {
             let rounding = 512.0
                 * f64::EPSILON
                 * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
@@ -4190,7 +4171,7 @@ mod tests {
         let planet = Planet::new(Arc::new(Depression(depressed)), 1, 10.0).unwrap();
         let direction = low.direction(4, &na::Point2::new(0.999, 0.5)).into_inner();
         let query = Vector::new(direction.x, direction.y, direction.z) * 3.0;
-        assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+        assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
         let (_, expected_surface, winner) = brute_force_projection(&planet, query);
         assert_eq!(winner, depressed);
         let (projection, _) = planet.project_local_point_and_get_feature(query);
@@ -4385,7 +4366,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             let planet = Planet::new(source, 1, 10.0).unwrap();
             let direction = low.direction(4, &na::Point2::from(uv)).into_inner();
             let query = Vector::new(direction.x, direction.y, direction.z) * 15.0;
-            assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+            assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
             let (expected_dist2, expected_pt, winning_patch) =
                 brute_force_projection(&planet, query);
             assert_eq!(winning_patch, high);

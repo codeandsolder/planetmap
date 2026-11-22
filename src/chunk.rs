@@ -87,7 +87,7 @@ impl Chunk {
     /// # Errors
     ///
     /// Rejects depths outside the addressable quadtree and non-finite or zero directions.
-    pub fn from_vector(depth: u8, dir: &na::Vector3<f32>) -> Result<Self, ChunkError> {
+    pub fn from_vector(depth: u8, dir: &na::Vector3<f64>) -> Result<Self, ChunkError> {
         if depth > Self::MAX_DEPTH {
             return Err(ChunkError::Depth(depth));
         }
@@ -106,8 +106,8 @@ impl Chunk {
     /// or negative half-angles.
     pub fn neighborhood(
         depth: u8,
-        direction: na::Vector3<f32>,
-        theta: f32,
+        direction: na::Vector3<f64>,
+        theta: f64,
     ) -> Result<impl Iterator<Item = Self>, ChunkError> {
         if depth > Self::MAX_DEPTH {
             return Err(ChunkError::Depth(depth));
@@ -211,13 +211,7 @@ impl Chunk {
     /// Shorthand for `direction(&[0.5; 2].into())`.
     #[must_use]
     pub fn origin<N: RealField + Copy>(&self) -> na::Unit<na::Vector3<N>> {
-        let size = self.edge_length::<N>();
-        let vec = na::Vector2::new(self.coords.x, self.coords.y)
-            .map(f64::from)
-            .cast::<N>()
-            .map(|x| (x + na::convert(0.5)) * size - na::convert(1.0))
-            .map(crate::cubemap::warp);
-        self.coords.face.basis() * na::Unit::new_normalize(vec.push(na::convert(1.0)))
+        self.coords.center(self.resolution())
     }
 
     /// Returns a grid of resolution^2 directions contained by the chunk, in scan-line order
@@ -238,7 +232,7 @@ impl Chunk {
 
     /// Compute the direction identified by a [0..1]^2 vector on this chunk
     #[must_use]
-    pub fn direction<N: RealField + Copy>(
+    pub fn direction<N: RealField + Copy + Into<f64>>(
         &self,
         coords: &na::Point2<N>,
     ) -> na::Unit<na::Vector3<N>> {
@@ -332,9 +326,9 @@ mod test {
 
     #[test]
     fn direction_and_cone_inputs_are_checked() {
-        let zero = na::Vector3::<f32>::zeros();
-        let nan = na::Vector3::new(f32::NAN, 1.0, 0.0);
-        let infinite = na::Vector3::new(f32::INFINITY, 1.0, 0.0);
+        let zero = na::Vector3::<f64>::zeros();
+        let nan = na::Vector3::new(f64::NAN, 1.0, 0.0);
+        let infinite = na::Vector3::new(f64::INFINITY, 1.0, 0.0);
         for invalid in [zero, nan, infinite] {
             assert_eq!(Chunk::from_vector(0, &invalid), Err(ChunkError::Direction));
             assert!(matches!(
@@ -347,11 +341,11 @@ mod test {
             Err(ChunkError::Angle)
         ));
         assert!(matches!(
-            Chunk::neighborhood(0, na::Vector3::x(), f32::INFINITY),
+            Chunk::neighborhood(0, na::Vector3::x(), f64::INFINITY),
             Err(ChunkError::Angle)
         ));
         assert!(matches!(
-            Chunk::neighborhood(0, na::Vector3::x(), f32::NAN),
+            Chunk::neighborhood(0, na::Vector3::x(), f64::NAN),
             Err(ChunkError::Angle)
         ));
     }
@@ -516,6 +510,28 @@ mod test {
                 .sum::<usize>(),
             3
         );
+    }
+
+    #[test]
+    fn depth_31_chunk_origin_is_distinct_and_addressable() {
+        let left = Chunk::try_new(
+            Coords {
+                x: (1 << 30) - 1,
+                y: 1 << 30,
+                face: Face::Pz,
+            },
+            31,
+        )
+        .unwrap();
+        let right = left.neighbors()[Edge::Px];
+        assert_ne!(left.origin::<f64>(), right.origin::<f64>());
+        for chunk in [left, right] {
+            assert_eq!(Chunk::from_vector(31, &chunk.origin()).unwrap(), chunk);
+            assert_eq!(
+                chunk.origin::<f64>(),
+                chunk.direction(&na::Point2::new(0.5, 0.5))
+            );
+        }
     }
 
     #[test]

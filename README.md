@@ -48,6 +48,15 @@ interpolation in a vertex shader.
   computation of sample coordinates within a `Chunk` or
   `cubemap::Coords`, useful for fast noise sampling
 
+## Coordinate precision
+
+Cubemap direction addressing, dense-map iteration, and angular neighborhood
+queries use f64 throughout so the entire supported u32 grid remains
+addressable. Scalar and SIMD sampling share the same exact cell positions;
+the SIMD interface narrows positions to f32 only at the final sampling stage.
+Use f64 scalar samples when distinct directions at the deepest quadtree
+levels are required.
+
 ## Collision query contracts
 
 Terrain dimensions and declared height bounds are fixed per planet. Sampling
