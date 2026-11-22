@@ -16,7 +16,7 @@ concurrency:
 jobs:
   strict-rust:
     name: Strict Rust and source policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7cdeeb9e1921a778e85dec30a2d611ccc1589555 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@834173ae06c35bfc435c68db85aa8a8eeda09c23 # main
     with:
       cargo-args: --locked --workspace --all-targets --all-features
 
