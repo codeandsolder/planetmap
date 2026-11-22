@@ -15,7 +15,11 @@ use std::collections::BinaryHeap;
 /// The tolerance accounts for the world-space cancellation in `origin - a`
 /// relative to the local triangle edge length rather than using a fixed
 /// world-space epsilon (planets can be millions of units from their origin).
-fn cast_triangle_ray_near_edge(tri: &Triangle, ray: &Ray, max_toi: f64) -> Option<RayIntersection> {
+pub(super) fn cast_triangle_ray_near_edge(
+    tri: &Triangle,
+    ray: &Ray,
+    max_toi: f64,
+) -> Option<RayIntersection> {
     let ab = tri.b - tri.a;
     let ac = tri.c - tri.a;
     let normal = ab.cross(ac);

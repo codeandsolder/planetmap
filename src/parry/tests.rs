@@ -4,6 +4,7 @@ use super::cast::nonlinear_swept_bounds;
 use super::discrete::PlanetPairRegion;
 use super::geometry::{Patch, Quad, corner};
 use super::manifold::Workspace;
+use super::ray::cast_triangle_ray_near_edge;
 use super::{FlatTerrain, Planet, PlanetConfigError, PlanetDispatcher, Terrain, cube_vector};
 use crate::cubemap::Coords;
 use parry3d_f64::bounding_volume::{Aabb, BoundingSphere, BoundingVolume};
