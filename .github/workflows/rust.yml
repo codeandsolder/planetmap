@@ -21,8 +21,8 @@ jobs:
       cargo-args: --locked --workspace --all-targets --all-features
 
   tests:
-    name: Rust 1.99.1 all-feature tests
+    name: Rust 1.100.0 all-feature tests
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@411fd9e8b72b47b2d086b6c18671434cc019699a # main
     with:
-      rust-toolchain: "1.99.1"
-      command: cargo +1.99.1 test --locked --workspace --all-targets --all-features
+      rust-toolchain: "1.100.0"
+      command: cargo +1.100.0 test --locked --workspace --all-targets --all-features
