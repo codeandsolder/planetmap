@@ -12,10 +12,10 @@ use std::{
     },
 };
 
-use glam::UVec2;
 use hashbrown::hash_map;
 use hashbrown::HashMap;
 use lru_slab::LruSlab;
+use parry3d_f64::glamx::glam::UVec2;
 use parry3d_f64::{
     bounding_volume::{Aabb, BoundingSphere, BoundingVolume},
     mass_properties::MassProperties,
@@ -3133,7 +3133,7 @@ struct Quad {
 impl Quad {
     fn new(patch: &Patch, resolution: u32, position: UVec2) -> Self {
         let offsets = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-        let position_f = Vec2::new(f64::from(position.x), f64::from(position.y));
+        let position_f = position.as_dvec2();
         Self {
             corners: offsets
                 .map(|x| patch.get(&((position_f + Vec2::from(x)) / f64::from(resolution)))),
