@@ -21,12 +21,12 @@ struct Slot {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Maximum depth of quad-tree traversal
-    pub(crate) max_depth: u8,
+    max_depth: u8,
     /// Upper bound for `Neighborhood` fields
     ///
     /// Should be set to the base 2 logarithm of the number of quads along the edge of a chunk to
     /// reduce stitching artifacts across extreme `LoD` boundaries.
-    pub(crate) max_neighbor_delta: u8,
+    max_neighbor_delta: u8,
 }
 
 impl Default for Config {
@@ -157,6 +157,17 @@ impl std::fmt::Display for AllocationError {
 }
 impl std::error::Error for AllocationError {}
 
+/// A ready terrain tile in the current visible render cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderableChunk {
+    /// Quadtree location of the terrain tile.
+    pub chunk: Chunk,
+    /// Coarser visible neighbors used for edge stitching.
+    pub neighborhood: Neighborhood,
+    /// Physical cache slot holding this tile's ready terrain data.
+    pub slot: u32,
+}
+
 /// Helper for streaming `Chunk`-oriented `LoD` into a fixed-size cache
 pub struct Manager {
     chunks: Slab<Slot>,
@@ -165,7 +176,7 @@ pub struct Manager {
     config: Config,
     /// Frame counter used to update `Slot.in_frame`
     frame: u64,
-    render: Vec<(Chunk, Neighborhood, u32)>,
+    render: Vec<RenderableChunk>,
 }
 
 impl Manager {
@@ -230,7 +241,7 @@ impl Manager {
         if let Some(list) = visited.as_deref_mut() {
             list.clear();
         }
-        for &(_, _, slot) in &self.render {
+        for &RenderableChunk { slot, .. } in &self.render {
             self.chunks[slot as usize].drawn = false;
         }
         self.render.clear();
@@ -267,10 +278,10 @@ impl Manager {
         }
     }
 
-    /// Chunks that can be rendered immediately, with their `LoD` neighborhood and slot index
+    /// Ready chunks in the current visible render cut. Recompute after each update.
     #[inline]
     #[must_use = "Use the returned chunks and slots to render terrain"]
-    pub fn renderable(&self) -> &[(Chunk, Neighborhood, u32)] {
+    pub fn renderable(&self) -> &[RenderableChunk] {
         &self.render
     }
 
@@ -348,7 +359,7 @@ impl Manager {
         transfers: &mut Vec<Chunk>,
         visited: &mut Option<&mut Vec<Chunk>>,
     ) {
-        // Gather the set of chunks we can should render and want to transfer
+        // Gather the visible render cut and target-quality transfer requests.
         for chunk in Face::iter().map(Chunk::root) {
             let slot = self.get(&chunk);
             // Kick off the loop for each face's quadtree
@@ -366,12 +377,17 @@ impl Manager {
 
         // Only actually drawn chunks can be stitching neighbors. Resident
         // parents of fully resolved child groups are not part of this cut.
-        for &(_, _, slot) in &self.render {
+        for &RenderableChunk { slot, .. } in &self.render {
             self.chunks[slot as usize].drawn = true;
         }
 
         // Compute the neighborhood of each rendered chunk.
-        for &mut (chunk, ref mut neighborhood, _) in &mut self.render {
+        for RenderableChunk {
+            chunk,
+            neighborhood,
+            ..
+        } in &mut self.render
+        {
             for (edge, neighbor) in Edge::iter().zip(chunk.neighbors().iter()) {
                 for x in neighbor.path() {
                     let slot = match self.index.get(&x) {
@@ -411,8 +427,11 @@ impl Manager {
         let subdivide = self.config.should_subdivide(&chunk.chunk, viewpoints);
         if !subdivide {
             if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
-                self.render
-                    .push((chunk.chunk, Neighborhood::default(), slot));
+                self.render.push(RenderableChunk {
+                    chunk: chunk.chunk,
+                    neighborhood: Neighborhood::default(),
+                    slot,
+                });
             }
             return;
         }
@@ -433,8 +452,11 @@ impl Manager {
             .all(|slot| slot.is_some_and(|x| self.chunks[x as usize].ready));
         // If this subtree should be rendered and the children can't be rendered, this chunk must be rendered.
         if !children_renderable && let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
-            self.render
-                .push((chunk.chunk, Neighborhood::default(), slot));
+            self.render.push(RenderableChunk {
+                chunk: chunk.chunk,
+                neighborhood: Neighborhood::default(),
+                slot,
+            });
         }
         // Recurse into the children
         for (&child, &slot) in children.iter().zip(child_slots.iter()) {
@@ -708,11 +730,11 @@ mod test {
         mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
         assert!(transfer.contains(&pending));
         assert!(
-            mgr.renderable().contains(&(
-                Chunk::root(pending.coords().face()),
-                Neighborhood::default(),
-                mgr.index[&Chunk::root(pending.coords().face())],
-            )),
+            mgr.renderable().contains(&RenderableChunk {
+                chunk: Chunk::root(pending.coords().face()),
+                neighborhood: Neighborhood::default(),
+                slot: mgr.index[&Chunk::root(pending.coords().face())],
+            }),
             "root must stay rendered during incomplete child split"
         );
     }
@@ -794,7 +816,7 @@ mod test {
         let neighbors = mgr
             .renderable()
             .iter()
-            .map(|&(chunk, neighbors, _slot)| (chunk, neighbors))
+            .map(|entry| (entry.chunk, entry.neighborhood))
             .collect::<HashMap<_, _>>();
         let neighborhood = *neighbors
             .get(&Chunk::try_new(1, Face::Px, 0, 0).unwrap())
@@ -864,8 +886,13 @@ mod test {
         manager.update(&viewpoints, &mut Vec::new());
         let rendered = manager.renderable();
         assert!(!rendered.is_empty());
-        let visible: HashSet<_> = rendered.iter().map(|(chunk, _, _)| *chunk).collect();
-        for (chunk, neighborhood, _) in rendered {
+        let visible: HashSet<_> = rendered.iter().map(|entry| entry.chunk).collect();
+        for RenderableChunk {
+            chunk,
+            neighborhood,
+            ..
+        } in rendered
+        {
             for (edge, neighbor) in Edge::iter().zip(chunk.neighbors()) {
                 let expected = neighbor
                     .path()
@@ -913,9 +940,14 @@ mod test {
             let visible: HashSet<_> = manager
                 .renderable()
                 .iter()
-                .map(|(chunk, _, _)| *chunk)
+                .map(|entry| entry.chunk)
                 .collect();
-            for (chunk, neighborhood, _) in manager.renderable() {
+            for RenderableChunk {
+                chunk,
+                neighborhood,
+                ..
+            } in manager.renderable()
+            {
                 for (edge, neighbor) in Edge::iter().zip(chunk.neighbors()) {
                     let expected = neighbor
                         .path()

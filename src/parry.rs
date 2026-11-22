@@ -32,6 +32,17 @@ const fn cube_vector(v: Vector) -> na::Vector3<f64> {
     na::Vector3::new(v.x, v.y, v.z)
 }
 
+/// A broadphase candidate identified by its terrain location, independent of cache residency.
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainTriangle<'a> {
+    /// Validated cubemap address of the owning terrain chunk.
+    pub coords: Coords,
+    /// Row-major triangle index within the chunk.
+    pub triangle_index: u32,
+    /// Displaced triangle geometry in planet-local coordinates, valid for the callback.
+    pub triangle: &'a parry3d_f64::shape::Triangle,
+}
+
 /// Height data source for `Planet`.
 ///
 /// Geometry and bounds are fixed for each Planet. Samples for a coordinate must
@@ -244,6 +255,7 @@ impl Planet {
     }
 
     fn sample(&self, coords: &Coords) -> Box<[f32]> {
+        debug_assert_eq!(coords.resolution(), self.face_resolution);
         let mut samples =
             vec![0.0; self.chunk_resolution as usize * self.chunk_resolution as usize]
                 .into_boxed_slice();
@@ -252,9 +264,18 @@ impl Planet {
     }
 
     fn lock_cache(&self) -> std::sync::MutexGuard<'_, Cache> {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A panic inside cache mutation may leave its LRU and lookup
+                // index inconsistent. Capacity is immutable; discard all
+                // derived data and clear poison only after repair.
+                let mut guard = poisoned.into_inner();
+                *guard = Cache::new(guard.max_size);
+                self.cache.clear_poison();
+                guard
+            }
+        }
     }
 
     fn cached_chunk(&self, coords: &Coords) -> (u32, Arc<ChunkData>) {
@@ -295,12 +316,7 @@ impl Clone for Planet {
     fn clone(&self) -> Self {
         Self {
             terrain: self.terrain.clone(),
-            cache: Mutex::new(
-                self.cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            ),
+            cache: Mutex::new(self.lock_cache().clone()),
             ..*self
         }
     }

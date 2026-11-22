@@ -1,3 +1,4 @@
+use super::TerrainTriangle;
 use super::{Planet, PlanetDispatcher};
 use crate::cubemap::Coords;
 use hashbrown::HashMap;
@@ -77,10 +78,12 @@ impl WorkspaceData for Workspace {
     }
 }
 
-fn resolve_manifold_slots(
+fn assign_manifold_subshapes<ManifoldData, ContactData>(
     planet: &Planet,
     keys: &[ManifoldKey],
-) -> Result<HashMap<Coords, u32>, Unsupported> {
+    manifolds: &mut [ContactManifold<ManifoldData, ContactData>],
+    flipped: bool,
+) -> Result<(), Unsupported> {
     // Resolve every active chunk together, *after* traversal; otherwise
     // a later chunk can recycle a slot used by an earlier manifold.
     let mut chunks = HashMap::new();
@@ -101,8 +104,18 @@ fn resolve_manifold_slots(
         let (slot, _) = cache.insert(data);
         slots.insert(coords, slot);
     }
+    // Keep every newly assigned slot resident until publication is complete.
+    for (key, manifold) in keys.iter().zip(manifolds) {
+        let slot = *slots.get(&key.coords).ok_or(Unsupported)?;
+        let subshape = planet.subshape_id(slot, key.triangle);
+        if flipped {
+            manifold.subshape2 = subshape;
+        } else {
+            manifold.subshape1 = subshape;
+        }
+    }
     drop(cache);
-    Ok(slots)
+    Ok(())
 }
 
 fn manifold_bounds(
@@ -237,32 +250,31 @@ where
         }
         true
     };
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, triangle_index, triangle| {
-        visit_manifold_parts(
-            other,
-            &pos21,
-            prediction,
-            ManifoldKey {
-                coords,
-                triangle: triangle_index,
-                other_part: None,
-            },
-            triangle,
-            &mut visit,
-        )
-    });
+    planet.map_elements_in_local_sphere(
+        &bounds,
+        &aabb,
+        |TerrainTriangle {
+             coords,
+             triangle_index,
+             triangle,
+         }| {
+            visit_manifold_parts(
+                other,
+                &pos21,
+                prediction,
+                ManifoldKey {
+                    coords,
+                    triangle: triangle_index,
+                    other_part: None,
+                },
+                triangle,
+                &mut visit,
+            )
+        },
+    );
     status?;
 
-    let slots = resolve_manifold_slots(planet, &keys)?;
-    for (key, manifold) in keys.into_iter().zip(&mut next) {
-        let slot = *slots.get(&key.coords).ok_or(Unsupported)?;
-        let subshape = planet.subshape_id(slot, key.triangle);
-        if flipped {
-            manifold.subshape2 = subshape;
-        } else {
-            manifold.subshape1 = subshape;
-        }
-    }
+    assign_manifold_subshapes(planet, &keys, &mut next, flipped)?;
     *manifolds = next;
     *workspace = Some(ContactManifoldsWorkspace(Box::new(next_state)));
     Ok(())

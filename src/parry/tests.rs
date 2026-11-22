@@ -1,3 +1,4 @@
+use super::TerrainTriangle;
 use super::bounds::{FaceRegion, GridRect, PatchBounds, ProjectionQuery, RankedRegion};
 use super::broadphase::SparseQuadSearch;
 use super::cast::nonlinear_swept_bounds;
@@ -914,10 +915,14 @@ fn first_collision_query_does_not_build_whole_chunk_mesh() {
     let center = (triangle.a + triangle.b + triangle.c) / 3.0;
     let aabb = Aabb::from_half_extents(center, Vector::splat(0.01));
     let mut matched = false;
-    planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |&at, _, _, _| {
-        matched |= at == coords;
-        true
-    });
+    planet.map_elements_in_local_sphere(
+        &aabb.bounding_sphere(),
+        &aabb,
+        |TerrainTriangle { coords: at, .. }| {
+            matched |= at == coords;
+            true
+        },
+    );
     assert!(
         matched,
         "the cold query must still emit the actual surface triangle"
@@ -937,7 +942,7 @@ fn first_collision_query_does_not_build_whole_chunk_mesh() {
     // The first three calls use sparse traversal. Repeated collision
     // queries on a still-resident chunk graduate to the cached index.
     for _ in 0..3 {
-        planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |_, _, _, _| true);
+        planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |_| true);
     }
     let cache = planet.cache.lock().unwrap();
     assert!(
@@ -1074,7 +1079,11 @@ fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
             planet.map_elements_in_local_sphere(
                 &aabb.bounding_sphere(),
                 &aabb,
-                |&coords, _, index, _| {
+                |TerrainTriangle {
+                     coords,
+                     triangle_index: index,
+                     ..
+                 }| {
                     found.insert((coords, index));
                     true
                 },
@@ -1137,7 +1146,7 @@ fn broadphase_wide_caps_prune_before_sampling_high_resolution_terrain() {
     // Off-center sphere covers the origin; its AABB is still
     // well inside the shell. No chunk should need sampling.
     let inside = Aabb::from_half_extents(Vector::new(100.0, 0.0, 0.0), Vector::splat(1000.0));
-    planet.map_elements_in_local_sphere(&inside.bounding_sphere(), &inside, |_, _, _, _| {
+    planet.map_elements_in_local_sphere(&inside.bounding_sphere(), &inside, |_| {
         panic!("interior volume cannot intersect flat terrain")
     });
     assert_eq!(source.samples.load(AtomicOrdering::Relaxed), 0);
@@ -1149,10 +1158,14 @@ fn broadphase_wide_caps_prune_before_sampling_high_resolution_terrain() {
         Vector::new(RADIUS + 10.0, 0.001, 0.001),
     );
     let mut faces = std::collections::HashSet::new();
-    planet.map_elements_in_local_sphere(&stripe.bounding_sphere(), &stripe, |coords, _, _, _| {
-        faces.insert(coords.face());
-        true
-    });
+    planet.map_elements_in_local_sphere(
+        &stripe.bounding_sphere(),
+        &stripe,
+        |TerrainTriangle { coords, .. }| {
+            faces.insert(coords.face());
+            true
+        },
+    );
     assert_eq!(faces, [Face::Px, Face::Nx].into_iter().collect());
     let samples = source.samples.load(AtomicOrdering::Relaxed);
     assert!(samples < 64, "thin stripe sampled {samples} patches");
@@ -1163,10 +1176,14 @@ fn broadphase_handles_volume_centered_on_planet_origin() {
     let planet = Planet::new(Arc::new(FlatTerrain::new(2, 3).unwrap()), 1, 10.0).unwrap();
     let aabb = Aabb::from_half_extents(Vector::ZERO, Vector::splat(15.0));
     let mut found = std::collections::HashSet::new();
-    planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |&coords, _, _, _| {
-        found.insert(coords.face());
-        true
-    });
+    planet.map_elements_in_local_sphere(
+        &aabb.bounding_sphere(),
+        &aabb,
+        |TerrainTriangle { coords, .. }| {
+            found.insert(coords.face());
+            true
+        },
+    );
     assert_eq!(
         found.len(),
         6,
@@ -1210,7 +1227,11 @@ fn broadphase_inward_displacement_reaches_opposite_direction() {
         planet.map_elements_in_local_sphere(
             &aabb.bounding_sphere(),
             &aabb,
-            |&coords, _, tri_idx, _| {
+            |TerrainTriangle {
+                 coords,
+                 triangle_index: tri_idx,
+                 ..
+             }| {
                 matched |= coords == target && tri_idx == idx;
                 true
             },
@@ -1260,7 +1281,11 @@ fn broadphase_includes_planetary_radius_face_seams_and_quad_corners() {
                             planet.map_elements_in_local_sphere(
                                 &aabb.bounding_sphere(),
                                 &aabb,
-                                |&at, _, idx, _| {
+                                |TerrainTriangle {
+                                     coords: at,
+                                     triangle_index: idx,
+                                     ..
+                                 }| {
                                     visited |= at == coords && idx == index;
                                     true
                                 },
@@ -1334,7 +1359,11 @@ fn broadphase_covers_randomly_oriented_boxes_and_variable_heights() {
             planet.map_elements_in_local_sphere(
                 &aabb.bounding_sphere(),
                 &aabb,
-                |&coords, _, idx, _| {
+                |TerrainTriangle {
+                     coords,
+                     triangle_index: idx,
+                     ..
+                 }| {
                     actual.insert((coords, idx));
                     true
                 },
@@ -1392,7 +1421,11 @@ fn broadphase_reports_every_triangle_whose_aabb_intersects_query() {
                             planet.map_elements_in_local_sphere(
                                 &sphere,
                                 &aabb,
-                                |&at, _, idx, _| {
+                                |TerrainTriangle {
+                                     coords: at,
+                                     triangle_index: idx,
+                                     ..
+                                 }| {
                                     actual.insert((at, idx));
                                     true
                                 },
@@ -2544,7 +2577,7 @@ fn collider_callback_can_reenter_cache_and_evict_current_chunk() {
     let bounds = BoundingSphere::new(center, 7.0);
     let aabb = Aabb::from_half_extents(center, Vector::splat(7.0));
     let mut seen = 0;
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, _, _| {
+    planet.map_elements_in_local_sphere(&bounds, &aabb, |TerrainTriangle { coords, .. }| {
         // Previously the callback was invoked while holding this mutex.
         assert!(planet.cache.try_lock().is_ok());
         // Reenter a different cubemap face with capacity 1 to ensure the
@@ -2673,8 +2706,8 @@ fn terrain_sample_panic_does_not_invalidate_existing_cache_entry() {
         }
     }
     let planet = Planet::new(Arc::new(PanickingTerrain), 1, 10.0).unwrap();
-    let first = Coords::new(2, Face::Px, 0, 0).unwrap();
-    let failed = Coords::new(2, Face::Nx, first.x(), first.y()).unwrap();
+    let first = Coords::root(Face::Px);
+    let failed = Coords::root(Face::Nx);
     let (slot, data) = planet.cached_chunk(&first);
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         planet.cached_chunk(&failed);
@@ -2687,6 +2720,35 @@ fn terrain_sample_panic_does_not_invalidate_existing_cache_entry() {
     let cache = planet.cache.lock().unwrap();
     assert_eq!(cache.slots.len(), 1);
     assert_eq!(cache.index.len(), 1);
+}
+
+#[test]
+fn poisoned_collision_cache_discards_partial_mutation_before_reuse() {
+    let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 10.0).unwrap();
+    let first = Coords::root(Face::Px);
+    let second = Coords::root(Face::Ny);
+    let (_, original) = planet.cached_chunk(&first);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cache = planet.cache.lock().unwrap();
+        // Model an interrupted update of the lookup index, leaving the
+        // resident LRU slot without its corresponding index entry.
+        cache.index.clear();
+        panic!("intentional cache mutation failure");
+    }));
+    assert!(failure.is_err());
+    assert!(planet.cache.is_poisoned());
+    let cloned = planet.clone();
+    assert!(!planet.cache.is_poisoned());
+    assert!(cloned.lock_cache().index.is_empty());
+    let (_, recovered) = planet.cached_chunk(&first);
+    assert!(!Arc::ptr_eq(&original, &recovered));
+    let (slot, _) = planet.cached_chunk(&second);
+    let cache = planet.lock_cache();
+    assert_eq!(cache.max_size, 1);
+    assert_eq!(cache.slots.len(), 1);
+    assert_eq!(cache.index.len(), 1);
+    assert_eq!(cache.index[&second], slot);
+    assert!(!cache.index.contains_key(&first));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use super::TerrainTriangle;
 use super::bounds::{DirectionCone, FaceRegion, PatchBounds, ProjectionQuery, RankedRegion};
 use super::broadphase::MAX_DIRECT_CAP_CELLS;
 use super::cast::{compute_nonlinear_toi, compute_toi};
@@ -79,25 +80,18 @@ impl Planet {
             return None;
         }
         let axis = cube_vector(bounds.center() / distance);
-        let face_resolution = self.face_resolution;
-        for coords in Coords::neighborhood(face_resolution, axis, theta) {
-            let rounding = 512.0
-                * f64::EPSILON
-                * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
-            let limit = (*max_distance + rounding).max(0.0);
-            let query_aabb = other_aabb.loosened(limit);
-            let query_bounds = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
-            let mut continue_search = true;
-            self.map_elements_in_chunk(
+        let rounding = 512.0
+            * f64::EPSILON
+            * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
+        for coords in Coords::neighborhood(self.face_resolution, axis, theta) {
+            if !self.visit_proximity_leaf(
                 coords,
-                &query_bounds,
-                &query_aabb,
-                &mut |&at, _, index, triangle| {
-                    continue_search = visitor(at, index, triangle, max_distance);
-                    continue_search
-                },
-            );
-            if !continue_search {
+                bounds,
+                other_aabb,
+                rounding,
+                max_distance,
+                visitor,
+            ) {
                 return Some(false);
             }
         }
@@ -138,17 +132,18 @@ impl Planet {
             let limit = (*max_distance + roundoff).max(0.0);
             let search_aabb = other_aabb.loosened(limit);
             let search_sphere = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
-            let mut continue_search = true;
             self.map_elements_in_chunk(
                 coords,
                 &search_sphere,
                 &search_aabb,
-                &mut |&at, _, index, triangle| {
-                    continue_search = visitor(at, index, triangle, max_distance);
-                    continue_search
+                &mut |TerrainTriangle {
+                          coords,
+                          triangle_index,
+                          triangle,
+                      }| {
+                    visitor(coords, triangle_index, triangle, max_distance)
                 },
-            );
-            continue_search
+            )
         }
     }
 
@@ -529,20 +524,33 @@ fn visit_planet_pair_triangles(
             let enlarged = candidate.second.aabb.loosened(*limit + roundoff);
             let bounds = enlarged.bounding_sphere();
             let mut continue_query = true;
-            first.map_elements_in_chunk(coords1, &bounds, &enlarged, &mut |&at1, _, id1, tri1| {
-                let tri_box = tri1.compute_aabb(&pos21).loosened(*limit + roundoff);
-                let tri_bounds = tri_box.bounding_sphere();
-                second.map_elements_in_chunk(
-                    coords2,
-                    &tri_bounds,
-                    &tri_box,
-                    &mut |&at2, _, id2, tri2| {
-                        continue_query = visitor(at1, id1, at2, id2, tri1, tri2, limit);
-                        continue_query
-                    },
-                );
-                continue_query
-            });
+            first.map_elements_in_chunk(
+                coords1,
+                &bounds,
+                &enlarged,
+                &mut |TerrainTriangle {
+                          coords: at1,
+                          triangle_index: id1,
+                          triangle: tri1,
+                      }| {
+                    let tri_box = tri1.compute_aabb(&pos21).loosened(*limit + roundoff);
+                    let tri_bounds = tri_box.bounding_sphere();
+                    second.map_elements_in_chunk(
+                        coords2,
+                        &tri_bounds,
+                        &tri_box,
+                        &mut |TerrainTriangle {
+                                  coords: at2,
+                                  triangle_index: id2,
+                                  triangle: tri2,
+                              }| {
+                            continue_query = visitor(at1, id1, at2, id2, tri1, tri2, limit);
+                            continue_query
+                        },
+                    );
+                    continue_query
+                },
+            );
             if !continue_query {
                 return;
             }
@@ -885,21 +893,29 @@ pub(super) fn planet_shape_contact(
     let bound = envelope.bounding_sphere();
     let mut best: Option<(Coords, u32, Contact)> = None;
     let mut unsupported = false;
-    planet.map_elements_in_local_sphere(&bound, &envelope, |&coords, _, index, triangle| {
-        match dispatcher.contact(pos12, triangle, other, prediction) {
-            Ok(Some(contact)) => {
-                if best.is_none_or(|(_, _, previous)| contact.dist < previous.dist) {
-                    best = Some((coords, index, contact));
+    planet.map_elements_in_local_sphere(
+        &bound,
+        &envelope,
+        |TerrainTriangle {
+             coords,
+             triangle_index: index,
+             triangle,
+         }| {
+            match dispatcher.contact(pos12, triangle, other, prediction) {
+                Ok(Some(contact)) => {
+                    if best.is_none_or(|(_, _, previous)| contact.dist < previous.dist) {
+                        best = Some((coords, index, contact));
+                    }
+                    true
                 }
-                true
+                Ok(None) => true,
+                Err(_) => {
+                    unsupported = true;
+                    false
+                }
             }
-            Ok(None) => true,
-            Err(_) => {
-                unsupported = true;
-                false
-            }
-        }
-    });
+        },
+    );
     if unsupported {
         return Err(Unsupported);
     }
@@ -1091,20 +1107,28 @@ fn intersects(
     let bounds = other.compute_bounding_sphere(pos12);
     let aabb = other.compute_aabb(pos12);
     let mut hit = Ok(ShapeIntersection::new(false));
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, index, triangle| {
-        match dispatcher.intersection_test(pos12, triangle, other) {
-            Ok(mut result) if result.intersecting => {
-                result.subshape1 = planet.stable_triangle_id(coords, index);
-                hit = Ok(result);
-                false
+    planet.map_elements_in_local_sphere(
+        &bounds,
+        &aabb,
+        |TerrainTriangle {
+             coords,
+             triangle_index: index,
+             triangle,
+         }| {
+            match dispatcher.intersection_test(pos12, triangle, other) {
+                Ok(mut result) if result.intersecting => {
+                    result.subshape1 = planet.stable_triangle_id(coords, index);
+                    hit = Ok(result);
+                    false
+                }
+                Ok(_) => true,
+                Err(error) => {
+                    hit = Err(error);
+                    false
+                }
             }
-            Ok(_) => true,
-            Err(error) => {
-                hit = Err(error);
-                false
-            }
-        }
-    });
+        },
+    );
     hit
 }
 

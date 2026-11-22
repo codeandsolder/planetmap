@@ -3,11 +3,10 @@ use super::geometry::{Patch, Quad};
 use super::tile_cache::{
     ChunkData, MAX_CACHED_PROJECTION_VERTICES, QUAD_BLOCK_WIDTH, QUAD_INDEX_BUILD_AFTER_QUERIES,
 };
-use super::{Planet, cube_vector, outer_displaced_radius};
+use super::{Planet, TerrainTriangle, cube_vector, outer_displaced_radius};
 use crate::cubemap::Coords;
 use parry3d_f64::bounding_volume::{Aabb, BoundingSphere, BoundingVolume};
 use parry3d_f64::math::{Pose, Vec2, Vector};
-use parry3d_f64::shape::Triangle;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 impl Planet {
@@ -47,14 +46,14 @@ impl Planet {
         chunk_coords: Coords,
         bounds: &BoundingSphere,
         aabb: &Aabb,
-        visitor: &mut impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+        visitor: &mut impl FnMut(TerrainTriangle<'_>) -> bool,
     ) -> bool {
         let dir = bounds.center();
         let distance = dir.length();
         // Never call an application-provided callback with our cache lock
         // held. An Arc keeps the geometry alive even if a nested query
         // evicts this slot before the callback completes.
-        let (slot, data) = self.cached_chunk(&chunk_coords);
+        let (_, data) = self.cached_chunk(&chunk_coords);
         // Both triangle interiors and displaced vertices lie in this
         // patch's angular cone; unlike the sample vertex radii, its
         // projected radial minimum is conservative for triangle chords.
@@ -77,7 +76,11 @@ impl Planet {
                 .enumerate()
             {
                 let index = (quad.index(self.chunk_resolution) << 1) | u32::from(i == 1);
-                if !visitor(&chunk_coords, slot, index, &triangle) {
+                if !visitor(TerrainTriangle {
+                    coords: chunk_coords,
+                    triangle_index: index,
+                    triangle: &triangle,
+                }) {
                     return false;
                 }
             }
@@ -138,9 +141,12 @@ impl Planet {
     }
 
     /// Applies `f` to potentially overlapping displaced terrain triangles.
+    /// The supplied sphere must enclose every point of interest in the AABB;
+    /// both bounds are expressed in planet-local space.
     /// Returns early when `f` returns false. The callback executes without
-    /// the cache mutex and may reenter this planet. Cache slot identifiers
-    /// are ephemeral and can be recycled by nested calls.
+    /// the cache mutex and may reenter this planet. Each candidate uses a
+    /// stable coordinate and local triangle index instead of a recyclable
+    /// cache slot.
     ///
     /// Positive-radius radial terrain supports fast angular neighborhood
     /// discovery for small caps. Wide caps and inward-displaced triangles
@@ -149,7 +155,7 @@ impl Planet {
         &self,
         bounds: &BoundingSphere,
         aabb: &Aabb,
-        mut f: impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+        mut f: impl FnMut(TerrainTriangle<'_>) -> bool,
     ) {
         let dir = bounds.center();
         let distance = dir.length();
@@ -288,7 +294,7 @@ impl Planet {
         &self,
         bounds: &BoundingSphere,
         aabb: &Aabb,
-        mut visit: impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+        mut visit: impl FnMut(TerrainTriangle<'_>) -> bool,
     ) {
         let mut stack: Vec<_> = FaceRegion::roots(self.face_resolution)
             .map(|region| PatchBounds::new(self, &Pose::IDENTITY, region))

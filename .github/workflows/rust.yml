@@ -26,3 +26,12 @@ jobs:
     with:
       rust-toolchain: "1.100.0"
       command: cargo +1.100.0 test --locked --workspace --all-targets --all-features
+
+  miri:
+    name: Cubemap allocation and borrowing under Miri
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+    with:
+      rust-toolchain: "nightly-2026-11-22"
+      rust-components: "miri rust-src"
+      rustflags: ""
+      command: cargo +nightly-2026-11-22 miri test --locked --lib --no-default-features cubemap::test::memory_
