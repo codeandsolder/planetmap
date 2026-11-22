@@ -280,6 +280,28 @@ mod test {
     }
 
     #[test]
+    fn angular_bound_covers_warped_grid_and_extreme_addresses() {
+        for face in Face::iter() {
+            for depth in [0, 1, 4, 10, 20, Chunk::MAX_DEPTH] {
+                let last = (1u32 << depth) - 1;
+                for x in [0, last / 3, last / 2, last] {
+                    for y in [0, last / 3, last / 2, last] {
+                        let chunk = Chunk::try_new(depth, face, x, y).unwrap();
+                        let center = chunk.origin::<f64>().into_inner();
+                        let radius = 2.0 * (0.5 * chunk.angular_radius_bound()).sin();
+                        for direction in chunk.samples::<f64>(9) {
+                            assert!(
+                                (direction.into_inner() - center).norm()
+                                    <= radius + 64.0 * f64::EPSILON
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn direction_and_cone_inputs_are_checked() {
         let zero = na::Vector3::<f64>::zeros();
         let nan = na::Vector3::new(f64::NAN, 1.0, 0.0);
