@@ -481,10 +481,11 @@ impl Planet {
         let threshold2 = bounds.radius().powi(2);
         let mut regions = BinaryHeap::new();
         regions.extend(
-            FaceRegion::roots(face_resolution).map(|region| ProjectionRegion::new(region, &query)),
+            FaceRegion::roots(face_resolution)
+                .map(|region| RankedRegion::projection(region, &query)),
         );
         while let Some(region) = regions.pop() {
-            if region.lower_distance2 > threshold2 {
+            if region.lower_bound > threshold2 {
                 break;
             }
             if let Some(coords) = region.region.leaf() {
@@ -497,8 +498,8 @@ impl Planet {
                 region
                     .region
                     .children()
-                    .map(|child| ProjectionRegion::new(child, &query))
-                    .filter(|candidate| candidate.lower_distance2 <= threshold2),
+                    .map(|child| RankedRegion::projection(child, &query))
+                    .filter(|candidate| candidate.lower_bound <= threshold2),
             );
         }
     }
@@ -579,16 +580,8 @@ fn cast_triangle_ray_near_edge(tri: &Triangle, ray: &Ray, max_toi: f64) -> Optio
     Some(RayIntersection::new(time, normal, FeatureId::Face(face)))
 }
 
-/// A ray-overlapping cubemap rectangle ordered by its earliest possible TOI.
-/// AABB bounds enclose every displaced triangle interior, not just vertices.
-#[derive(Clone, Copy, Debug)]
-struct RayRegion {
-    region: FaceRegion,
-    lower_time: f64,
-}
-
-impl RayRegion {
-    fn new(planet: &Planet, region: FaceRegion, ray: &Ray, max_toi: f64) -> Option<Self> {
+impl RankedRegion {
+    fn ray(planet: &Planet, region: FaceRegion, ray: &Ray, max_toi: f64) -> Option<Self> {
         let cone = DirectionCone::from_region(region, planet.face_resolution);
         let radius = planet.radius;
         let min_height = f64::from(planet.min_height);
@@ -600,27 +593,10 @@ impl RayRegion {
         );
         let aabb = cone.aabb(radial_min, radial_max, pad);
         let lower_time = aabb.cast_local_ray(ray, max_toi, true)?;
-        Some(Self { region, lower_time })
-    }
-}
-
-impl PartialEq for RayRegion {
-    fn eq(&self, other: &Self) -> bool {
-        self.lower_time.total_cmp(&other.lower_time).is_eq() && self.region == other.region
-    }
-}
-impl Eq for RayRegion {}
-impl PartialOrd for RayRegion {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for RayRegion {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .lower_time
-            .total_cmp(&self.lower_time)
-            .then_with(|| self.region.cmp(&other.region))
+        Some(Self {
+            region,
+            lower_bound: lower_time,
+        })
     }
 }
 
@@ -779,7 +755,7 @@ impl RayCast for Planet {
             return Some(hit);
         }
         let mut candidates: BinaryHeap<_> = FaceRegion::roots(self.face_resolution)
-            .filter_map(|region| RayRegion::new(self, region, ray, max_toi))
+            .filter_map(|region| RankedRegion::ray(self, region, ray, max_toi))
             .collect();
         // The LRU slot can be reassigned while visiting adjacent patches.
         // Retain the winning tile and triangle until all possible earlier
@@ -787,7 +763,7 @@ impl RayCast for Planet {
         let mut closest: Option<(f64, Coords, u32, RayIntersection)> = None;
         while let Some(candidate) = candidates.pop() {
             let limit = closest.as_ref().map_or(max_toi, |x| x.0);
-            if candidate.lower_time > limit {
+            if candidate.lower_bound > limit {
                 break;
             }
             if let Some(coords) = candidate.region.leaf() {
@@ -804,7 +780,7 @@ impl RayCast for Planet {
                 candidate
                     .region
                     .children()
-                    .filter_map(|child| RayRegion::new(self, child, ray, limit)),
+                    .filter_map(|child| RankedRegion::ray(self, child, ray, limit)),
             );
         }
         let (_, coords, tri_idx, mut hit) = closest?;
@@ -901,18 +877,13 @@ impl Ord for FaceRegion {
     }
 }
 
-/// A rectangular group of terrain patches in the cubemap, ordered by a
-/// conservative lower bound on the distance to any triangle it contains.
-///
-/// The patch's undisplaced vertices are convex combinations of unit corner
-/// directions. A positive radial displacement preserves this cone, and
-/// triangles interpolate between such displaced vertices. The conservative
-/// radius lower bound must therefore enclose triangle interiors, not merely
-/// the displaced vertices; use their projection along the cone axis.
+/// A cubemap region with a conservative lower bound for a single
+/// best-first query. Each heap uses its own units (distance squared, ray
+/// time, or plane support); the ordering and partition are identical.
 #[derive(Clone, Copy, Debug)]
-struct ProjectionRegion {
+struct RankedRegion {
     region: FaceRegion,
-    lower_distance2: f64,
+    lower_bound: f64,
 }
 
 /// At most 1.5 MiB of f64 vertices per tile is retained for warm queries.
@@ -1058,8 +1029,8 @@ impl DirectionCone {
     }
 }
 
-impl ProjectionRegion {
-    fn new(region: FaceRegion, query: &ProjectionQuery) -> Self {
+impl RankedRegion {
+    fn projection(region: FaceRegion, query: &ProjectionQuery) -> Self {
         let cone = DirectionCone::from_region(region, query.resolution);
         let min_radius = cone.minimum_radius(query.planet_radius, query.min_height);
         let max_radius =
@@ -1084,30 +1055,27 @@ impl ProjectionRegion {
         };
         Self {
             region,
-            lower_distance2,
+            lower_bound: lower_distance2,
         }
     }
 }
 
-impl PartialEq for ProjectionRegion {
+impl PartialEq for RankedRegion {
     fn eq(&self, other: &Self) -> bool {
-        self.lower_distance2
-            .total_cmp(&other.lower_distance2)
-            .is_eq()
-            && self.region == other.region
+        self.lower_bound.total_cmp(&other.lower_bound).is_eq() && self.region == other.region
     }
 }
-impl Eq for ProjectionRegion {}
-impl PartialOrd for ProjectionRegion {
+impl Eq for RankedRegion {}
+impl PartialOrd for RankedRegion {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ProjectionRegion {
+impl Ord for RankedRegion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other
-            .lower_distance2
-            .total_cmp(&self.lower_distance2)
+            .lower_bound
+            .total_cmp(&self.lower_bound)
             .then_with(|| self.region.cmp(&other.region))
     }
 }
@@ -1202,11 +1170,12 @@ impl Planet {
     ) {
         let mut regions = BinaryHeap::new();
         regions.extend(
-            FaceRegion::roots(query.resolution).map(|region| ProjectionRegion::new(region, query)),
+            FaceRegion::roots(query.resolution)
+                .map(|region| RankedRegion::projection(region, query)),
         );
         while let Some(region) = regions.pop() {
             let best_distance2 = nearest.as_ref().map_or(f64::INFINITY, |x| x.distance2);
-            if region.lower_distance2 > best_distance2 {
+            if region.lower_bound > best_distance2 {
                 break;
             }
             if let Some(coords) = region.region.leaf() {
@@ -1218,8 +1187,8 @@ impl Planet {
                 region
                     .region
                     .children()
-                    .map(|child| ProjectionRegion::new(child, query))
-                    .filter(|candidate| candidate.lower_distance2 <= best_distance2),
+                    .map(|child| RankedRegion::projection(child, query))
+                    .filter(|candidate| candidate.lower_bound <= best_distance2),
             );
         }
     }
@@ -1877,11 +1846,12 @@ impl Planet {
             * (self.max_radius() + center.abs().max_element() + bounds.radius());
         let mut regions = BinaryHeap::new();
         regions.extend(
-            FaceRegion::roots(query.resolution).map(|region| ProjectionRegion::new(region, &query)),
+            FaceRegion::roots(query.resolution)
+                .map(|region| RankedRegion::projection(region, &query)),
         );
         while let Some(region) = regions.pop() {
             let threshold = bounds.radius() + *max_distance + roundoff;
-            if region.lower_distance2 > threshold * threshold {
+            if region.lower_bound > threshold * threshold {
                 break;
             }
             if let Some(coords) = region.region.leaf() {
@@ -1901,8 +1871,8 @@ impl Planet {
                 region
                     .region
                     .children()
-                    .map(|child| ProjectionRegion::new(child, &query))
-                    .filter(|candidate| candidate.lower_distance2 <= threshold * threshold),
+                    .map(|child| RankedRegion::projection(child, &query))
+                    .filter(|candidate| candidate.lower_bound <= threshold * threshold),
             );
         }
     }
@@ -1915,17 +1885,8 @@ impl Planet {
     }
 }
 
-/// A best-first cubemap region ordered by the smallest possible vertex
-/// projection along a given plane normal. The bounds include all triangle
-/// interiors, and remain safe if large negative heights invert their rays.
-#[derive(Clone, Copy, Debug)]
-struct PlaneSupportRegion {
-    region: FaceRegion,
-    lower_dot: f64,
-}
-
-impl PlaneSupportRegion {
-    fn new(planet: &Planet, region: FaceRegion, normal: Vector) -> Self {
+impl RankedRegion {
+    fn plane(planet: &Planet, region: FaceRegion, normal: Vector) -> Self {
         let cone = DirectionCone::from_region(region, planet.face_resolution);
         let min_height = f64::from(planet.min_height);
         let min_radius = cone.minimum_radius(planet.radius, min_height);
@@ -1934,30 +1895,10 @@ impl PlaneSupportRegion {
         let slack = 512.0 * f64::EPSILON * (max_radius + planet.radius);
         Self {
             region,
-            lower_dot: minimum - slack,
+            lower_bound: minimum - slack,
         }
     }
 }
-impl PartialEq for PlaneSupportRegion {
-    fn eq(&self, other: &Self) -> bool {
-        self.lower_dot.total_cmp(&other.lower_dot).is_eq() && self.region == other.region
-    }
-}
-impl Eq for PlaneSupportRegion {}
-impl PartialOrd for PlaneSupportRegion {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for PlaneSupportRegion {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .lower_dot
-            .total_cmp(&self.lower_dot)
-            .then_with(|| self.region.cmp(&other.region))
-    }
-}
-
 struct PlaneSupportWinner {
     coords: Coords,
     triangle: u32,
@@ -2003,13 +1944,12 @@ impl Planet {
         let mut regions = BinaryHeap::new();
         let resolution = self.face_resolution;
         regions.extend(
-            FaceRegion::roots(resolution)
-                .map(|region| PlaneSupportRegion::new(self, region, normal)),
+            FaceRegion::roots(resolution).map(|region| RankedRegion::plane(self, region, normal)),
         );
         while let Some(region) = regions.pop() {
             if winner
                 .as_ref()
-                .is_some_and(|best| region.lower_dot > best.dot)
+                .is_some_and(|best| region.lower_bound > best.dot)
             {
                 break;
             }
@@ -2040,11 +1980,11 @@ impl Planet {
                 region
                     .region
                     .children()
-                    .map(|child| PlaneSupportRegion::new(self, child, normal))
+                    .map(|child| RankedRegion::plane(self, child, normal))
                     .filter(|candidate| {
                         winner
                             .as_ref()
-                            .is_none_or(|best| candidate.lower_dot <= best.dot)
+                            .is_none_or(|best| candidate.lower_bound <= best.dot)
                     }),
             );
         }
@@ -4100,12 +4040,12 @@ mod tests {
             min_height: 10.0,
             max_height: 10.0,
         };
-        let region = ProjectionRegion::new(FaceRegion::new(Face::Px, 0, 1, 0, 1), &query);
+        let region = RankedRegion::projection(FaceRegion::new(Face::Px, 0, 1, 0, 1), &query);
         let actual_distance2 = (20.0_f64 / 3.0_f64.sqrt()).powi(2);
         assert!(
-            region.lower_distance2 <= actual_distance2,
+            region.lower_bound <= actual_distance2,
             "pruning bound {} exceeds closest triangle interior {actual_distance2}",
-            region.lower_distance2
+            region.lower_bound
         );
     }
 
@@ -4173,7 +4113,7 @@ mod tests {
                                     min_height: min_h,
                                     max_height: max_h,
                                 };
-                                let region = ProjectionRegion::new(
+                                let region = RankedRegion::projection(
                                     FaceRegion::new(face, x0, x1, y0, y1),
                                     &query,
                                 );
@@ -4181,11 +4121,11 @@ mod tests {
                                 for &point in &mesh_points {
                                     let d2 = point.distance_squared(query_point);
                                     assert!(
-                                        region.lower_distance2 <= d2 + 1.0e-9,
+                                        region.lower_bound <= d2 + 1.0e-9,
                                         "region bound {} > point distance {d2}; \
 face={face:?}, res={resolution}, rect=({x0},{x1},{y0},{y1}), \
 heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
-                                        region.lower_distance2
+                                        region.lower_bound
                                     );
                                 }
                             }
