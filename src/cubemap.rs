@@ -734,8 +734,8 @@ impl Coords {
     fn face_position(&self, resolution: u32, local: na::Point2<f64>) -> na::Point2<f64> {
         let scale = f64::from(resolution);
         na::Point2::new(
-            centered_axis(f64::from(self.x) * 2.0 - scale, scale, local.x),
-            centered_axis(f64::from(self.y) * 2.0 - scale, scale, local.y),
+            centered_axis(centered_origin(self.x, resolution), scale, local.x),
+            centered_axis(centered_origin(self.y, resolution), scale, local.y),
         )
     }
 
@@ -908,8 +908,14 @@ impl<T> IndexMut<Edge> for [T] {
 // The factors of two are exact for finite normalized coordinates and u32
 // indices. Keep cancellation before the division so even the deepest cells
 // adjacent to a face center remain distinguishable.
+fn centered_origin(index: u32, resolution: u32) -> f64 {
+    // Both u32 operands are exactly representable in f64, as is their sum or difference.
+    let index = f64::from(index);
+    (index - f64::from(resolution)) + index
+}
+
 fn centered_axis(origin: f64, scale: f64, local: f64) -> f64 {
-    (origin + local * 2.0) / scale
+    (origin + (local + local)) / scale
 }
 
 /// Scanline grid shared by scalar and SIMD samplers. Increment the cell
@@ -929,8 +935,8 @@ impl SampleGrid {
     fn new(coords: Coords, face_resolution: u32, side: u32) -> Self {
         let scale = f64::from(face_resolution);
         let origin = na::Point2::new(
-            f64::from(coords.x) * 2.0 - scale,
-            f64::from(coords.y) * 2.0 - scale,
+            centered_origin(coords.x, face_resolution),
+            centered_origin(coords.y, face_resolution),
         );
         Self {
             origin,
