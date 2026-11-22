@@ -506,6 +506,59 @@ impl Face {
     }
 }
 
+// Conservative rounding allowance in unit-direction and unit-grid space.
+const ANGULAR_ROUNDOFF: f64 = 64.0 * f64::EPSILON;
+
+fn face_to_grid(x: f64) -> f64 {
+    unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0).clamp(0.0, 1.0)
+}
+
+// Range of one component of a unit vector inside an angular cap.
+// The extrema may be at the +/- cardinal directions, not the rim.
+fn cap_range(axis: f64, transverse: f64, cos: f64, sin: f64) -> (f64, f64) {
+    let perpendicular = transverse * sin;
+    let min = if -axis >= cos {
+        -1.0
+    } else {
+        axis.mul_add(cos, -perpendicular)
+    };
+    let max = if axis >= cos {
+        1.0
+    } else {
+        axis.mul_add(cos, perpendicular)
+    };
+    (min, max)
+}
+
+// Exact maximum angular dot product for points in the face's
+// projective square. The maximum is attained at an interior point,
+// a stationary point on one of its four edges, or a corner.
+fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
+    if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
+        return 1.0;
+    }
+    let mut best = f64::NEG_INFINITY;
+    let mut consider = |x: f64, y: f64| {
+        let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
+        let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
+        best = best.max(dot / length);
+    };
+    for edge in [-1.0, 1.0] {
+        for corner in [-1.0, 1.0] {
+            consider(edge, corner);
+        }
+        let x_edge = direction.x.mul_add(edge, direction.z);
+        if x_edge > 0.0 {
+            consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
+        }
+        let y_edge = direction.y.mul_add(edge, direction.z);
+        if y_edge > 0.0 {
+            consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
+        }
+    }
+    best
+}
+
 /// Coordinates in a discretized cubemap
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Coords {
@@ -596,56 +649,6 @@ impl Coords {
         direction: na::Vector3<f64>,
         theta: f64,
     ) -> impl Iterator<Item = Self> {
-        fn to_grid(x: f64) -> f64 {
-            unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0).clamp(0.0, 1.0)
-        }
-
-        // Range of one component of a unit vector inside an angular cap.
-        // The extrema may be at the +/- cardinal directions, not the rim.
-        fn cap_range(axis: f64, transverse: f64, cos: f64, sin: f64) -> (f64, f64) {
-            let perpendicular = transverse * sin;
-            let min = if -axis >= cos {
-                -1.0
-            } else {
-                axis.mul_add(cos, -perpendicular)
-            };
-            let max = if axis >= cos {
-                1.0
-            } else {
-                axis.mul_add(cos, perpendicular)
-            };
-            (min, max)
-        }
-
-        // Exact maximum angular dot product for points in the face's
-        // projective square. The maximum is attained at an interior point,
-        // a stationary point on one of its four edges, or a corner.
-        fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
-            if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
-                return 1.0;
-            }
-            let mut best = f64::NEG_INFINITY;
-            let mut consider = |x: f64, y: f64| {
-                let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
-                let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
-                best = best.max(dot / length);
-            };
-            for edge in [-1.0, 1.0] {
-                for corner in [-1.0, 1.0] {
-                    consider(edge, corner);
-                }
-                let x_edge = direction.x.mul_add(edge, direction.z);
-                if x_edge > 0.0 {
-                    consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
-                }
-                let y_edge = direction.y.mul_add(edge, direction.z);
-                if y_edge > 0.0 {
-                    consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
-                }
-            }
-            best
-        }
-
         let valid = resolution != 0 && theta.is_finite() && theta >= 0.0;
         // Scale first: normalization must also work for finite vectors whose
         // squared norm would overflow or underflow.
@@ -657,7 +660,7 @@ impl Coords {
         };
         // Roundoff at the cap/face or cap/cell boundary must not discard
         // geometrically touching cells.
-        let angle = (theta + 64.0 * f64::EPSILON).min(std::f64::consts::PI);
+        let angle = (theta + ANGULAR_ROUNDOFF).min(std::f64::consts::PI);
         let (sin, cos) = angle.sin_cos();
         Face::iter()
             .filter_map(move |face| {
@@ -669,16 +672,16 @@ impl Coords {
                 // Reject faces that the cone cannot physically reach. Without
                 // this check, a tiny cone near a face's horizon could scan
                 // every texel of that face due to the 1/z projection.
-                if face_max_dot(local) < cos - 64.0 * f64::EPSILON {
+                if face_max_dot(local) < cos - ANGULAR_ROUNDOFF {
                     return None;
                 }
                 let (lo_x, hi_x) = cap_range(local.x, local.y.hypot(local.z), cos, sin);
                 let (lo_y, hi_y) = cap_range(local.y, local.x.hypot(local.z), cos, sin);
                 let (lo_z, hi_z) = cap_range(local.z, local.x.hypot(local.y), cos, sin);
-                if hi_z < -64.0 * f64::EPSILON {
+                if hi_z < -ANGULAR_ROUNDOFF {
                     return None;
                 }
-                let ((x_min, y_min), (x_max, y_max)) = if lo_z <= 64.0 * f64::EPSILON {
+                let ((x_min, y_min), (x_max, y_max)) = if lo_z <= ANGULAR_ROUNDOFF {
                     // The cone touches the projection horizon; even finite
                     // component bounds can correspond to unbounded x/z,y/z.
                     ((-1.0, -1.0), (1.0, 1.0))
@@ -690,25 +693,25 @@ impl Coords {
                         (ratio_max(hi_x), ratio_max(hi_y)),
                     )
                 };
-                if x_min > 1.0 + 64.0 * f64::EPSILON
-                    || y_min > 1.0 + 64.0 * f64::EPSILON
-                    || x_max < -1.0 - 64.0 * f64::EPSILON
-                    || y_max < -1.0 - 64.0 * f64::EPSILON
+                if x_min > 1.0 + ANGULAR_ROUNDOFF
+                    || y_min > 1.0 + ANGULAR_ROUNDOFF
+                    || x_max < -1.0 - ANGULAR_ROUNDOFF
+                    || y_max < -1.0 - ANGULAR_ROUNDOFF
                 {
                     return None;
                 }
                 let (x0, y0) = discretize(
                     resolution,
                     na::Point2::new(
-                        to_grid(x_min) - 64.0 * f64::EPSILON,
-                        to_grid(y_min) - 64.0 * f64::EPSILON,
+                        face_to_grid(x_min) - ANGULAR_ROUNDOFF,
+                        face_to_grid(y_min) - ANGULAR_ROUNDOFF,
                     ),
                 );
                 let (x1, y1) = discretize(
                     resolution,
                     na::Point2::new(
-                        to_grid(x_max) + 64.0 * f64::EPSILON,
-                        to_grid(y_max) + 64.0 * f64::EPSILON,
+                        face_to_grid(x_max) + ANGULAR_ROUNDOFF,
+                        face_to_grid(y_max) + ANGULAR_ROUNDOFF,
                     ),
                 );
                 Some((face, x0, x1, y0, y1))
@@ -730,7 +733,8 @@ impl Coords {
 
     fn face_position(&self, resolution: u32, local: na::Point2<f64>) -> na::Point2<f64> {
         let scale = f64::from(resolution);
-        let centered = |index, uv: f64| (f64::from(index).mul_add(2.0, -scale) + uv * 2.0) / scale;
+        let centered =
+            |index, uv: f64| uv.mul_add(2.0, f64::from(index).mul_add(2.0, -scale)) / scale;
         na::Point2::new(centered(self.x, local.x), centered(self.y, local.y))
     }
 

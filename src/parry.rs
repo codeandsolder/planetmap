@@ -333,7 +333,7 @@ impl Planet {
         // Both triangle interiors and displaced vertices lie in this
         // patch's angular cone; unlike the sample vertex radii, its
         // projected radial minimum is conservative for triangle chords.
-        let (_, min_cos) = ProjectionRegion::cone(
+        let cone = DirectionCone::from_region(
             chunk_coords.face,
             chunk_coords.x,
             chunk_coords.x + 1,
@@ -342,12 +342,7 @@ impl Planet {
             self.face_resolution,
         );
         let min_height = f64::from(data.min);
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let minimum_radius = self.radius.mul_add(min_cos, min_height_projection);
+        let minimum_radius = cone.minimum_radius(self.radius, min_height);
         if outer_displaced_radius(self.radius, f64::from(data.min), f64::from(data.max))
             + bounds.radius()
             < distance
@@ -619,54 +614,6 @@ struct RayRegion {
     lower_time: f64,
 }
 
-/// Conservative local AABB of a displaced angular cone, shared by ray and pair traversal.
-fn displaced_cone_aabb(
-    axis: Vector,
-    min_cos: f64,
-    radial_min: f64,
-    radial_max: f64,
-    pad: Vector,
-) -> Aabb {
-    if radial_min <= 0.0 {
-        // An unusually deep inward displacement can invalidate angular
-        // bounds. A full containing cube remains correct and eventually
-        // subdivides to narrower, positive-radius regions.
-        Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
-    } else {
-        let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-        let component_bounds = |component: f64| {
-            let perpendicular = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
-            let min_component = if -component >= min_cos {
-                -1.0
-            } else {
-                component.mul_add(min_cos, -perpendicular)
-            };
-            let max_component = if component >= min_cos {
-                1.0
-            } else {
-                component.mul_add(min_cos, perpendicular)
-            };
-            let lower = min_component
-                * if min_component >= 0.0 {
-                    radial_min
-                } else {
-                    radial_max
-                };
-            let upper = max_component
-                * if max_component >= 0.0 {
-                    radial_max
-                } else {
-                    radial_min
-                };
-            (lower, upper)
-        };
-        let (lx, ux) = component_bounds(axis.x);
-        let (ly, uy) = component_bounds(axis.y);
-        let (lz, uz) = component_bounds(axis.z);
-        Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
-    }
-}
-
 impl RayRegion {
     #[expect(
         clippy::too_many_arguments,
@@ -685,7 +632,7 @@ impl RayRegion {
         ray: &Ray,
         max_toi: f64,
     ) -> Option<Self> {
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
+        let cone = DirectionCone::from_region(face, x0, x1, y0, y1, resolution);
         let region = ProjectionRegion {
             face,
             x0,
@@ -694,17 +641,12 @@ impl RayRegion {
             y1,
             lower_distance2: 0.0,
         };
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let radial_min = radius.mul_add(min_cos, min_height_projection);
+        let radial_min = cone.minimum_radius(radius, min_height);
         let radial_max = outer_displaced_radius(radius, min_height, max_height);
         let pad = Vector::splat(
             256.0 * f64::EPSILON * (radial_max + ray.origin.abs().max_element() + radius),
         );
-        let aabb = displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad);
+        let aabb = cone.aabb(radial_min, radial_max, pad);
         let lower_time = aabb.cast_local_ray(ray, max_toi, true)?;
         Some(Self { region, lower_time })
     }
@@ -1009,46 +951,130 @@ struct ProjectionQuery {
     max_height: f64,
 }
 
-impl ProjectionRegion {
-    /// Conservative cone of directions containing all displaced triangle
-    /// interiors of the cubemap rectangle, independent of terrain heights.
-    fn cone(
+/// A conservative unit-direction cone, represented by its maximum chord.
+/// Unlike cosine alone, this remains well-conditioned as the aperture
+/// approaches zero (e.g. millimetre tiles on a planetary-scale sphere).
+#[derive(Clone, Copy, Debug)]
+struct DirectionCone {
+    axis: Vector,
+    chord: f64,
+}
+
+impl DirectionCone {
+    // Allow for normalization, warp, and vector arithmetic rounding at the
+    // unit-sphere scale, rather than inflating every angle by sqrt(epsilon).
+    const ROUNDOFF: f64 = 64.0 * f64::EPSILON;
+
+    fn from_region(
         face: crate::cubemap::Face,
         x0: u32,
         x1: u32,
         y0: u32,
         y1: u32,
         resolution: u32,
-    ) -> (Vector, f64) {
-        let scale = 2.0 / f64::from(resolution);
+    ) -> Self {
+        let scale = f64::from(resolution);
         let face_direction = |x: f64, y: f64| {
             let d = face.direction(&na::Point2::new(
-                x.mul_add(scale, -1.0),
-                y.mul_add(scale, -1.0),
+                x.mul_add(2.0, -scale) / scale,
+                y.mul_add(2.0, -scale) / scale,
             ));
             Vector::new(d.x, d.y, d.z)
         };
-        let center = face_direction(
+        let axis = face_direction(
             f64::from(x0).midpoint(f64::from(x1)),
             f64::from(y0).midpoint(f64::from(y1)),
         );
-        // All unit directions in this warped cubemap rectangle lie inside
-        // the positive cone spanned by its four corners. For our centered
-        // axis, the minimum dot product over that cone is bounded by the
-        // minimum over its corners (the normalization can only increase a
-        // positive center dot product of a convex combination).
-        let mut min_cos = 1.0_f64;
+        // The warped projective rectangle is in the positive cone of its
+        // corners. Normalizing a convex combination cannot decrease its
+        // positive axis dot below the minimum corner dot.
+        let mut chord = 0.0_f64;
         for x in [x0, x1] {
             for y in [y0, y1] {
-                min_cos = min_cos.min(center.dot(face_direction(f64::from(x), f64::from(y))));
+                chord = chord.max(axis.distance(face_direction(f64::from(x), f64::from(y))));
             }
         }
-        // Account for rounding of warp, the face rotation, and corner dot
-        // products when using the bound to prune an entire subtree.
-        min_cos = 64.0f64.mul_add(-f64::EPSILON, min_cos).clamp(0.0, 1.0);
-        (center, min_cos)
+        Self {
+            axis,
+            chord: (chord + Self::ROUNDOFF).min(2.0),
+        }
     }
 
+    fn cosine(self) -> f64 {
+        (-0.5 * self.chord).mul_add(self.chord, 1.0)
+    }
+
+    fn half_cosine(self) -> f64 {
+        (-0.25 * self.chord)
+            .mul_add(self.chord, 1.0)
+            .max(0.0)
+            .sqrt()
+    }
+
+    /// Conservative radial lower bound, including chord sag and negative
+    /// displacement. A nonpositive bound means angular clipping is unsafe.
+    fn minimum_radius(self, radius: f64, min_height: f64) -> f64 {
+        let cos = (self.cosine() - Self::ROUNDOFF).max(0.0);
+        let height = if min_height >= 0.0 {
+            min_height * cos
+        } else {
+            min_height
+        };
+        radius.mul_add(cos, height)
+    }
+
+    /// Smallest unit-direction chord separating a query direction from the
+    /// cone. Use the half-angle subtraction identity, without subtracting
+    /// nearly equal dot products or taking acos near one.
+    fn separation_chord(self, direction: Vector) -> f64 {
+        let sin_half = 0.5 * self.axis.distance(direction);
+        let cos_half = 0.5 * (self.axis + direction).length();
+        let difference = sin_half.mul_add(self.half_cosine(), -cos_half * 0.5 * self.chord);
+        difference.mul_add(2.0, -Self::ROUNDOFF).max(0.0)
+    }
+
+    /// Support of the cone with any radius in the supplied interval.
+    fn radial_interval(self, direction: Vector, min_radius: f64, max_radius: f64) -> (f64, f64) {
+        if min_radius <= 0.0 {
+            return (-max_radius, max_radius);
+        }
+        let cosine = self.cosine();
+        let transverse = self.axis.cross(direction).length() * self.chord * self.half_cosine();
+        let center = self.axis.dot(direction).clamp(-1.0, 1.0);
+        let low = if (self.axis + direction).length() <= self.chord {
+            -1.0
+        } else {
+            center.mul_add(cosine, -transverse) - Self::ROUNDOFF
+        }
+        .max(-1.0);
+        let high = if self.axis.distance(direction) <= self.chord {
+            1.0
+        } else {
+            center.mul_add(cosine, transverse) + Self::ROUNDOFF
+        }
+        .min(1.0);
+        (
+            low * if low >= 0.0 { min_radius } else { max_radius },
+            high * if high >= 0.0 { max_radius } else { min_radius },
+        )
+    }
+
+    fn rotated(self, pose: &Pose) -> Self {
+        Self {
+            axis: pose.rotation * self.axis,
+            ..self
+        }
+    }
+
+    fn aabb(self, min_radius: f64, max_radius: f64, pad: Vector) -> Aabb {
+        let (lx, ux) = self.radial_interval(Vector::X, min_radius, max_radius);
+        let (ly, uy) = self.radial_interval(Vector::Y, min_radius, max_radius);
+        let (lz, uz) = self.radial_interval(Vector::Z, min_radius, max_radius);
+        Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
+    }
+}
+
+impl ProjectionRegion {
     fn new(
         face: crate::cubemap::Face,
         x0: u32,
@@ -1057,21 +1083,8 @@ impl ProjectionRegion {
         y1: u32,
         query: &ProjectionQuery,
     ) -> Self {
-        let (center, min_cos) = Self::cone(face, x0, x1, y0, y1, query.resolution);
-        // A displaced vertex is R*v + h*normalize(v), where v is a convex
-        // combination of the face's unit corner directions. The dot product
-        // with the cone axis is at least R*min_cos plus h*min_cos for h>=0
-        // (or h itself for negative h). Every point inside a triangle is
-        // itself a convex combination of its displaced vertices, so this
-        // remains a valid radial *lower* bound for triangle interiors.
-        // Bounding only vertex lengths would be unsound: a raised flat
-        // triangle's interior can lie much closer to the planet center.
-        let min_height_projection = if query.min_height >= 0.0 {
-            query.min_height * min_cos
-        } else {
-            query.min_height
-        };
-        let min_radius = query.planet_radius.mul_add(min_cos, min_height_projection);
+        let cone = DirectionCone::from_region(face, x0, x1, y0, y1, query.resolution);
+        let min_radius = cone.minimum_radius(query.planet_radius, query.min_height);
         let max_radius =
             outer_displaced_radius(query.planet_radius, query.min_height, query.max_height);
         let lower_distance2 = if min_radius <= 0.0 {
@@ -1080,22 +1093,14 @@ impl ProjectionRegion {
             // triangle points have a positive radius in the cone.
             0.0
         } else {
-            let cos_center = center.dot(query.query_axis).clamp(-1.0, 1.0);
-            let cos_distance = if cos_center >= min_cos {
-                1.0
-            } else {
-                let sin_center = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
-                let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-                cos_center.mul_add(min_cos, sin_center * sin_cone).min(1.0)
-            };
-            // Closest possible radius at this angular distance, clamped to
-            // the global height envelope and chord sag of this region.
+            let chord = cone.separation_chord(query.query_axis);
+            let chord_squared = chord * chord;
+            let cos_distance = (-0.5 * chord).mul_add(chord, 1.0);
+            // Squared distance = radial delta squared + product of the
+            // radii times chord squared. Avoid cancellation at small angles.
             let radius = (query.query_radius * cos_distance).clamp(min_radius, max_radius);
             let delta = query.query_radius - radius;
-            let bound2 = delta.mul_add(
-                delta,
-                2.0 * query.query_radius * radius * (1.0 - cos_distance),
-            );
+            let bound2 = delta.mul_add(delta, query.query_radius * radius * chord_squared);
             let rounding =
                 128.0 * f64::EPSILON * (query.query_radius + max_radius + query.planet_radius);
             (bound2.max(0.0).sqrt() - rounding).max(0.0).powi(2)
@@ -2030,35 +2035,11 @@ impl PlaneSupportRegion {
         normal: Vector,
     ) -> Self {
         let resolution = planet.face_resolution;
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
+        let cone = DirectionCone::from_region(face, x0, x1, y0, y1, resolution);
         let min_height = f64::from(planet.min_height);
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let min_radius = planet.radius.mul_add(min_cos, min_height_projection);
+        let min_radius = cone.minimum_radius(planet.radius, min_height);
         let max_radius = planet.max_radius();
-        let cos_center = axis.dot(normal).clamp(-1.0, 1.0);
-        let min_direction_dot = if -cos_center >= min_cos {
-            -1.0
-        } else {
-            let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
-            let aperture = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-            cos_center
-                .mul_add(min_cos, -transverse * aperture)
-                .max(-1.0)
-        };
-        let minimum = if min_radius <= 0.0 {
-            // An inward-flipped triangle is no longer confined to this
-            // positive angular cone. The enclosing planet sphere remains
-            // a conservative bound on every possible projected component.
-            -max_radius
-        } else if min_direction_dot >= 0.0 {
-            min_direction_dot * min_radius
-        } else {
-            min_direction_dot * max_radius
-        };
+        let (minimum, _) = cone.radial_interval(normal, min_radius, max_radius);
         let slack = 512.0 * f64::EPSILON * (max_radius + planet.radius);
         Self {
             region: ProjectionRegion {
@@ -2292,8 +2273,7 @@ struct PatchBounds {
     aabb: Aabb,
     // Shape1 frame; the cone contains all displaced triangle interiors.
     origin: Vector,
-    cone_axis: Vector,
-    cone_cos: f64,
+    cone: DirectionCone,
     radial_min: f64,
     radial_max: f64,
     sphere_center: Vector,
@@ -2311,15 +2291,10 @@ impl PatchBounds {
         y0: u32,
         y1: u32,
     ) -> Self {
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, planet.face_resolution);
+        let cone = DirectionCone::from_region(face, x0, x1, y0, y1, planet.face_resolution);
         let min_height = f64::from(planet.min_height);
         let max_height = f64::from(planet.max_height);
-        let min_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let radial_min = planet.radius.mul_add(min_cos, min_projection);
+        let radial_min = cone.minimum_radius(planet.radius, min_height);
         let radial_max = outer_displaced_radius(planet.radius, min_height, max_height);
         let pad = Vector::splat(
             512.0
@@ -2328,28 +2303,23 @@ impl PatchBounds {
         );
         // Convexity of the squared distance to a point on the cone axis
         // makes the extremal radial value occur at an endpoint.
-        let cone_axis = pose.rotation * axis;
+        let world_cone = cone.rotated(pose);
         let (sphere_center, sphere_radius) = if radial_min <= 0.0 {
             (pose.translation, radial_max + pad.x)
         } else {
             let center_radius = radial_min.midpoint(radial_max);
             let radius_at = |radial: f64| {
-                radial
-                    .mul_add(
-                        radial,
-                        center_radius
-                            .mul_add(center_radius, -2.0 * radial * center_radius * min_cos),
-                    )
-                    .max(0.0)
+                let delta = radial - center_radius;
+                delta
+                    .mul_add(delta, radial * center_radius * cone.chord.powi(2))
                     .sqrt()
             };
             (
-                pose.translation + cone_axis * center_radius,
+                pose.translation + world_cone.axis * center_radius,
                 radius_at(radial_min).max(radius_at(radial_max)) + pad.x,
             )
         };
-        let aabb =
-            displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad).transform_by(pose);
+        let aabb = cone.aabb(radial_min, radial_max, pad).transform_by(pose);
         Self {
             region: ProjectionRegion {
                 face,
@@ -2361,8 +2331,7 @@ impl PatchBounds {
             },
             aabb,
             origin: pose.translation,
-            cone_axis,
-            cone_cos: min_cos,
+            cone: world_cone,
             radial_min,
             radial_max,
             sphere_center,
@@ -2375,37 +2344,9 @@ impl PatchBounds {
     /// along a unit world direction. Inverted cones use the outer sphere.
     fn support_interval(&self, direction: Vector) -> (f64, f64) {
         let shift = self.origin.dot(direction);
-        if self.radial_min <= 0.0 {
-            return (
-                shift - self.radial_max - self.padding,
-                shift + self.radial_max + self.padding,
-            );
-        }
-        let cos_center = self.cone_axis.dot(direction).clamp(-1.0, 1.0);
-        let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt()
-            * self.cone_cos.mul_add(-self.cone_cos, 1.0).max(0.0).sqrt();
-        let min_direction = if -cos_center >= self.cone_cos {
-            -1.0
-        } else {
-            cos_center.mul_add(self.cone_cos, -transverse).max(-1.0)
-        };
-        let max_direction = if cos_center >= self.cone_cos {
-            1.0
-        } else {
-            cos_center.mul_add(self.cone_cos, transverse).min(1.0)
-        };
-        let low = min_direction
-            * if min_direction >= 0.0 {
-                self.radial_min
-            } else {
-                self.radial_max
-            };
-        let high = max_direction
-            * if max_direction >= 0.0 {
-                self.radial_max
-            } else {
-                self.radial_min
-            };
+        let (low, high) = self
+            .cone
+            .radial_interval(direction, self.radial_min, self.radial_max);
         (shift + low - self.padding, shift + high + self.padding)
     }
 
@@ -4231,6 +4172,62 @@ mod tests {
             } else {
                 assert_relative_eq!(solid.point.x, face, epsilon = 1.0e-10);
                 assert!(planet.distance_to_local_point(point, false) > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_patch_bounds_remain_tight_and_enclose_real_geometry() {
+        const RADIUS: f64 = 6_371_000.0;
+        const RESOLUTION: u32 = 1 << 31;
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(RESOLUTION, 3).unwrap()),
+            1,
+            RADIUS,
+        )
+        .unwrap();
+        for face in Face::iter() {
+            for (x, y) in [
+                (0, 0),
+                (RESOLUTION / 2, RESOLUTION / 2),
+                (RESOLUTION - 1, RESOLUTION - 1),
+            ] {
+                let coords = Coords { face, x, y };
+                let bounds = PatchBounds::new(&planet, &Pose::IDENTITY, face, x, x + 1, y, y + 1);
+                assert!(
+                    (bounds.aabb.maxs - bounds.aabb.mins).length() < 0.03,
+                    "{bounds:?}"
+                );
+                assert!(bounds.sphere_radius < 0.02, "{bounds:?}");
+                let patch = Patch::new(&coords, RESOLUTION);
+                for (_, triangle) in patch.triangles(RADIUS, 3, &[0.0; 9]) {
+                    for point in [
+                        triangle.a,
+                        triangle.b,
+                        triangle.c,
+                        (triangle.a + triangle.b + triangle.c) / 3.0,
+                    ] {
+                        assert!(
+                            bounds.aabb.mins.cmple(point).all()
+                                && bounds.aabb.maxs.cmpge(point).all(),
+                            "{point:?} outside {bounds:?}"
+                        );
+                        assert!(bounds.sphere_center.distance(point) <= bounds.sphere_radius);
+                        for direction in [
+                            Vector::X,
+                            Vector::Y,
+                            Vector::Z,
+                            Vector::new(1.0, 2.0, -3.0).normalize(),
+                        ] {
+                            let (lo, hi) = bounds.support_interval(direction);
+                            let projected = direction.dot(point);
+                            assert!(
+                                lo <= projected && projected <= hi,
+                                "{lo} <= {projected} <= {hi}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
