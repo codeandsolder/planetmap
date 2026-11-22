@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(feature = "parry")]
 use parry3d_f64::{
     math::{Pose, Vector},

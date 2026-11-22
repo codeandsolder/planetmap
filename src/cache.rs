@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use slab::Slab;
 
-use crate::cubemap::{Edge, Face};
 use crate::Chunk;
+use crate::cubemap::{Edge, Face};
 
 struct Slot {
     chunk: Chunk,

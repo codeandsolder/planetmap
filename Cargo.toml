@@ -2,15 +2,16 @@
 name = "planetmap"
 version = "0.1.0"
 authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
-license = "MIT/Apache-2.0"
-edition = "2021"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.100"
 readme = "README.md"
 
 [package.metadata.docs.rs]
 all-features = true
 
 [features]
-parry = ["parry3d-f64", "lru-slab"]
+parry = ["dep:parry3d-f64", "dep:lru-slab"]
 fearless_simd = ["dep:fearless_simd"]
 
 [dependencies]

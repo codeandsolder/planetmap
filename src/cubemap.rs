@@ -1140,10 +1140,11 @@ mod test {
         for (index, value) in refs.iter_mut().enumerate() {
             **value = u32::try_from(index).unwrap();
         }
-        assert!(map
-            .iter()
-            .enumerate()
-            .all(|(index, (_, value))| { usize::try_from(*value) == Ok(index) }));
+        assert!(
+            map.iter()
+                .enumerate()
+                .all(|(index, (_, value))| { usize::try_from(*value) == Ok(index) })
+        );
     }
 
     #[test]
@@ -1162,14 +1163,18 @@ mod test {
                 y,
                 face: Face::Px,
             };
-            assert!(std::panic::catch_unwind(|| {
-                let _ = map[invalid];
-            })
-            .is_err());
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                map[invalid] = 99;
-            }))
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _ = map[invalid];
+                })
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    map[invalid] = 99;
+                }))
+                .is_err()
+            );
         }
         assert_eq!(map[valid], 42);
         assert_eq!(
@@ -1242,12 +1247,15 @@ mod test {
             -na::Vector3::x_axis(),
             -na::Vector3::y_axis(),
             -na::Vector3::z_axis(),
-            na::Unit::new_normalize(na::Vector3::new(1.0, 1.0, 1.0)),
         ] {
             let index = index(RES, dir);
             let out = get_dir(RES, index).unwrap();
             assert_eq!(dir, &out);
         }
+        // A cube corner lies on a cell boundary, not at a dense cell center.
+        let corner = na::Unit::new_normalize(na::Vector3::new(1.0, 1.0, 1.0));
+        let cell = index(RES, &corner);
+        assert_eq!(index(RES, &get_dir(RES, cell).unwrap()), cell);
     }
 
     #[test]

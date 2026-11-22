@@ -7,12 +7,11 @@
 use std::{
     collections::BinaryHeap,
     sync::{
-        atomic::{AtomicU8, Ordering as AtomicOrdering},
         Arc, Mutex, OnceLock,
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
 };
 
-use hashbrown::hash_map;
 use hashbrown::HashMap;
 use lru_slab::LruSlab;
 use parry3d_f64::{
@@ -20,11 +19,11 @@ use parry3d_f64::{
     mass_properties::MassProperties,
     math::{Matrix, Pose, Real, Vec2, Vector},
     query::{
-        details::NormalConstraints, ClosestPoints, Contact, ContactManifold,
-        ContactManifoldsWorkspace, DefaultQueryDispatcher, NonlinearRigidMotion,
-        PersistentQueryDispatcher, PointProjection, PointQuery, QueryDispatcher, Ray, RayCast,
-        RayIntersection, ShapeCastHit, ShapeCastOptions, ShapeDistance, ShapeIntersection,
-        TypedWorkspaceData, Unsupported, WorkspaceData,
+        ClosestPoints, Contact, ContactManifold, ContactManifoldsWorkspace, DefaultQueryDispatcher,
+        NonlinearRigidMotion, PersistentQueryDispatcher, PointProjection, PointQuery,
+        QueryDispatcher, Ray, RayCast, RayIntersection, ShapeCastHit, ShapeCastOptions,
+        ShapeCastStatus, ShapeDistance, ShapeIntersection, TypedWorkspaceData, Unsupported,
+        WorkspaceData, details::NormalConstraints,
     },
     shape::{
         CompositeShape, FeatureId, HalfSpace, Shape, ShapeType, SubShapeId, Triangle, TypedShape,
@@ -43,7 +42,11 @@ const fn na3f32(v: Vector) -> na::Vector3<f32> {
     na::Vector3::new(v.x as f32, v.y as f32, v.z as f32)
 }
 
-/// Height data source for `Planet`
+/// Height data source for `Planet`.
+///
+/// Geometry and bounds are fixed for each Planet. Samples for a coordinate must
+/// be deterministic, finite, and inside the advertised inclusive height range.
+/// Concurrent cache misses may sample the same coordinate independently.
 pub trait Terrain: Send + Sync + 'static {
     /// Generate a `resolution * resolution` grid of heights wrt. sea level
     fn sample(&self, coords: &Coords, out: &mut [f32]);
@@ -178,6 +181,9 @@ pub struct Planet {
     terrain: Arc<dyn Terrain>,
     radius: f64,
     chunk_resolution: u32,
+    face_resolution: u32,
+    min_height: f32,
+    max_height: f32,
     // Future work: could preallocate an arena for height samples
     cache: Mutex<Cache>,
 }
@@ -200,7 +206,8 @@ impl Planet {
         radius: f64,
     ) -> Result<Self, PlanetConfigError> {
         let chunk_resolution = terrain.chunk_resolution();
-        validate_terrain_geometry(terrain.face_resolution(), chunk_resolution)?;
+        let face_resolution = terrain.face_resolution();
+        validate_terrain_geometry(face_resolution, chunk_resolution)?;
         if cache_size == 0 {
             return Err(PlanetConfigError::CacheSize);
         }
@@ -228,6 +235,9 @@ impl Planet {
         }
         Ok(Self {
             chunk_resolution,
+            face_resolution,
+            min_height: min,
+            max_height: max,
             terrain,
             radius,
             cache: Mutex::new(Cache::new(cache_size)),
@@ -237,8 +247,8 @@ impl Planet {
     fn max_radius(&self) -> f64 {
         outer_displaced_radius(
             self.radius,
-            f64::from(self.terrain.min_height()),
-            f64::from(self.terrain.max_height()),
+            f64::from(self.min_height),
+            f64::from(self.max_height),
         )
     }
 
@@ -248,6 +258,23 @@ impl Planet {
                 .into_boxed_slice();
         self.terrain.sample(coords, &mut samples[..]);
         samples
+    }
+
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cached_chunk(&self, coords: &Coords) -> (u32, Arc<ChunkData>) {
+        if let Some(entry) = self.lock_cache().lookup(coords) {
+            return entry;
+        }
+        // Application code runs without the mutex. A concurrent caller may
+        // populate the same coordinate first; deterministic samples make
+        // either result equivalent.
+        let data = Arc::new(ChunkData::new(*coords, self.sample(coords)));
+        self.lock_cache().insert(data)
     }
 
     /// Number of triangles in a single chunk, i.e. the stride between chunk slots in
@@ -307,11 +334,7 @@ impl Planet {
         // Never call an application-provided callback with our cache lock
         // held. An Arc keeps the geometry alive even if a nested query
         // evicts this slot before the callback completes.
-        let (slot, data) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &chunk_coords);
+        let (slot, data) = self.cached_chunk(&chunk_coords);
         // Both triangle interiors and displaced vertices lie in this
         // patch's angular cone; unlike the sample vertex radii, its
         // projected radial minimum is conservative for triangle chords.
@@ -321,7 +344,7 @@ impl Planet {
             chunk_coords.x + 1,
             chunk_coords.y,
             chunk_coords.y + 1,
-            self.terrain.face_resolution(),
+            self.face_resolution,
         );
         let min_height = f64::from(data.min);
         let min_height_projection = if min_height >= 0.0 {
@@ -337,7 +360,7 @@ impl Planet {
         {
             return true;
         }
-        let patch = Patch::new(&chunk_coords, self.terrain.face_resolution());
+        let patch = Patch::new(&chunk_coords, self.face_resolution);
         let mut emit = |quad: Quad| {
             for (i, triangle) in quad
                 .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -426,9 +449,9 @@ impl Planet {
     ) {
         let dir = bounds.center();
         let distance = dir.length();
-        let min_height = f64::from(self.terrain.min_height());
-        let max_height = f64::from(self.terrain.max_height());
-        let face_resolution = self.terrain.face_resolution();
+        let min_height = f64::from(self.min_height);
+        let max_height = f64::from(self.max_height);
+        let face_resolution = self.face_resolution;
         // A full cube face has minimum axis projection 1/sqrt(3).
         // This bound covers triangle *interiors*, not only vertices.
         let inscribed = self.radius / 3.0_f64.sqrt()
@@ -726,12 +749,8 @@ impl Planet {
         max_toi: f64,
         solid: bool,
     ) -> Option<(u32, RayIntersection)> {
-        let (_, data) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
-        let patch = Patch::new(&coords, self.terrain.face_resolution());
+        let (_, data) = self.cached_chunk(&coords);
+        let patch = Patch::new(&coords, self.face_resolution);
         let padding = Vector::splat(
             256.0 * f64::EPSILON * (self.max_radius() + ray.origin.abs().max_element()),
         );
@@ -788,15 +807,15 @@ impl Planet {
         if ray.origin.dot(ray.dir) >= 0.0 && ray.origin.length() > self.max_radius() {
             return None;
         }
-        if self.radius / 3.0_f64.sqrt() + f64::from(self.terrain.min_height()) <= 0.0 {
+        if self.radius / 3.0_f64.sqrt() + f64::from(self.min_height) <= 0.0 {
             return None;
         }
         let end = ray.origin + ray.dir * max_toi;
         if !end.is_finite() {
             return None;
         }
-        let coords = Coords::from_vector(self.terrain.face_resolution(), &na3f32(ray.origin));
-        let patch = Patch::new(&coords, self.terrain.face_resolution());
+        let coords = Coords::from_vector(self.face_resolution, &na3f32(ray.origin));
+        let patch = Patch::new(&coords, self.face_resolution);
         let quad_resolution = self.chunk_resolution - 1;
         let uv = patch.project(&ray.origin) * f64::from(quad_resolution);
         #[expect(
@@ -825,11 +844,7 @@ impl Planet {
                 return None;
             }
         }
-        let (_, data) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (_, data) = self.cached_chunk(&coords);
         let mut closest: Option<(u32, RayIntersection)> = None;
         for (i, triangle) in quad
             .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -854,11 +869,7 @@ impl Planet {
             }
         }
         let (triangle, mut hit) = closest?;
-        let (slot, _) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (slot, _) = self.cached_chunk(&coords);
         hit.subshape = self.subshape_id(slot, triangle);
         Some(hit)
     }
@@ -882,9 +893,9 @@ impl RayCast for Planet {
         if let Some(hit) = self.cast_ray_inside_one_quad(ray, max_toi, solid) {
             return Some(hit);
         }
-        let resolution = self.terrain.face_resolution();
-        let min_height = f64::from(self.terrain.min_height());
-        let max_height = f64::from(self.terrain.max_height());
+        let resolution = self.face_resolution;
+        let min_height = f64::from(self.min_height);
+        let max_height = f64::from(self.max_height);
         let mut candidates = BinaryHeap::new();
         for face in crate::cubemap::Face::iter() {
             if let Some(region) = RayRegion::new(
@@ -961,11 +972,7 @@ impl RayCast for Planet {
             }
         }
         let (_, coords, tri_idx, mut hit) = closest?;
-        let (slot, _) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (slot, _) = self.cached_chunk(&coords);
         hit.subshape = self.subshape_id(slot, tri_idx);
         Some(hit)
     }
@@ -1156,11 +1163,7 @@ impl Planet {
         query_radius: f64,
         best: &mut Option<ProjectionWinner>,
     ) {
-        let (_, data) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (_, data) = self.cached_chunk(&coords);
         // Actual displaced quad vertices bound both triangles by their
         // AABB. Skip Parry's expensive projection unless that AABB can
         // beat the nearest triangle found so far.
@@ -1218,7 +1221,7 @@ impl Planet {
         } else {
             // Keep the API general for very large sample grids without
             // multiplying their persistent memory footprint by six.
-            let patch = Patch::new(&coords, self.terrain.face_resolution());
+            let patch = Patch::new(&coords, self.face_resolution);
             for quad in patch.quads(self.chunk_resolution) {
                 let corners = quad
                     .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -1306,7 +1309,7 @@ impl Planet {
         // convexly interpolated triangle interiors. For negative heights,
         // the worst possible projected height is the entire negative
         // displacement; for positive heights it is scaled by 1/sqrt(3).
-        let min_height = f64::from(self.terrain.min_height());
+        let min_height = f64::from(self.min_height);
         let inscribed = self.radius / 3.0_f64.sqrt()
             + if min_height >= 0.0 {
                 min_height / 3.0_f64.sqrt()
@@ -1344,7 +1347,7 @@ impl Planet {
         // by the ray from the planet center through the query. Tall cliffs,
         // patch boundaries, and points near the center can all have their
         // nearest surface on a different tile or even a different cube face.
-        let face_resolution = self.terrain.face_resolution();
+        let face_resolution = self.face_resolution;
         let query_radius = pt.length();
         if !query_radius.is_finite() {
             return (PointProjection::new(false, pt), FeatureId::Unknown);
@@ -1358,8 +1361,8 @@ impl Planet {
                 Vector::X
             },
             planet_radius: self.radius,
-            min_height: f64::from(self.terrain.min_height()),
-            max_height: f64::from(self.terrain.max_height()),
+            min_height: f64::from(self.min_height),
+            max_height: f64::from(self.max_height),
         };
         // The tuple retains the winning grid location rather than a cache
         // slot that may be evicted while visiting other patches.
@@ -1423,11 +1426,7 @@ impl Planet {
         // Classifying containment can sample a different chunk and evict
         // the nearest projection triangle from a small LRU. Assign its live
         // subshape only after all containment raycasts have completed.
-        let (slot, _) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (slot, _) = self.cached_chunk(&coords);
         projection.subshape = self.subshape_id(slot, triangle);
         (projection, feature)
     }
@@ -1518,27 +1517,25 @@ impl Cache {
         }
     }
 
-    pub fn get(&mut self, planet: &Planet, coords: &Coords) -> (u32, Arc<ChunkData>) {
-        let (slot, old) = match self.index.entry(*coords) {
-            hash_map::Entry::Occupied(e) => (*e.get(), None),
-            hash_map::Entry::Vacant(e) => {
-                // Terrain sampling invokes user code and may unwind. Complete it
-                // before changing the slot table or its reverse index.
-                let data = Arc::new(ChunkData::new(*coords, planet.sample(coords)));
-                let old = if self.slots.len() == self.max_size {
-                    self.slots.lru().map(|lru| self.slots.remove(lru).coords)
-                } else {
-                    None
-                };
-                let slot = self.slots.insert(data);
-                e.insert(slot);
-                (slot, old)
-            }
-        };
-        if let Some(old) = old {
-            self.index.remove(&old);
+    fn lookup(&mut self, coords: &Coords) -> Option<(u32, Arc<ChunkData>)> {
+        let slot = *self.index.get(coords)?;
+        Some((slot, Arc::clone(self.slots.get_mut(slot))))
+    }
+
+    fn insert(&mut self, data: Arc<ChunkData>) -> (u32, Arc<ChunkData>) {
+        if let Some(entry) = self.lookup(&data.coords) {
+            return entry;
         }
-        (slot, Arc::clone(self.slots.get_mut(slot)))
+        if self.slots.len() == self.max_size {
+            if let Some(lru) = self.slots.lru() {
+                let old = self.slots.remove(lru);
+                self.index.remove(&old.coords);
+            }
+        }
+        let coords = data.coords;
+        let slot = self.slots.insert(Arc::clone(&data));
+        self.index.insert(coords, slot);
+        (slot, data)
     }
 }
 
@@ -1751,7 +1748,7 @@ impl ChunkData {
     /// them. Raycasts and collision callbacks still use the original samples.
     fn projection_vertices(&self, planet: &Planet) -> &[Vector] {
         self.projection_vertices.get_or_init(|| {
-            let patch = Patch::new(&self.coords, planet.terrain.face_resolution());
+            let patch = Patch::new(&self.coords, planet.face_resolution);
             let resolution = planet.chunk_resolution;
             let quads = f64::from(resolution - 1);
             let mut vertices = Vec::with_capacity(self.samples.len());
@@ -1794,7 +1791,7 @@ impl Planet {
         } else {
             Vector::X
         };
-        let resolution = self.terrain.face_resolution();
+        let resolution = self.face_resolution;
         let coords = Coords::from_vector(resolution, &na3f32(axis));
         let patch = Patch::new(&coords, resolution);
         let side = self.chunk_resolution - 1;
@@ -1807,11 +1804,7 @@ impl Planet {
                 (uv.y.floor() as u32).min(side - 1),
             ),
         );
-        let (_, data) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (_, data) = self.cached_chunk(&coords);
         for (index, triangle) in quad
             .displace(self.radius, self.chunk_resolution, &data.samples)
             .triangles()
@@ -1846,7 +1839,7 @@ impl Planet {
     ) -> Option<bool> {
         let distance = bounds.center().length();
         let cap_radius = bounds.radius() + *max_distance;
-        let inscribed = self.radius / 3.0_f64.sqrt() + f64::from(self.terrain.min_height());
+        let inscribed = self.radius / 3.0_f64.sqrt() + f64::from(self.min_height);
         if inscribed <= 64.0 * f64::EPSILON * self.radius
             || !distance.is_finite()
             || distance <= cap_radius
@@ -1855,11 +1848,11 @@ impl Planet {
             return None;
         }
         let theta = (cap_radius / distance).asin();
-        if (theta + 2.0e-6) * f64::from(self.terrain.face_resolution()) > 2.0 {
+        if (theta + 2.0e-6) * f64::from(self.face_resolution) > 2.0 {
             return None;
         }
         let axis = na3f32(bounds.center() / distance);
-        let face_resolution = self.terrain.face_resolution();
+        let face_resolution = self.face_resolution;
         for coords in Coords::neighborhood(face_resolution, axis, (theta + 2.0e-6) as f32) {
             let rounding = 512.0
                 * f64::EPSILON
@@ -1897,12 +1890,8 @@ impl Planet {
         visitor: &mut impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
     ) -> bool {
         if max_distance.is_infinite() {
-            let patch = Patch::new(&coords, self.terrain.face_resolution());
-            let (_, data) = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(self, &coords);
+            let patch = Patch::new(&coords, self.face_resolution);
+            let (_, data) = self.cached_chunk(&coords);
             for quad in patch.quads(self.chunk_resolution) {
                 for (index, triangle) in quad
                     .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -1953,7 +1942,7 @@ impl Planet {
         let center = bounds.center();
         let center_radius = center.length();
         let query = ProjectionQuery {
-            resolution: self.terrain.face_resolution(),
+            resolution: self.face_resolution,
             query_axis: if center_radius > 0.0 {
                 center / center_radius
             } else {
@@ -1961,8 +1950,8 @@ impl Planet {
             },
             query_radius: center_radius,
             planet_radius: self.radius,
-            min_height: f64::from(self.terrain.min_height()),
-            max_height: f64::from(self.terrain.max_height()),
+            min_height: f64::from(self.min_height),
+            max_height: f64::from(self.max_height),
         };
         // The two seed triangles establish a finite, geometrically valid
         // upper bound without enumerating every triangle in a chunk.
@@ -2037,11 +2026,7 @@ impl Planet {
     /// Return the terrain subshape ID only once the winner is known; visiting
     /// other chunks can recycle LRU slots, especially with capacity one.
     fn stable_triangle_id(&self, coords: Coords, triangle: u32) -> SubShapeId {
-        let (slot, _) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self, &coords);
+        let (slot, _) = self.cached_chunk(&coords);
         self.subshape_id(slot, triangle)
     }
 }
@@ -2065,9 +2050,9 @@ impl PlaneSupportRegion {
         y1: u32,
         normal: Vector,
     ) -> Self {
-        let resolution = planet.terrain.face_resolution();
+        let resolution = planet.face_resolution;
         let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
-        let min_height = f64::from(planet.terrain.min_height());
+        let min_height = f64::from(planet.min_height);
         let min_height_projection = if min_height >= 0.0 {
             min_height * min_cos
         } else {
@@ -2172,7 +2157,7 @@ impl Planet {
             },
         );
         let mut regions = BinaryHeap::new();
-        let resolution = self.terrain.face_resolution();
+        let resolution = self.face_resolution;
         for face in crate::cubemap::Face::iter() {
             regions.push(PlaneSupportRegion::new(
                 self, face, 0, resolution, 0, resolution, normal,
@@ -2192,11 +2177,7 @@ impl Planet {
                     x: region.region.x0,
                     y: region.region.y0,
                 };
-                let (_, data) = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(self, &coords);
+                let (_, data) = self.cached_chunk(&coords);
                 let patch = Patch::new(&coords, resolution);
                 for quad in patch.quads(self.chunk_resolution) {
                     for (index, triangle) in quad
@@ -2351,10 +2332,9 @@ impl PairPatch {
         y0: u32,
         y1: u32,
     ) -> Self {
-        let (axis, min_cos) =
-            ProjectionRegion::cone(face, x0, x1, y0, y1, planet.terrain.face_resolution());
-        let min_height = f64::from(planet.terrain.min_height());
-        let max_height = f64::from(planet.terrain.max_height());
+        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, planet.face_resolution);
+        let min_height = f64::from(planet.min_height);
+        let max_height = f64::from(planet.max_height);
         let min_projection = if min_height >= 0.0 {
             min_height * min_cos
         } else {
@@ -2578,8 +2558,8 @@ fn visit_planet_pair_triangles(
         * f64::EPSILON
         * (first.max_radius() + second.max_radius() + pos12.translation.abs().max_element());
     let mut queue = BinaryHeap::new();
-    let res1 = first.terrain.face_resolution();
-    let res2 = second.terrain.face_resolution();
+    let res1 = first.face_resolution;
+    let res2 = second.face_resolution;
     for f1 in crate::cubemap::Face::iter() {
         let a = PairPatch::new(first, &Pose::IDENTITY, f1, 0, res1, 0, res1);
         for f2 in crate::cubemap::Face::iter() {
@@ -2664,19 +2644,18 @@ fn stable_planet_pair_ids(
     tri2: u32,
 ) -> Result<(SubShapeId, SubShapeId), Unsupported> {
     if std::ptr::eq(first, second) {
-        let mut cache = first
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if at1 != at2 && cache.max_size < 2 {
+        if at1 != at2 && first.lock_cache().max_size < 2 {
             return Err(Unsupported);
         }
-        let (slot1, _) = cache.get(first, &at1);
-        let slot2 = if at1 == at2 {
-            slot1
+        let (_, data1) = first.cached_chunk(&at1);
+        let data2 = if at1 == at2 {
+            Arc::clone(&data1)
         } else {
-            cache.get(first, &at2).0
+            first.cached_chunk(&at2).1
         };
+        let mut cache = first.lock_cache();
+        let (slot1, _) = cache.insert(data1);
+        let (slot2, _) = cache.insert(data2);
         Ok((
             first.subshape_id(slot1, tri1),
             first.subshape_id(slot2, tri2),
@@ -3275,6 +3254,29 @@ fn compute_toi(
     {
         return Err(Unsupported);
     }
+    if vel12 == Vector::ZERO {
+        if !options.stop_at_penetration {
+            return Ok(None);
+        }
+        return planet_shape_contact(pos12, planet, other, options.target_distance).map(
+            |contact| {
+                contact.map(|contact| ShapeCastHit {
+                    time_of_impact: 0.0,
+                    witness1: contact.point1,
+                    witness2: contact.point2,
+                    normal1: contact.normal1,
+                    normal2: contact.normal2,
+                    status: if contact.dist < options.target_distance {
+                        ShapeCastStatus::PenetratingOrWithinTargetDist
+                    } else {
+                        ShapeCastStatus::Converged
+                    },
+                    subshape1: contact.subshape1,
+                    subshape2: contact.subshape2,
+                })
+            },
+        );
+    }
     let start = other.compute_aabb(pos12);
     if !start.mins.is_finite() || !start.maxs.is_finite() {
         return Err(Unsupported);
@@ -3399,54 +3401,15 @@ where
         manifolds: &mut Vec<ContactManifold<ManifoldData, ContactData>>,
         workspace: &mut Option<ContactManifoldsWorkspace>,
     ) -> Result<(), Unsupported> {
-        // Do not report a successful empty manifold when the convex
-        // per-triangle dispatcher cannot accept another custom Planet.
-        if g1.as_shape::<Planet>().is_some() && g2.as_shape::<Planet>().is_some() {
-            return Err(Unsupported);
-        }
-        if let Some(p1) = g1.as_shape::<Planet>() {
-            if let Some(composite) = g2.as_composite_shape() {
-                compute_manifolds_vs_composite(
-                    pos12,
-                    &pos12.inverse(),
-                    p1,
-                    composite,
-                    prediction,
-                    manifolds,
-                    workspace,
-                    false,
-                );
-            } else {
-                compute_manifolds(pos12, p1, g2, prediction, manifolds, workspace, false);
-            }
-            return Ok(());
-        }
-        if let Some(p2) = g2.as_shape::<Planet>() {
-            if let Some(composite) = g1.as_composite_shape() {
-                compute_manifolds_vs_composite(
-                    &pos12.inverse(),
-                    pos12,
-                    p2,
-                    composite,
-                    prediction,
-                    manifolds,
-                    workspace,
-                    true,
-                );
-            } else {
-                compute_manifolds(
-                    &pos12.inverse(),
-                    p2,
-                    g1,
-                    prediction,
-                    manifolds,
-                    workspace,
-                    true,
-                );
-            }
-            return Ok(());
-        }
-        Err(Unsupported)
+        let (planet, other, pose, flipped) =
+            match (g1.as_shape::<Planet>(), g2.as_shape::<Planet>()) {
+                (Some(planet), None) => (planet, g2, *pos12, false),
+                (None, Some(planet)) => (planet, g1, pos12.inverse(), true),
+                _ => return Err(Unsupported),
+            };
+        compute_manifolds(
+            &pose, planet, other, prediction, manifolds, workspace, flipped,
+        )
     }
 
     fn contact_manifold_convex_convex(
@@ -3464,101 +3427,19 @@ where
     }
 }
 
-fn compute_manifolds<ManifoldData, ContactData>(
-    pos12: &Pose,
-    planet: &Planet,
-    other: &dyn Shape,
-    prediction: Real,
-    manifolds: &mut Vec<ContactManifold<ManifoldData, ContactData>>,
-    workspace: &mut Option<ContactManifoldsWorkspace>,
-    flipped: bool,
-) where
-    ManifoldData: Default + Clone + Send + Sync,
-    ContactData: Default + Copy + Send + Sync,
-{
-    let workspace =
-        workspace.get_or_insert_with(|| ContactManifoldsWorkspace(Box::<Workspace>::default()));
-    if !workspace.0.is::<Workspace>() {
-        *workspace = ContactManifoldsWorkspace(Box::<Workspace>::default());
-    }
-    let Some(workspace) = workspace.0.downcast_mut::<Workspace>() else {
-        return;
-    };
-    let dispatcher = DefaultQueryDispatcher; // TODO after https://github.com/dimforge/parry/issues/8
-
-    workspace.phase ^= true;
-    let phase = workspace.phase;
-
-    let bounds = other.compute_bounding_sphere(pos12).loosened(prediction);
-    let aabb = other.compute_aabb(pos12).loosened(prediction);
-    let mut old_manifolds = std::mem::take(manifolds);
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, slot, index, triangle| {
-        let tri_state = match workspace.state.entry((coords, index)) {
-            hash_map::Entry::Occupied(e) => {
-                let tri_state = e.into_mut();
-
-                let manifold = old_manifolds[tri_state.manifold_index].take();
-                tri_state.manifold_index = manifolds.len();
-                tri_state.phase = phase;
-                manifolds.push(manifold);
-
-                tri_state
-            }
-            hash_map::Entry::Vacant(e) => {
-                let tri_state = TriangleState {
-                    manifold_index: manifolds.len(),
-                    phase,
-                };
-
-                let subshape = planet.subshape_id(slot, index);
-                // `other`'s subshape is 0 because only composite shapes have subshapes, and those
-                // take the `compute_manifolds_vs_composite` path. TODO: Supporting other shapes
-                // with subshapes (height fields, voxels) would mean dispatching through
-                // `contact_manifolds` so that `other` can report its own subshape IDs.
-                let (subshape1, subshape2) = if flipped {
-                    (0, subshape)
-                } else {
-                    (subshape, 0)
-                };
-                manifolds.push(ContactManifold::with_data(
-                    subshape1,
-                    subshape2,
-                    ManifoldData::default(),
-                ));
-
-                e.insert(tri_state)
-            }
-        };
-
-        let manifold = &mut manifolds[tri_state.manifold_index];
-
-        // TODO: Nonconvex, postprocess contact `fid`s once parry's feature ID story is worked out
-        if flipped {
-            let _ = dispatcher.contact_manifold_convex_convex(
-                &pos12.inverse(),
-                other,
-                triangle,
-                None,
-                None,
-                prediction,
-                manifold,
-            );
-        } else {
-            let _ = dispatcher.contact_manifold_convex_convex(
-                pos12, triangle, other, None, None, prediction, manifold,
-            );
-        }
-        true
-    });
-
-    workspace.state.retain(|_, x| x.phase == phase);
+/// The persistent key identifies geometry rather than its temporary LRU slot.
+#[derive(Eq, PartialEq, Hash, Copy, Clone)]
+struct ManifoldKey {
+    coords: Coords,
+    triangle: u32,
+    other_part: Option<u32>,
 }
 
-/// Narrow-phase collision detection state for `Planet`
+/// Narrow-phase state associated with one shape pair.
 #[derive(Default, Clone)]
 pub struct Workspace {
-    state: HashMap<(Coords, u32), TriangleState>,
-    phase: bool,
+    state: HashMap<ManifoldKey, usize>,
+    flipped: bool,
 }
 
 impl WorkspaceData for Workspace {
@@ -3571,152 +3452,166 @@ impl WorkspaceData for Workspace {
     }
 }
 
-#[derive(Clone)]
-struct TriangleState {
-    manifold_index: usize,
-    phase: bool,
-}
-
 #[expect(
     clippy::too_many_arguments,
-    reason = "Parry contact-manifold dispatch requires transforms, shapes, workspace, contacts and orientation"
+    reason = "Parry requires independent prediction, output, persistent workspace and orientation"
 )]
-fn compute_manifolds_vs_composite<ManifoldData, ContactData>(
+fn compute_manifolds<ManifoldData, ContactData>(
     pos12: &Pose,
-    pos21: &Pose,
     planet: &Planet,
-    other: &dyn CompositeShape,
+    other: &dyn Shape,
     prediction: Real,
     manifolds: &mut Vec<ContactManifold<ManifoldData, ContactData>>,
     workspace: &mut Option<ContactManifoldsWorkspace>,
     flipped: bool,
-) where
+) -> Result<(), Unsupported>
+where
     ManifoldData: Default + Clone + Send + Sync,
     ContactData: Default + Copy + Send + Sync,
 {
-    let workspace = workspace
-        .get_or_insert_with(|| ContactManifoldsWorkspace(Box::<WorkspaceVsComposite>::default()));
-    if !workspace.0.is::<WorkspaceVsComposite>() {
-        *workspace = ContactManifoldsWorkspace(Box::<WorkspaceVsComposite>::default());
+    let old = workspace
+        .as_ref()
+        .and_then(|workspace| workspace.0.downcast_ref::<Workspace>())
+        .filter(|workspace| workspace.flipped == flipped);
+    if !prediction.is_finite() || prediction < 0.0 {
+        return Err(Unsupported);
     }
-    let Some(workspace) = workspace.0.downcast_mut::<WorkspaceVsComposite>() else {
-        return;
+    let composite = other.as_composite_shape();
+    let aabb = other.compute_aabb(pos12).loosened(prediction);
+    if !aabb.mins.is_finite() || !aabb.maxs.is_finite() {
+        return Err(Unsupported);
+    }
+    let bounds = aabb.bounding_sphere();
+    if !bounds.radius().is_finite() {
+        return Err(Unsupported);
+    }
+    let pos21 = pos12.inverse();
+    let mut next = Vec::new();
+    let mut keys = Vec::new();
+    let mut next_state = Workspace {
+        state: HashMap::new(),
+        flipped,
     };
-    let dispatcher = DefaultQueryDispatcher; // TODO after https://github.com/dimforge/parry/issues/8
-
-    workspace.phase ^= true;
-    let phase = workspace.phase;
-
-    let bvh = other.bvh();
-
-    let bounds = bvh
-        .root_aabb()
-        .bounding_sphere()
-        .transform_by(pos12)
-        .loosened(prediction);
-    let aabb = bvh.root_aabb().transform_by(pos12).loosened(prediction);
-    let mut old_manifolds = std::mem::take(manifolds);
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, slot, index, triangle| {
-        let tri_aabb = triangle.compute_aabb(pos21).loosened(prediction);
-
-        for composite_subshape in bvh.intersect_aabb(&tri_aabb) {
-            other.map_part_at(
-                composite_subshape,
-                &mut |composite_part_pos, composite_part_shape, normal_constraints| {
-                    let key = CompositeKey {
-                        chunk_coords: coords,
-                        triangle: index,
-                        composite_subshape,
-                    };
-                    // TODO: Dedup wrt. convex case
-                    let tri_state = match workspace.state.entry(key) {
-                        hash_map::Entry::Occupied(e) => {
-                            let tri_state = e.into_mut();
-
-                            let manifold = old_manifolds[tri_state.manifold_index].take();
-                            tri_state.manifold_index = manifolds.len();
-                            tri_state.phase = phase;
-                            manifolds.push(manifold);
-
-                            tri_state
-                        }
-                        hash_map::Entry::Vacant(e) => {
-                            let mut manifold = ContactManifold::new();
-                            let subshape = planet.subshape_id(slot, index);
-                            if flipped {
-                                manifold.subshape1 = composite_subshape;
-                                manifold.subshape2 = subshape;
-                                manifold.set_subshape_pos1(composite_part_pos.copied());
-                            } else {
-                                manifold.subshape1 = subshape;
-                                manifold.subshape2 = composite_subshape;
-                                manifold.set_subshape_pos2(composite_part_pos.copied());
-                            }
-
-                            let tri_state = TriangleState {
-                                manifold_index: manifolds.len(),
-                                phase,
-                            };
-                            manifolds.push(manifold);
-                            e.insert(tri_state)
-                        }
-                    };
-
-                    let manifold = &mut manifolds[tri_state.manifold_index];
-
-                    if flipped {
-                        let _ = dispatcher.contact_manifold_convex_convex(
-                            &composite_part_pos.inv_mul(pos21),
-                            composite_part_shape,
-                            triangle,
-                            normal_constraints,
-                            None,
-                            prediction,
-                            manifold,
-                        );
-                    } else {
-                        let _ = dispatcher.contact_manifold_convex_convex(
-                            &composite_part_pos.prepend_to(pos12),
-                            triangle,
-                            composite_part_shape,
-                            None,
-                            normal_constraints,
-                            prediction,
-                            manifold,
-                        );
-                    }
+    let mut status = Ok(());
+    let mut visit = |key: ManifoldKey,
+                     triangle: &Triangle,
+                     part: &dyn Shape,
+                     part_pos: Option<&Pose>,
+                     constraints: Option<&dyn NormalConstraints>| {
+        if status.is_err() || next_state.state.contains_key(&key) {
+            return;
+        }
+        // An external caller can reset the vector without resetting the
+        // workspace. Missing historical entries simply start cold.
+        let mut manifold = old
+            .and_then(|old| old.state.get(&key))
+            .and_then(|&index| manifolds.get(index))
+            .cloned()
+            .unwrap_or_else(ContactManifold::new);
+        let other_id = key.other_part.unwrap_or(0);
+        let result = if flipped {
+            manifold.subshape1 = other_id;
+            manifold.set_subshape_pos1(part_pos.copied());
+            manifold.set_subshape_pos2(None);
+            DefaultQueryDispatcher.contact_manifold_convex_convex(
+                &part_pos.inv_mul(&pos21),
+                part,
+                triangle,
+                constraints,
+                None,
+                prediction,
+                &mut manifold,
+            )
+        } else {
+            manifold.subshape2 = other_id;
+            manifold.set_subshape_pos1(None);
+            manifold.set_subshape_pos2(part_pos.copied());
+            DefaultQueryDispatcher.contact_manifold_convex_convex(
+                &part_pos.prepend_to(pos12),
+                triangle,
+                part,
+                None,
+                constraints,
+                prediction,
+                &mut manifold,
+            )
+        };
+        if let Err(error) = result {
+            status = Err(error);
+        } else if !manifold.contacts().is_empty() {
+            next_state.state.insert(key, next.len());
+            keys.push(key);
+            next.push(manifold);
+        }
+    };
+    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, triangle_index, triangle| {
+        if let Some(composite) = composite {
+            let tri_aabb = triangle.compute_aabb(&pos21).loosened(prediction);
+            for part in composite.bvh().intersect_aabb(&tri_aabb) {
+                composite.map_part_at(part, &mut |pose, shape, constraints| {
+                    visit(
+                        ManifoldKey {
+                            coords,
+                            triangle: triangle_index,
+                            other_part: Some(part),
+                        },
+                        triangle,
+                        shape,
+                        pose,
+                        constraints,
+                    );
+                });
+            }
+        } else {
+            visit(
+                ManifoldKey {
+                    coords,
+                    triangle: triangle_index,
+                    other_part: None,
                 },
+                triangle,
+                other,
+                None,
+                None,
             );
         }
-
         true
     });
+    status?;
 
-    workspace.state.retain(|_, x| x.phase == phase);
-}
-
-/// Narrow-phase collision detection state for `Planet`
-#[derive(Default, Clone)]
-pub struct WorkspaceVsComposite {
-    state: HashMap<CompositeKey, TriangleState>,
-    phase: bool,
-}
-
-#[derive(Eq, PartialEq, Hash, Copy, Clone)]
-struct CompositeKey {
-    chunk_coords: Coords,
-    triangle: u32,
-    composite_subshape: u32,
-}
-
-impl WorkspaceData for WorkspaceVsComposite {
-    fn as_typed_workspace_data(&self) -> TypedWorkspaceData<'_> {
-        TypedWorkspaceData::Custom
+    // Resolve every active chunk together, *after* traversal; otherwise
+    // a later chunk can recycle a slot used by an earlier manifold.
+    let mut chunks = HashMap::new();
+    let capacity = planet.lock_cache().max_size as usize;
+    for key in &keys {
+        let full = chunks.len() == capacity;
+        if let hashbrown::hash_map::Entry::Vacant(entry) = chunks.entry(key.coords) {
+            if full {
+                // All live subshape IDs must fit simultaneously.
+                return Err(Unsupported);
+            }
+            entry.insert(planet.cached_chunk(&key.coords).1);
+        }
     }
-
-    fn clone_dyn(&self) -> Box<dyn WorkspaceData> {
-        Box::new(self.clone())
+    let mut slots = HashMap::with_capacity(chunks.len());
+    {
+        let mut cache = planet.lock_cache();
+        for (coords, data) in chunks {
+            let (slot, _) = cache.insert(data);
+            slots.insert(coords, slot);
+        }
     }
+    for (key, manifold) in keys.into_iter().zip(&mut next) {
+        let subshape = planet.subshape_id(slots[&key.coords], key.triangle);
+        if flipped {
+            manifold.subshape2 = subshape;
+        } else {
+            manifold.subshape1 = subshape;
+        }
+    }
+    *manifolds = next;
+    *workspace = Some(ContactManifoldsWorkspace(Box::new(next_state)));
+    Ok(())
 }
 
 /// Direction on a face at `[0..1]^2` coordinates within a chunk
@@ -3873,7 +3768,6 @@ mod tests {
     use approx::{assert_abs_diff_eq, assert_relative_eq};
     use parry3d_f64::{
         math::Rotation,
-        query::ShapeCastStatus,
         shape::{Ball, Cuboid, TriMesh},
     };
 
@@ -3940,11 +3834,7 @@ mod tests {
             3
         }
         fn min_height(&self) -> f32 {
-            if self.patterned {
-                -1.0
-            } else {
-                0.0
-            }
+            if self.patterned { -1.0 } else { 0.0 }
         }
         fn max_height(&self) -> f32 {
             5.0
@@ -3956,11 +3846,11 @@ mod tests {
     fn brute_force_projection(planet: &Planet, pt: Vector) -> (f64, Vector, Coords) {
         let mut winner = None;
         for face in Face::iter() {
-            for y in 0..planet.terrain.face_resolution() {
-                for x in 0..planet.terrain.face_resolution() {
+            for y in 0..planet.face_resolution {
+                for x in 0..planet.face_resolution {
                     let coords = Coords { face, x, y };
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    let patch = Patch::new(&coords, planet.face_resolution);
                     for (_, tri) in
                         patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                     {
@@ -4094,8 +3984,11 @@ mod tests {
                     };
                     let point = axis * near_point;
                     let expected_inside = near_point < boundary;
-                    assert_eq!(planet.contains_local_point(point), expected_inside,
-                        "face_resolution={face_resolution}, patterned={patterned}, index={index}, radius={near_point}, boundary={boundary}, point={point:?}");
+                    assert_eq!(
+                        planet.contains_local_point(point),
+                        expected_inside,
+                        "face_resolution={face_resolution}, patterned={patterned}, index={index}, radius={near_point}, boundary={boundary}, point={point:?}"
+                    );
                     let projected = planet.project_local_point(point, true);
                     assert_eq!(projected.is_inside, expected_inside);
                     if expected_inside {
@@ -4137,8 +4030,10 @@ mod tests {
                         !planet.contains_local_point(outside),
                         "false seam interior: face={face:?}, radius={radius}, point={outside:?}"
                     );
-                    assert!(planet.contains_local_point(surface),
-                        "on-surface cube edge/corner must be contained: face={face:?}, point={surface:?}");
+                    assert!(
+                        planet.contains_local_point(surface),
+                        "on-surface cube edge/corner must be contained: face={face:?}, point={surface:?}"
+                    );
                 }
             }
         }
@@ -4165,8 +4060,10 @@ mod tests {
                                 let query = point + outward * (sign * displacement);
                                 let solid = planet.project_local_point(query, true);
                                 let hollow = planet.project_local_point(query, false);
-                                assert_eq!(solid.is_inside, inside,
-                                    "radius={radius}, coords={coords:?}, query={query:?}, point={point:?}");
+                                assert_eq!(
+                                    solid.is_inside, inside,
+                                    "radius={radius}, coords={coords:?}, query={query:?}, point={point:?}"
+                                );
                                 assert_eq!(
                                     hollow.is_inside, inside,
                                     "radius={radius}, coords={coords:?}, query={query:?}"
@@ -4561,7 +4458,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 y: 1,
             },
         ] {
-            let (_, data) = planet.cache.lock().unwrap().get(&planet, &coords);
+            let (_, data) = planet.cached_chunk(&coords);
             let vertices = data.projection_vertices(&planet);
             assert_eq!(
                 vertices.as_ptr(),
@@ -4571,7 +4468,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 vertices.len(),
                 (planet.chunk_resolution * planet.chunk_resolution) as usize
             );
-            let patch = Patch::new(&coords, planet.terrain.face_resolution());
+            let patch = Patch::new(&coords, planet.face_resolution);
             for quad in patch.quads(planet.chunk_resolution) {
                 let p = quad.position;
                 let idx = (p.y * planet.chunk_resolution + p.x) as usize;
@@ -4797,8 +4694,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                             for col in x0..x1 {
                                 let quad = Quad::new(&patch, side, na::Vector2::new(col, row));
                                 for vertex in quad.displace(radius, resolution, &samples).corners {
-                                    assert!(vertex.cmpge(bound.mins).all() && vertex.cmple(bound.maxs).all(),
-                                        "radius={radius},res={resolution},face={face:?},case={case},region={region:?},vertex={vertex:?},bound={bound:?}");
+                                    assert!(
+                                        vertex.cmpge(bound.mins).all()
+                                            && vertex.cmple(bound.maxs).all(),
+                                        "radius={radius},res={resolution},face={face:?},case={case},region={region:?},vertex={vertex:?},bound={bound:?}"
+                                    );
                                 }
                             }
                         }
@@ -4891,7 +4791,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     })
                     .map(|(coords, index, _)| (*coords, *index))
                     .collect();
-                assert!(missing.is_empty(), "face_resolution={face_resolution},resolution={resolution},case={case},center={center:?},missing={missing:?}");
+                assert!(
+                    missing.is_empty(),
+                    "face_resolution={face_resolution},resolution={resolution},case={case},center={center:?},missing={missing:?}"
+                );
             }
         }
     }
@@ -4901,7 +4804,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let planet = Planet::new(Arc::new(FlatTerrain::new(3, 17).unwrap()), 1, 10.0).unwrap();
         for face in Face::iter() {
             let coords = Coords { face, x: 1, y: 1 };
-            let (_, data) = planet.cache.lock().unwrap().get(&planet, &coords);
+            let (_, data) = planet.cached_chunk(&coords);
             assert!(data.quad_bounds.get().is_none());
             let boxes = data.quad_bounds(&planet);
             assert_eq!(boxes.quads.len(), 256);
@@ -5120,7 +5023,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     })
                     .map(|(coords, idx, _)| (*coords, *idx))
                     .collect();
-                assert!(missing.is_empty(), "resolution={resolution}, case={case}, center={center:?}, half={half:?}, missing={missing:?}");
+                assert!(
+                    missing.is_empty(),
+                    "resolution={resolution}, case={case}, center={center:?}, half={half:?}, missing={missing:?}"
+                );
             }
         }
     }
@@ -5183,8 +5089,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                                         }
                                     }
                                 }
-                                assert!(missing.is_empty(),
-                                    "resolution={resolution}, query={query_count}, center={center:?}, missing={missing:?}, emitted={} ", actual.len());
+                                assert!(
+                                    missing.is_empty(),
+                                    "resolution={resolution}, query={query_count}, center={center:?}, missing={missing:?}, emitted={} ",
+                                    actual.len()
+                                );
                                 query_count += 1;
                             }
                         }
@@ -5223,10 +5132,12 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             };
             assert!((a.distance(pose * b) - d1.distance).abs() < 1.0e-10);
         }
-        assert!(dispatcher
-            .contact(&pose, &first, &second, 20.0)
-            .expect("Planet/Planet predicted contact should be supported")
-            .is_some());
+        assert!(
+            dispatcher
+                .contact(&pose, &first, &second, 20.0)
+                .expect("Planet/Planet predicted contact should be supported")
+                .is_some()
+        );
     }
 
     /// A reference that uses neither the dual-tree hierarchy nor the
@@ -5241,11 +5152,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let all = |planet: &Planet| {
             let mut result = Vec::new();
             for face in Face::iter() {
-                for y in 0..planet.terrain.face_resolution() {
-                    for x in 0..planet.terrain.face_resolution() {
+                for y in 0..planet.face_resolution {
+                    for x in 0..planet.face_resolution {
                         let coords = Coords { face, x, y };
                         let samples = planet.sample(&coords);
-                        let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                        let patch = Patch::new(&coords, planet.face_resolution);
                         result.extend(
                             patch
                                 .triangles(planet.radius, planet.chunk_resolution, &samples)
@@ -5508,13 +5419,15 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             // after each query, even with capacity one on both planets.
             for (planet, id) in [(&first, distance.subshape1), (&second, distance.subshape2)] {
                 let slot = id / planet.triangles_per_chunk();
-                assert!(planet
-                    .cache
-                    .lock()
-                    .unwrap()
-                    .slots
-                    .iter()
-                    .any(|(i, _)| i == slot));
+                assert!(
+                    planet
+                        .cache
+                        .lock()
+                        .unwrap()
+                        .slots
+                        .iter()
+                        .any(|(i, _)| i == slot)
+                );
             }
         }
     }
@@ -5643,8 +5556,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                                 for direction in directions {
                                     let (low, high) = region.support_interval(direction);
                                     let dot = pt.dot(direction);
-                                    assert!(dot>=low-1.0e-9 && dot<=high+1.0e-9,
-                                        "region {face:?} {x0}:{x1},{y0}:{y1}: dir={direction:?}, dot={dot}, bounds={low}..{high}");
+                                    assert!(
+                                        dot >= low - 1.0e-9 && dot <= high + 1.0e-9,
+                                        "region {face:?} {x0}:{x1},{y0}:{y1}: dir={direction:?}, dot={dot}, bounds={low}..{high}"
+                                    );
                                 }
                             }
                         }
@@ -5727,26 +5642,32 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let first = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 1, 10.0).unwrap();
         let second = Planet::new(Arc::new(FlatTerrain::new(1, 3).unwrap()), 1, 7.0).unwrap();
         let pose = Pose::translation(9.0, 0.2, -0.1);
-        assert!(PlanetDispatcher
-            .cast_shapes(
-                &pose,
-                Vector::ZERO,
-                &first,
-                &second,
-                ShapeCastOptions::default()
-            )
-            .is_err());
+        assert!(
+            PlanetDispatcher
+                .cast_shapes(
+                    &pose,
+                    Vector::ZERO,
+                    &first,
+                    &second,
+                    ShapeCastOptions::default()
+                )
+                .is_err()
+        );
         let motion1 =
             NonlinearRigidMotion::new(Pose::IDENTITY, Vector::ZERO, Vector::ZERO, Vector::ZERO);
         let motion2 = NonlinearRigidMotion::new(pose, Vector::ZERO, Vector::ZERO, Vector::ZERO);
-        assert!(PlanetDispatcher
-            .cast_shapes_nonlinear(&motion1, &first, &motion2, &second, 0.0, 1.0, true)
-            .is_err());
+        assert!(
+            PlanetDispatcher
+                .cast_shapes_nonlinear(&motion1, &first, &motion2, &second, 0.0, 1.0, true)
+                .is_err()
+        );
         let mut manifolds = Vec::<ContactManifold<(), ()>>::new();
         let mut workspace = None;
-        assert!(PlanetDispatcher
-            .contact_manifolds(&pose, &first, &second, 0.0, &mut manifolds, &mut workspace)
-            .is_err());
+        assert!(
+            PlanetDispatcher
+                .contact_manifolds(&pose, &first, &second, 0.0, &mut manifolds, &mut workspace)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5795,11 +5716,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let mut closest = ClosestPoints::Disjoint;
         let mut contact: Option<Contact> = None;
         for face in Face::iter() {
-            for y in 0..planet.terrain.face_resolution() {
-                for x in 0..planet.terrain.face_resolution() {
+            for y in 0..planet.face_resolution {
+                for x in 0..planet.face_resolution {
                     let coords = Coords { face, x, y };
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    let patch = Patch::new(&coords, planet.face_resolution);
                     for (_, triangle) in
                         patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                     {
@@ -5886,8 +5807,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 if matches!(expected_pts, ClosestPoints::Intersecting) {
                     assert_eq!(points, ClosestPoints::Intersecting);
                 } else if let ClosestPoints::WithinMargin(p1, p2) = points {
-                    assert!((p1.distance(pose*p2)-expected_dist).abs() < 1.0e-8,
-                        "patterned={patterned},case={case},closest={points:?},expected={expected_pts:?}");
+                    assert!(
+                        (p1.distance(pose * p2) - expected_dist).abs() < 1.0e-8,
+                        "patterned={patterned},case={case},closest={points:?},expected={expected_pts:?}"
+                    );
                 } else {
                     panic!("missing witness points: {points:?}");
                 }
@@ -6051,13 +5974,15 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             // Subshape IDs are meaningful immediately on return, even if
             // the global search evicted the geometrically best chunk.
             let slot = actual.subshape1 / planet.triangles_per_chunk();
-            assert!(planet
-                .cache
-                .lock()
-                .unwrap()
-                .slots
-                .iter()
-                .any(|(id, _)| id == slot));
+            assert!(
+                planet
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .any(|(id, _)| id == slot)
+            );
         }
     }
 
@@ -6129,11 +6054,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 let normal = pose.rotation * plane.normal;
                 let mut expected_signed = f64::INFINITY;
                 for face in Face::iter() {
-                    for y in 0..planet.terrain.face_resolution() {
-                        for x in 0..planet.terrain.face_resolution() {
+                    for y in 0..planet.face_resolution {
+                        for x in 0..planet.face_resolution {
                             let coords = Coords { face, x, y };
                             let samples = planet.sample(&coords);
-                            let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                            let patch = Patch::new(&coords, planet.face_resolution);
                             for (_, triangle) in
                                 patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                             {
@@ -6312,14 +6237,12 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             assert!(planet.cache.try_lock().is_ok());
             // Reenter a different cubemap face with capacity 1 to ensure the
             // outer Arc snapshot remains valid after its LRU slot is evicted.
-            let mut cache = planet.cache.lock().unwrap();
             let other = Coords {
                 x: 0,
                 y: 0,
                 face: Face::Py,
             };
-            let _ = cache.get(&planet, &other);
-            drop(cache);
+            let _ = planet.cached_chunk(&other);
             assert_eq!(coords.face, Face::Px);
             seen += 1;
             true
@@ -6451,15 +6374,16 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             face: Face::Nx,
             ..first
         };
-        let mut cache = planet.cache.lock().unwrap();
-        let (slot, data) = cache.get(&planet, &first);
+        let (slot, data) = planet.cached_chunk(&first);
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cache.get(&planet, &failed);
+            planet.cached_chunk(&failed);
         }));
         assert!(failure.is_err());
-        let (recovered_slot, recovered_data) = cache.get(&planet, &first);
+        assert!(!planet.cache.is_poisoned());
+        let (recovered_slot, recovered_data) = planet.cached_chunk(&first);
         assert_eq!(slot, recovered_slot);
         assert!(Arc::ptr_eq(&data, &recovered_data));
+        let cache = planet.cache.lock().unwrap();
         assert_eq!(cache.slots.len(), 1);
         assert_eq!(cache.index.len(), 1);
     }
@@ -6470,40 +6394,29 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let terrain = Arc::new(FlatTerrain::new(1, 2).unwrap());
         let planet = Planet::new(terrain, 1 << 31, 1.0)
             .expect("maximum slot count is representable without preallocating all slots");
-        let mut cache = planet.cache.lock().unwrap();
-        assert_eq!(cache.slots.len(), 0);
-        let (first, _) = cache.get(
-            &planet,
-            &Coords {
-                x: 0,
-                y: 0,
-                face: Face::Px,
-            },
-        );
+        assert_eq!(planet.lock_cache().slots.len(), 0);
+        let (first, _) = planet.cached_chunk(&Coords {
+            x: 0,
+            y: 0,
+            face: Face::Px,
+        });
         assert_eq!(first, 0);
         assert_eq!(planet.subshape_id(first, 1), 1);
-        assert!(cache.slots.capacity() < 32);
-        drop(cache);
+        assert!(planet.lock_cache().slots.capacity() < 32);
         // Ordinary LRU eviction must preserve the configured slot bound.
         let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 1.0).unwrap();
-        let mut cache = planet.cache.lock().unwrap();
-        let (a, _) = cache.get(
-            &planet,
-            &Coords {
-                x: 0,
-                y: 0,
-                face: Face::Px,
-            },
-        );
-        let (b, _) = cache.get(
-            &planet,
-            &Coords {
-                x: 0,
-                y: 0,
-                face: Face::Py,
-            },
-        );
+        let (a, _) = planet.cached_chunk(&Coords {
+            x: 0,
+            y: 0,
+            face: Face::Px,
+        });
+        let (b, _) = planet.cached_chunk(&Coords {
+            x: 0,
+            y: 0,
+            face: Face::Py,
+        });
         assert_eq!(a, b);
+        let cache = planet.lock_cache();
         assert_eq!(cache.slots.len(), 1);
         assert_eq!(cache.index.len(), 1);
     }
@@ -6522,7 +6435,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             face: Face::Pz,
         };
         let samples = planet.sample(&coords);
-        let patch = Patch::new(&coords, planet.terrain.face_resolution());
+        let patch = Patch::new(&coords, planet.face_resolution);
         assert_eq!(
             patch
                 .triangles(planet.radius, planet.chunk_resolution, &samples)
@@ -6573,8 +6486,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
 
         // We add 0.1 to PLANET_RADIUS in positive tests below to hack around the issue in
         // https://github.com/dimforge/parry/pull/148. Can be removed once fix is released.
-        assert!(ball_contacts(&planet, Vector::new(2.0, PLANET_RADIUS + 0.1, 0.0), 1.0) >= 2,
-                "a ball lying on an axis of a planet with an even number of chunks per face overlaps with at least four triangles");
+        assert!(
+            ball_contacts(&planet, Vector::new(2.0, PLANET_RADIUS + 0.1, 0.0), 1.0) >= 2,
+            "a ball lying on an axis of a planet with an even number of chunks per face overlaps with at least four triangles"
+        );
         assert_eq!(
             ball_contacts(&planet, Vector::new(0.0, PLANET_RADIUS + 2.0, 0.0), 1.0),
             0
@@ -6645,7 +6560,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
 
     #[test]
     fn linear_cast_target_distance_and_reversed_rotated_frame() {
-        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 3).unwrap()), 4, 10.0).unwrap();
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4, 3).unwrap()), 4, 10.0).unwrap();
         let ball = Ball { radius: 1.0 };
         let pose = Pose::new(
             Vector::new(13.0, 0.0, 0.0),
@@ -6682,7 +6597,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
 
     #[test]
     fn stationary_cast_can_hit_within_target_distance() {
-        let planet = Planet::new(Arc::new(FlatTerrain::new(3, 3).unwrap()), 4, 10.0).unwrap();
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4, 3).unwrap()), 4, 10.0).unwrap();
         let ball = Ball { radius: 1.0 };
         let hit = PlanetDispatcher
             .cast_shapes(
@@ -6881,6 +6796,70 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
     }
 
     #[test]
+    fn manifold_workspace_survives_eviction_and_external_reset() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4, 3).unwrap()), 8, 10.0).unwrap();
+        let ball = Ball { radius: 1.0 };
+        let pose = Pose::translation(10.5, 0.0, 0.0);
+        let mut workspace = None;
+        let mut manifolds = Vec::<ContactManifold<(), ()>>::new();
+        for reset in [false, true] {
+            PlanetDispatcher
+                .contact_manifolds(&pose, &planet, &ball, 0.0, &mut manifolds, &mut workspace)
+                .unwrap();
+            let state = workspace
+                .as_ref()
+                .unwrap()
+                .0
+                .downcast_ref::<Workspace>()
+                .unwrap();
+            assert!(state.state.len() > 1);
+            let cache = planet.lock_cache();
+            let mut ids = std::collections::HashSet::new();
+            for (key, &index) in &state.state {
+                let id = manifolds[index].subshape1;
+                assert!(ids.insert(id));
+                assert_eq!(cache.index[&key.coords], id / planet.triangles_per_chunk());
+                assert_eq!(key.triangle, id % planet.triangles_per_chunk());
+            }
+            drop(cache);
+            if reset {
+                manifolds.clear();
+            }
+            for x in 0..4 {
+                for y in 0..4 {
+                    planet.cached_chunk(&Coords {
+                        x,
+                        y,
+                        face: Face::Nx,
+                    });
+                }
+            }
+        }
+        PlanetDispatcher
+            .contact_manifolds(&pose, &planet, &ball, 0.0, &mut manifolds, &mut workspace)
+            .unwrap();
+        assert!(!manifolds.is_empty());
+    }
+
+    #[test]
+    fn manifold_query_rejects_unrepresentable_live_ids() {
+        let planet = Planet::new(Arc::new(FlatTerrain::new(4, 3).unwrap()), 1, 10.0).unwrap();
+        let mut workspace = None;
+        let mut manifolds = Vec::<ContactManifold<(), ()>>::new();
+        let result = PlanetDispatcher.contact_manifolds(
+            &Pose::translation(10.5, 0.0, 0.0),
+            &planet,
+            &Ball { radius: 1.0 },
+            0.0,
+            &mut manifolds,
+            &mut workspace,
+        );
+        assert!(result.is_err());
+        assert!(manifolds.is_empty());
+        assert!(workspace.is_none());
+    }
+
+    #[test]
     fn swapped_composite_manifolds_use_mesh_part_ids() {
         const RADIUS: f64 = 6371e3;
         let planet = Planet::new(
@@ -6910,9 +6889,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 &mut workspace,
             )
             .unwrap();
-        assert!(manifolds
-            .iter()
-            .any(|manifold| !manifold.contacts().is_empty()));
+        assert!(
+            manifolds
+                .iter()
+                .any(|manifold| !manifold.contacts().is_empty())
+        );
         assert!(manifolds.iter().all(|manifold| manifold.subshape1 == 0));
     }
 
@@ -6949,11 +6930,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
     fn exhaustive_ray_hit(planet: &Planet, ray: &Ray, max_toi: f64) -> Option<RayIntersection> {
         let mut closest: Option<RayIntersection> = None;
         for face in Face::iter() {
-            for y in 0..planet.terrain.face_resolution() {
-                for x in 0..planet.terrain.face_resolution() {
+            for y in 0..planet.face_resolution {
+                for x in 0..planet.face_resolution {
                     let coords = Coords { x, y, face };
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, planet.terrain.face_resolution());
+                    let patch = Patch::new(&coords, planet.face_resolution);
                     for (_, triangle) in
                         patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                     {
@@ -7095,8 +7076,10 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                                         "target ray {count}: {ray:?}"
                                     );
                                     if let (Some(a), Some(b)) = (actual, expected) {
-                                        assert!((a.time_of_impact - b.time_of_impact).abs() < 1.0e-7,
-                                            "target ray {count}: {ray:?}, actual={a:?}, expected={b:?}");
+                                        assert!(
+                                            (a.time_of_impact - b.time_of_impact).abs() < 1.0e-7,
+                                            "target ray {count}: {ray:?}, actual={a:?}, expected={b:?}"
+                                        );
                                     }
                                     count += 1;
                                 }
@@ -7183,9 +7166,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             origin: Vector::new(RADIUS + 10.0, 1.0, 1.0),
             dir: -Vector::X,
         };
-        assert!(planet
-            .cast_ray_inside_one_quad(&crossing, 2.0 * RADIUS + 40.0, true)
-            .is_none());
+        assert!(
+            planet
+                .cast_ray_inside_one_quad(&crossing, 2.0 * RADIUS + 40.0, true)
+                .is_none()
+        );
         // Ray starting near a cube corner, for which the original walk
         // missed a known triangle, must still be handled globally.
         let seam = Ray {
@@ -7235,8 +7220,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                                         .expect("ray must intersect targeted triangle");
                                     let actual =
                                         planet.cast_local_ray_and_get_normal(&ray, 20.0, true);
-                                    assert!(actual.is_some_and(|hit| hit.time_of_impact <= direct.time_of_impact + 0.0001),
-                                        "missed target {count}: face={face:?}, coords={coords:?}, ray={ray:?}, direct={direct:?}, planet={actual:?}");
+                                    assert!(
+                                        actual.is_some_and(|hit| hit.time_of_impact
+                                            <= direct.time_of_impact + 0.0001),
+                                        "missed target {count}: face={face:?}, coords={coords:?}, ray={ray:?}, direct={direct:?}, planet={actual:?}"
+                                    );
                                     count += 1;
                                 }
                             }
@@ -7270,9 +7258,11 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             hit.time_of_impact,
             point.length()
         );
-        assert!(planet
-            .cast_local_ray_and_get_normal(&ray, hit.time_of_impact * 0.5, true)
-            .is_none());
+        assert!(
+            planet
+                .cast_local_ray_and_get_normal(&ray, hit.time_of_impact * 0.5, true)
+                .is_none()
+        );
     }
 
     #[test]
