@@ -321,6 +321,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.34.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "627003914c6057c9c8f0832ee4f870b5a4f599d0cfa83f4072675114860cd0ff"
+dependencies = [
+ "approx",
+]
+
+[[package]]
 name = "glamx"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -606,7 +615,7 @@ dependencies = [
  "approx",
  "criterion",
  "fearless_simd",
- "glam 0.33.12",
+ "glam 0.34.3",
  "hashbrown 0.17.1",
  "lru-slab",
  "nalgebra",
