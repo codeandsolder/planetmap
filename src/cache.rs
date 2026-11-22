@@ -427,11 +427,9 @@ impl Manager {
             .iter()
             .all(|slot| slot.is_some_and(|x| self.chunks[x as usize].ready));
         // If this subtree should be rendered and the children can't be rendered, this chunk must be rendered.
-        if !children_renderable {
-            if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
-                self.render
-                    .push((chunk.chunk, Neighborhood::default(), slot));
-            }
+        if !children_renderable && let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
+            self.render
+                .push((chunk.chunk, Neighborhood::default(), slot));
         }
         // Recurse into the children
         for (&child, &slot) in children.iter().zip(child_slots.iter()) {

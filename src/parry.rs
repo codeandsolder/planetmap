@@ -25,9 +25,7 @@ use parry3d_f64::{
         ShapeCastStatus, ShapeDistance, ShapeIntersection, TypedWorkspaceData, Unsupported,
         WorkspaceData, details::NormalConstraints,
     },
-    shape::{
-        CompositeShape, FeatureId, HalfSpace, Shape, ShapeType, SubShapeId, Triangle, TypedShape,
-    },
+    shape::{FeatureId, HalfSpace, Shape, ShapeType, SubShapeId, Triangle, TypedShape},
     utils::PoseOpt,
 };
 
@@ -267,7 +265,8 @@ impl Planet {
     }
 
     fn cached_chunk(&self, coords: &Coords) -> (u32, Arc<ChunkData>) {
-        if let Some(entry) = self.lock_cache().lookup(coords) {
+        let cached = self.lock_cache().lookup(coords);
+        if let Some(entry) = cached {
             return entry;
         }
         // Application code runs without the mutex. A concurrent caller may
@@ -933,13 +932,12 @@ impl RayCast for Planet {
             } = candidate.region;
             if x1 - x0 == 1 && y1 - y0 == 1 {
                 let coords = Coords { face, x: x0, y: y0 };
-                if let Some((idx, hit)) = self.cast_ray_in_chunk(coords, ray, limit, solid) {
-                    if closest
+                if let Some((idx, hit)) = self.cast_ray_in_chunk(coords, ray, limit, solid)
+                    && closest
                         .as_ref()
                         .is_none_or(|best| hit.time_of_impact < best.0)
-                    {
-                        closest = Some((hit.time_of_impact, coords, idx, hit));
-                    }
+                {
+                    closest = Some((hit.time_of_impact, coords, idx, hit));
                 }
                 continue;
             }
@@ -1526,11 +1524,11 @@ impl Cache {
         if let Some(entry) = self.lookup(&data.coords) {
             return entry;
         }
-        if self.slots.len() == self.max_size {
-            if let Some(lru) = self.slots.lru() {
-                let old = self.slots.remove(lru);
-                self.index.remove(&old.coords);
-            }
+        if self.slots.len() == self.max_size
+            && let Some(lru) = self.slots.lru()
+        {
+            let old = self.slots.remove(lru);
+            self.index.remove(&old.coords);
         }
         let coords = data.coords;
         let slot = self.slots.insert(Arc::clone(&data));
@@ -2656,6 +2654,7 @@ fn stable_planet_pair_ids(
         let mut cache = first.lock_cache();
         let (slot1, _) = cache.insert(data1);
         let (slot2, _) = cache.insert(data2);
+        drop(cache);
         Ok((
             first.subshape_id(slot1, tri1),
             first.subshape_id(slot2, tri2),
@@ -2970,6 +2969,25 @@ fn planet_shape_contact(
     Ok(Some(contact))
 }
 
+/// Normalize shape order once for all discrete queries. The specialized
+/// pair path preserves both terrain geometries; only the single-planet
+/// path needs a result transformation when the input order is reversed.
+fn dispatch_discrete<T>(
+    pose: &Pose,
+    first: &dyn Shape,
+    second: &dyn Shape,
+    single: impl FnOnce(&Pose, &Planet, &dyn Shape) -> Result<T, Unsupported>,
+    pair: impl FnOnce(&Pose, &Planet, &Planet) -> Result<T, Unsupported>,
+    swap: impl FnOnce(T) -> T,
+) -> Result<T, Unsupported> {
+    match (first.as_shape::<Planet>(), second.as_shape::<Planet>()) {
+        (Some(a), Some(b)) => pair(pose, a, b),
+        (Some(a), None) => single(pose, a, second),
+        (None, Some(b)) => single(&pose.inverse(), b, first).map(swap),
+        (None, None) => Err(Unsupported),
+    }
+}
+
 impl QueryDispatcher for PlanetDispatcher {
     fn intersection_test(
         &self,
@@ -2977,16 +2995,14 @@ impl QueryDispatcher for PlanetDispatcher {
         g1: &dyn Shape,
         g2: &dyn Shape,
     ) -> Result<ShapeIntersection, Unsupported> {
-        if let (Some(first), Some(second)) = (g1.as_shape::<Planet>(), g2.as_shape::<Planet>()) {
-            return planet_planet_intersection(pos12, first, second);
-        }
-        if let Some(p1) = g1.as_shape::<Planet>() {
-            return intersects(pos12, p1, g2);
-        }
-        if let Some(p2) = g2.as_shape::<Planet>() {
-            return intersects(&pos12.inverse(), p2, g1).map(ShapeIntersection::swapped);
-        }
-        Err(Unsupported)
+        dispatch_discrete(
+            pos12,
+            g1,
+            g2,
+            intersects,
+            planet_planet_intersection,
+            ShapeIntersection::swapped,
+        )
     }
 
     fn distance(
@@ -2995,16 +3011,14 @@ impl QueryDispatcher for PlanetDispatcher {
         g1: &dyn Shape,
         g2: &dyn Shape,
     ) -> Result<ShapeDistance, Unsupported> {
-        if let (Some(first), Some(second)) = (g1.as_shape::<Planet>(), g2.as_shape::<Planet>()) {
-            return planet_planet_distance(pos12, first, second);
-        }
-        if let Some(planet) = g1.as_shape::<Planet>() {
-            return planet_shape_distance(pos12, planet, g2);
-        }
-        if let Some(planet) = g2.as_shape::<Planet>() {
-            return planet_shape_distance(&pos12.inverse(), planet, g1).map(ShapeDistance::swapped);
-        }
-        Err(Unsupported)
+        dispatch_discrete(
+            pos12,
+            g1,
+            g2,
+            planet_shape_distance,
+            planet_planet_distance,
+            ShapeDistance::swapped,
+        )
     }
 
     fn contact(
@@ -3014,17 +3028,14 @@ impl QueryDispatcher for PlanetDispatcher {
         g2: &dyn Shape,
         prediction: Real,
     ) -> Result<Option<Contact>, Unsupported> {
-        if let (Some(first), Some(second)) = (g1.as_shape::<Planet>(), g2.as_shape::<Planet>()) {
-            return planet_planet_contact(pos12, first, second, prediction);
-        }
-        if let Some(planet) = g1.as_shape::<Planet>() {
-            return planet_shape_contact(pos12, planet, g2, prediction);
-        }
-        if let Some(planet) = g2.as_shape::<Planet>() {
-            return planet_shape_contact(&pos12.inverse(), planet, g1, prediction)
-                .map(|contact| contact.map(Contact::flipped));
-        }
-        Err(Unsupported)
+        dispatch_discrete(
+            pos12,
+            g1,
+            g2,
+            |pose, planet, other| planet_shape_contact(pose, planet, other, prediction),
+            |pose, first, second| planet_planet_contact(pose, first, second, prediction),
+            |contact| contact.map(Contact::flipped),
+        )
     }
 
     fn closest_points(
@@ -3034,17 +3045,14 @@ impl QueryDispatcher for PlanetDispatcher {
         g2: &dyn Shape,
         max_dist: Real,
     ) -> Result<ClosestPoints, Unsupported> {
-        if let (Some(first), Some(second)) = (g1.as_shape::<Planet>(), g2.as_shape::<Planet>()) {
-            return planet_planet_closest_points(pos12, first, second, max_dist);
-        }
-        if let Some(planet) = g1.as_shape::<Planet>() {
-            return planet_shape_closest_points(pos12, planet, g2, max_dist);
-        }
-        if let Some(planet) = g2.as_shape::<Planet>() {
-            return planet_shape_closest_points(&pos12.inverse(), planet, g1, max_dist)
-                .map(|points| points.flipped());
-        }
-        Err(Unsupported)
+        dispatch_discrete(
+            pos12,
+            g1,
+            g2,
+            |pose, planet, other| planet_shape_closest_points(pose, planet, other, max_dist),
+            |pose, first, second| planet_planet_closest_points(pose, first, second, max_dist),
+            |points| points.flipped(),
+        )
     }
 
     fn cast_shapes(
@@ -3171,7 +3179,7 @@ fn swept_translation_bounds(
         .max_radius()
         .max(start.mins.abs().max_element())
         .max(start.maxs.abs().max_element());
-    let margin = options.target_distance + 128.0 * f64::EPSILON * scale;
+    let margin = (128.0 * f64::EPSILON).mul_add(scale, options.target_distance);
     let outer = planet.compute_local_aabb().loosened(margin);
     let mut lo = 0.0_f64;
     let mut hi = options.max_time_of_impact.min(f64::MAX);
@@ -3328,8 +3336,10 @@ fn nonlinear_swept_bounds(
     let sphere = other.compute_local_bounding_sphere();
     let radius = (sphere.center() - motion_other.local_center).length() + sphere.radius();
     // Convex interpolation of endpoint bounds: 2*u*(1-u) <= 1/2.
-    let pad = max_separation * (planet_rate * duration * 0.5).min(2.0)
-        + radius * ((planet_rate + other_rate) * duration * 0.5).min(2.0);
+    let pad = radius.mul_add(
+        ((planet_rate + other_rate) * duration * 0.5).min(2.0),
+        max_separation * (planet_rate * duration * 0.5).min(2.0),
+    );
     endpoints.loosened(pad)
 }
 
@@ -3452,10 +3462,53 @@ impl WorkspaceData for Workspace {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Parry requires independent prediction, output, persistent workspace and orientation"
-)]
+fn resolve_manifold_slots(
+    planet: &Planet,
+    keys: &[ManifoldKey],
+) -> Result<HashMap<Coords, u32>, Unsupported> {
+    // Resolve every active chunk together, *after* traversal; otherwise
+    // a later chunk can recycle a slot used by an earlier manifold.
+    let mut chunks = HashMap::new();
+    let capacity = planet.lock_cache().max_size as usize;
+    for key in keys {
+        let full = chunks.len() == capacity;
+        if let hashbrown::hash_map::Entry::Vacant(entry) = chunks.entry(key.coords) {
+            if full {
+                // All live subshape IDs must fit simultaneously.
+                return Err(Unsupported);
+            }
+            entry.insert(planet.cached_chunk(&key.coords).1);
+        }
+    }
+    let mut slots = HashMap::with_capacity(chunks.len());
+    let mut cache = planet.lock_cache();
+    for (coords, data) in chunks {
+        let (slot, _) = cache.insert(data);
+        slots.insert(coords, slot);
+    }
+    drop(cache);
+    Ok(slots)
+}
+
+fn manifold_bounds(
+    other: &dyn Shape,
+    pose: &Pose,
+    prediction: Real,
+) -> Result<(Aabb, BoundingSphere), Unsupported> {
+    if !prediction.is_finite() || prediction < 0.0 {
+        return Err(Unsupported);
+    }
+    let aabb = other.compute_aabb(pose).loosened(prediction);
+    if !aabb.mins.is_finite() || !aabb.maxs.is_finite() {
+        return Err(Unsupported);
+    }
+    let bounds = aabb.bounding_sphere();
+    if !bounds.radius().is_finite() {
+        return Err(Unsupported);
+    }
+    Ok((aabb, bounds))
+}
+
 fn compute_manifolds<ManifoldData, ContactData>(
     pos12: &Pose,
     planet: &Planet,
@@ -3473,18 +3526,8 @@ where
         .as_ref()
         .and_then(|workspace| workspace.0.downcast_ref::<Workspace>())
         .filter(|workspace| workspace.flipped == flipped);
-    if !prediction.is_finite() || prediction < 0.0 {
-        return Err(Unsupported);
-    }
+    let (aabb, bounds) = manifold_bounds(other, pos12, prediction)?;
     let composite = other.as_composite_shape();
-    let aabb = other.compute_aabb(pos12).loosened(prediction);
-    if !aabb.mins.is_finite() || !aabb.maxs.is_finite() {
-        return Err(Unsupported);
-    }
-    let bounds = aabb.bounding_sphere();
-    if !bounds.radius().is_finite() {
-        return Err(Unsupported);
-    }
     let pos21 = pos12.inverse();
     let mut next = Vec::new();
     let mut keys = Vec::new();
@@ -3579,30 +3622,10 @@ where
     });
     status?;
 
-    // Resolve every active chunk together, *after* traversal; otherwise
-    // a later chunk can recycle a slot used by an earlier manifold.
-    let mut chunks = HashMap::new();
-    let capacity = planet.lock_cache().max_size as usize;
-    for key in &keys {
-        let full = chunks.len() == capacity;
-        if let hashbrown::hash_map::Entry::Vacant(entry) = chunks.entry(key.coords) {
-            if full {
-                // All live subshape IDs must fit simultaneously.
-                return Err(Unsupported);
-            }
-            entry.insert(planet.cached_chunk(&key.coords).1);
-        }
-    }
-    let mut slots = HashMap::with_capacity(chunks.len());
-    {
-        let mut cache = planet.lock_cache();
-        for (coords, data) in chunks {
-            let (slot, _) = cache.insert(data);
-            slots.insert(coords, slot);
-        }
-    }
+    let slots = resolve_manifold_slots(planet, &keys)?;
     for (key, manifold) in keys.into_iter().zip(&mut next) {
-        let subshape = planet.subshape_id(slots[&key.coords], key.triangle);
+        let slot = *slots.get(&key.coords).ok_or(Unsupported)?;
+        let subshape = planet.subshape_id(slot, key.triangle);
         if flipped {
             manifold.subshape2 = subshape;
         } else {

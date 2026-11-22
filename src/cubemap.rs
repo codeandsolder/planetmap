@@ -537,8 +537,12 @@ impl Coords {
         } else {
             let scale = f64::from(resolution);
             na::Point2::new(
-                (f64::from(coords.x) * scale - f64::from(x)).clamp(0.0, 1.0),
-                (f64::from(coords.y) * scale - f64::from(y)).clamp(0.0, 1.0),
+                f64::from(coords.x)
+                    .mul_add(scale, -f64::from(x))
+                    .clamp(0.0, 1.0),
+                f64::from(coords.y)
+                    .mul_add(scale, -f64::from(y))
+                    .clamp(0.0, 1.0),
             )
             .cast()
         };
