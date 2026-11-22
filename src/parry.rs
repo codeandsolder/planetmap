@@ -31,13 +31,9 @@ use parry3d_f64::{
 
 use crate::cubemap::Coords;
 
-/// Convert a `parry` vector to the nalgebra type consumed by the `cubemap` module
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Parry uses f64 world-space vectors, but terrain sampling is intentionally f32"
-)]
-const fn na3f32(v: Vector) -> na::Vector3<f32> {
-    na::Vector3::new(v.x as f32, v.y as f32, v.z as f32)
+/// Convert between the collision engine and cubemap vector representations.
+const fn cube_vector(v: Vector) -> na::Vector3<f64> {
+    na::Vector3::new(v.x, v.y, v.z)
 }
 
 /// Height data source for `Planet`.
@@ -309,7 +305,7 @@ impl Planet {
             resolution: self.chunk_resolution,
         };
         sparse.visit(
-            QuadCellRegion {
+            GridRect {
                 x0: 0,
                 x1: self.chunk_resolution - 1,
                 y0: 0,
@@ -337,21 +333,10 @@ impl Planet {
         // Both triangle interiors and displaced vertices lie in this
         // patch's angular cone; unlike the sample vertex radii, its
         // projected radial minimum is conservative for triangle chords.
-        let (_, min_cos) = ProjectionRegion::cone(
-            chunk_coords.face,
-            chunk_coords.x,
-            chunk_coords.x + 1,
-            chunk_coords.y,
-            chunk_coords.y + 1,
-            self.face_resolution,
-        );
+        let cone =
+            DirectionCone::from_region(FaceRegion::from_coords(chunk_coords), self.face_resolution);
         let min_height = f64::from(data.min);
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let minimum_radius = self.radius.mul_add(min_cos, min_height_projection);
+        let minimum_radius = cone.minimum_radius(self.radius, min_height);
         if outer_displaced_radius(self.radius, f64::from(data.min), f64::from(data.max))
             + bounds.radius()
             < distance
@@ -436,10 +421,6 @@ impl Planet {
     /// Positive-radius radial terrain supports fast angular neighborhood
     /// discovery. Inward-displaced triangles and query spheres centered at
     /// the origin instead use conservative best-first global region bounds.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "The angular neighborhood uses f32 with a conservative 1e-6-radian pad"
-    )]
     pub fn map_elements_in_local_sphere(
         &self,
         bounds: &BoundingSphere,
@@ -459,21 +440,21 @@ impl Planet {
             } else {
                 min_height
             };
-        let direction32 = na3f32(dir);
+        let direction = cube_vector(dir);
         if inscribed > 256.0 * f64::EPSILON * self.radius
             && distance.is_finite()
             && distance > 0.0
-            && direction32.iter().all(|v| v.is_finite())
-            && direction32.norm_squared() > 0.0
+            && direction.iter().all(|v| v.is_finite())
+            && direction.norm_squared() > 0.0
         {
             // A query bounding sphere at distance d subtends asin(r/d);
-            // Coords::neighborhood adds 1e-6 radians for f32 discretization.
+            // Coords::neighborhood includes numerical boundary slack.
             let theta = if distance > bounds.radius() {
                 (bounds.radius() / distance).asin()
             } else {
                 std::f64::consts::PI
             };
-            for coords in Coords::neighborhood(face_resolution, direction32, theta as f32) {
+            for coords in Coords::neighborhood(face_resolution, direction, theta) {
                 if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
                     return;
                 }
@@ -499,47 +480,27 @@ impl Planet {
         };
         let threshold2 = bounds.radius().powi(2);
         let mut regions = BinaryHeap::new();
-        for face in crate::cubemap::Face::iter() {
-            regions.push(ProjectionRegion::new(
-                face,
-                0,
-                face_resolution,
-                0,
-                face_resolution,
-                &query,
-            ));
-        }
+        regions.extend(
+            FaceRegion::roots(face_resolution)
+                .map(|region| RankedRegion::projection(region, &query)),
+        );
         while let Some(region) = regions.pop() {
-            if region.lower_distance2 > threshold2 {
+            if region.lower_bound > threshold2 {
                 break;
             }
-            if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
-                let coords = Coords {
-                    face: region.face,
-                    x: region.x0,
-                    y: region.y0,
-                };
+            if let Some(coords) = region.region.leaf() {
                 if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
                     return;
                 }
                 continue;
             }
-            let mid_x = region.x0 + (region.x1 - region.x0) / 2;
-            let mid_y = region.y0 + (region.y1 - region.y0) / 2;
-            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
-                if x0 == x1 {
-                    continue;
-                }
-                for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
-                    if y0 == y1 {
-                        continue;
-                    }
-                    let candidate = ProjectionRegion::new(region.face, x0, x1, y0, y1, &query);
-                    if candidate.lower_distance2 <= threshold2 {
-                        regions.push(candidate);
-                    }
-                }
-            }
+            regions.extend(
+                region
+                    .region
+                    .children()
+                    .map(|child| RankedRegion::projection(child, &query))
+                    .filter(|candidate| candidate.lower_bound <= threshold2),
+            );
         }
     }
 }
@@ -619,122 +580,23 @@ fn cast_triangle_ray_near_edge(tri: &Triangle, ray: &Ray, max_toi: f64) -> Optio
     Some(RayIntersection::new(time, normal, FeatureId::Face(face)))
 }
 
-/// A ray-overlapping cubemap rectangle ordered by its earliest possible TOI.
-/// AABB bounds enclose every displaced triangle interior, not just vertices.
-#[derive(Clone, Copy, Debug)]
-struct RayRegion {
-    region: ProjectionRegion,
-    lower_time: f64,
-}
-
-/// Conservative local AABB of a displaced angular cone, shared by ray and pair traversal.
-fn displaced_cone_aabb(
-    axis: Vector,
-    min_cos: f64,
-    radial_min: f64,
-    radial_max: f64,
-    pad: Vector,
-) -> Aabb {
-    if radial_min <= 0.0 {
-        // An unusually deep inward displacement can invalidate angular
-        // bounds. A full containing cube remains correct and eventually
-        // subdivides to narrower, positive-radius regions.
-        Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
-    } else {
-        let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-        let component_bounds = |component: f64| {
-            let perpendicular = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
-            let min_component = if -component >= min_cos {
-                -1.0
-            } else {
-                component.mul_add(min_cos, -perpendicular)
-            };
-            let max_component = if component >= min_cos {
-                1.0
-            } else {
-                component.mul_add(min_cos, perpendicular)
-            };
-            let lower = min_component
-                * if min_component >= 0.0 {
-                    radial_min
-                } else {
-                    radial_max
-                };
-            let upper = max_component
-                * if max_component >= 0.0 {
-                    radial_max
-                } else {
-                    radial_min
-                };
-            (lower, upper)
-        };
-        let (lx, ux) = component_bounds(axis.x);
-        let (ly, uy) = component_bounds(axis.y);
-        let (lz, uz) = component_bounds(axis.z);
-        Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
-    }
-}
-
-impl RayRegion {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Conservative bound depends on terrain extrema and grid rectangle"
-    )]
-    fn new(
-        face: crate::cubemap::Face,
-        x0: u32,
-        x1: u32,
-        y0: u32,
-        y1: u32,
-        resolution: u32,
-        radius: f64,
-        min_height: f64,
-        max_height: f64,
-        ray: &Ray,
-        max_toi: f64,
-    ) -> Option<Self> {
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
-        let region = ProjectionRegion {
-            face,
-            x0,
-            x1,
-            y0,
-            y1,
-            lower_distance2: 0.0,
-        };
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let radial_min = radius.mul_add(min_cos, min_height_projection);
+impl RankedRegion {
+    fn ray(planet: &Planet, region: FaceRegion, ray: &Ray, max_toi: f64) -> Option<Self> {
+        let cone = DirectionCone::from_region(region, planet.face_resolution);
+        let radius = planet.radius;
+        let min_height = f64::from(planet.min_height);
+        let max_height = f64::from(planet.max_height);
+        let radial_min = cone.minimum_radius(radius, min_height);
         let radial_max = outer_displaced_radius(radius, min_height, max_height);
         let pad = Vector::splat(
             256.0 * f64::EPSILON * (radial_max + ray.origin.abs().max_element() + radius),
         );
-        let aabb = displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad);
+        let aabb = cone.aabb(radial_min, radial_max, pad);
         let lower_time = aabb.cast_local_ray(ray, max_toi, true)?;
-        Some(Self { region, lower_time })
-    }
-}
-
-impl PartialEq for RayRegion {
-    fn eq(&self, other: &Self) -> bool {
-        self.lower_time.total_cmp(&other.lower_time).is_eq() && self.region == other.region
-    }
-}
-impl Eq for RayRegion {}
-impl PartialOrd for RayRegion {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for RayRegion {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .lower_time
-            .total_cmp(&self.lower_time)
-            .then_with(|| self.region.cmp(&other.region))
+        Some(Self {
+            region,
+            lower_bound: lower_time,
+        })
     }
 }
 
@@ -813,23 +675,9 @@ impl Planet {
         if !end.is_finite() {
             return None;
         }
-        let coords = Coords::from_vector(self.face_resolution, &na3f32(ray.origin));
+        let coords = Coords::from_vector(self.face_resolution, &cube_vector(ray.origin));
         let patch = Patch::new(&coords, self.face_resolution);
-        let quad_resolution = self.chunk_resolution - 1;
-        let uv = patch.project(&ray.origin) * f64::from(quad_resolution);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "The clamped normalized patch coordinate is within the u32 quad range"
-        )]
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "Patch coordinates are clamped nonnegative"
-        )]
-        let address = na::Vector2::new(
-            (uv.x.floor() as u32).min(quad_resolution - 1),
-            (uv.y.floor() as u32).min(quad_resolution - 1),
-        );
-        let quad = Quad::new(&patch, quad_resolution, address);
+        let quad = patch.quad_at_direction(self.chunk_resolution - 1, &ray.origin);
         let [a, b, c, d] = quad.corners;
         let margin = 512.0
             * f64::EPSILON
@@ -892,46 +740,19 @@ impl RayCast for Planet {
         if let Some(hit) = self.cast_ray_inside_one_quad(ray, max_toi, solid) {
             return Some(hit);
         }
-        let resolution = self.face_resolution;
-        let min_height = f64::from(self.min_height);
-        let max_height = f64::from(self.max_height);
-        let mut candidates = BinaryHeap::new();
-        for face in crate::cubemap::Face::iter() {
-            if let Some(region) = RayRegion::new(
-                face,
-                0,
-                resolution,
-                0,
-                resolution,
-                resolution,
-                self.radius,
-                min_height,
-                max_height,
-                ray,
-                max_toi,
-            ) {
-                candidates.push(region);
-            }
-        }
+        let mut candidates: BinaryHeap<_> = FaceRegion::roots(self.face_resolution)
+            .filter_map(|region| RankedRegion::ray(self, region, ray, max_toi))
+            .collect();
         // The LRU slot can be reassigned while visiting adjacent patches.
         // Retain the winning tile and triangle until all possible earlier
         // intersections have been excluded.
         let mut closest: Option<(f64, Coords, u32, RayIntersection)> = None;
         while let Some(candidate) = candidates.pop() {
             let limit = closest.as_ref().map_or(max_toi, |x| x.0);
-            if candidate.lower_time > limit {
+            if candidate.lower_bound > limit {
                 break;
             }
-            let ProjectionRegion {
-                face,
-                x0,
-                x1,
-                y0,
-                y1,
-                ..
-            } = candidate.region;
-            if x1 - x0 == 1 && y1 - y0 == 1 {
-                let coords = Coords { face, x: x0, y: y0 };
+            if let Some(coords) = candidate.region.leaf() {
                 if let Some((idx, hit)) = self.cast_ray_in_chunk(coords, ray, limit, solid)
                     && closest
                         .as_ref()
@@ -941,33 +762,12 @@ impl RayCast for Planet {
                 }
                 continue;
             }
-            let mid_x = x0 + (x1 - x0) / 2;
-            let mid_y = y0 + (y1 - y0) / 2;
-            for (a, b) in [(x0, mid_x), (mid_x, x1)] {
-                if a == b {
-                    continue;
-                }
-                for (c, d) in [(y0, mid_y), (mid_y, y1)] {
-                    if c == d {
-                        continue;
-                    }
-                    if let Some(region) = RayRegion::new(
-                        face,
-                        a,
-                        b,
-                        c,
-                        d,
-                        resolution,
-                        self.radius,
-                        min_height,
-                        max_height,
-                        ray,
-                        limit,
-                    ) {
-                        candidates.push(region);
-                    }
-                }
-            }
+            candidates.extend(
+                candidate
+                    .region
+                    .children()
+                    .filter_map(|child| RankedRegion::ray(self, child, ray, limit)),
+            );
         }
         let (_, coords, tri_idx, mut hit) = closest?;
         let (slot, _) = self.cached_chunk(&coords);
@@ -976,22 +776,100 @@ impl RayCast for Planet {
     }
 }
 
-/// A rectangular group of terrain patches in the cubemap, ordered by a
-/// conservative lower bound on the distance to any triangle it contains.
-///
-/// The patch's undisplaced vertices are convex combinations of unit corner
-/// directions. A positive radial displacement preserves this cone, and
-/// triangles interpolate between such displaced vertices. The conservative
-/// radius lower bound must therefore enclose triangle interiors, not merely
-/// the displaced vertices; use their projection along the cone axis.
-#[derive(Clone, Copy, Debug)]
-struct ProjectionRegion {
-    face: crate::cubemap::Face,
+/// An integer grid rectangle with exclusive upper bounds. Splitting an
+/// odd-sized region partitions every cell exactly once, including when
+/// only one axis can still be subdivided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GridRect {
     x0: u32,
     x1: u32,
     y0: u32,
     y1: u32,
-    lower_distance2: f64,
+}
+
+impl GridRect {
+    const fn new(x0: u32, x1: u32, y0: u32, y1: u32) -> Self {
+        Self { x0, x1, y0, y1 }
+    }
+
+    const fn is_leaf(self) -> bool {
+        self.x1 - self.x0 == 1 && self.y1 - self.y0 == 1
+    }
+
+    fn children(self) -> impl Iterator<Item = Self> {
+        let mid_x = u32::midpoint(self.x0, self.x1);
+        let mid_y = u32::midpoint(self.y0, self.y1);
+        [
+            Self::new(self.x0, mid_x, self.y0, mid_y),
+            Self::new(self.x0, mid_x, mid_y, self.y1),
+            Self::new(mid_x, self.x1, self.y0, mid_y),
+            Self::new(mid_x, self.x1, mid_y, self.y1),
+        ]
+        .into_iter()
+        .filter(move |r| !self.is_leaf() && r.x0 < r.x1 && r.y0 < r.y1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaceRegion {
+    face: crate::cubemap::Face,
+    cells: GridRect,
+}
+
+impl FaceRegion {
+    const fn new(face: crate::cubemap::Face, x0: u32, x1: u32, y0: u32, y1: u32) -> Self {
+        Self {
+            face,
+            cells: GridRect::new(x0, x1, y0, y1),
+        }
+    }
+
+    const fn from_coords(coords: Coords) -> Self {
+        Self::new(coords.face, coords.x, coords.x + 1, coords.y, coords.y + 1)
+    }
+
+    fn roots(resolution: u32) -> impl Iterator<Item = Self> {
+        crate::cubemap::Face::iter().map(move |face| Self::new(face, 0, resolution, 0, resolution))
+    }
+
+    const fn leaf(self) -> Option<Coords> {
+        if self.cells.is_leaf() {
+            Some(Coords {
+                face: self.face,
+                x: self.cells.x0,
+                y: self.cells.y0,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn children(self) -> impl Iterator<Item = Self> {
+        self.cells
+            .children()
+            .map(move |cells| Self { cells, ..self })
+    }
+}
+
+impl PartialOrd for FaceRegion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FaceRegion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.face as u8, self.cells).cmp(&(other.face as u8, other.cells))
+    }
+}
+
+/// A cubemap region with a conservative lower bound for a single
+/// best-first query. Each heap uses its own units (distance squared, ray
+/// time, or plane support); the ordering and partition are identical.
+#[derive(Clone, Copy, Debug)]
+struct RankedRegion {
+    region: FaceRegion,
+    lower_bound: f64,
 }
 
 /// At most 1.5 MiB of f64 vertices per tile is retained for warm queries.
@@ -1017,69 +895,130 @@ struct ProjectionQuery {
     max_height: f64,
 }
 
-impl ProjectionRegion {
-    /// Conservative cone of directions containing all displaced triangle
-    /// interiors of the cubemap rectangle, independent of terrain heights.
-    fn cone(
-        face: crate::cubemap::Face,
-        x0: u32,
-        x1: u32,
-        y0: u32,
-        y1: u32,
-        resolution: u32,
-    ) -> (Vector, f64) {
-        let scale = 2.0 / f64::from(resolution);
+/// A conservative unit-direction cone, represented by its maximum chord.
+/// Unlike cosine alone, this remains well-conditioned as the aperture
+/// approaches zero (e.g. millimetre tiles on a planetary-scale sphere).
+#[derive(Clone, Copy, Debug)]
+struct DirectionCone {
+    axis: Vector,
+    chord: f64,
+}
+
+impl DirectionCone {
+    // Allow for normalization, warp, and vector arithmetic rounding at the
+    // unit-sphere scale, rather than inflating every angle by sqrt(epsilon).
+    const ROUNDOFF: f64 = 64.0 * f64::EPSILON;
+
+    fn from_region(region: FaceRegion, resolution: u32) -> Self {
+        let FaceRegion {
+            face,
+            cells: GridRect { x0, x1, y0, y1 },
+        } = region;
+        let scale = f64::from(resolution);
         let face_direction = |x: f64, y: f64| {
             let d = face.direction(&na::Point2::new(
-                x.mul_add(scale, -1.0),
-                y.mul_add(scale, -1.0),
+                x.mul_add(2.0, -scale) / scale,
+                y.mul_add(2.0, -scale) / scale,
             ));
             Vector::new(d.x, d.y, d.z)
         };
-        let center = face_direction(
+        let axis = face_direction(
             f64::from(x0).midpoint(f64::from(x1)),
             f64::from(y0).midpoint(f64::from(y1)),
         );
-        // All unit directions in this warped cubemap rectangle lie inside
-        // the positive cone spanned by its four corners. For our centered
-        // axis, the minimum dot product over that cone is bounded by the
-        // minimum over its corners (the normalization can only increase a
-        // positive center dot product of a convex combination).
-        let mut min_cos = 1.0_f64;
+        // The warped projective rectangle is in the positive cone of its
+        // corners. Normalizing a convex combination cannot decrease its
+        // positive axis dot below the minimum corner dot.
+        let mut chord = 0.0_f64;
         for x in [x0, x1] {
             for y in [y0, y1] {
-                min_cos = min_cos.min(center.dot(face_direction(f64::from(x), f64::from(y))));
+                chord = chord.max(axis.distance(face_direction(f64::from(x), f64::from(y))));
             }
         }
-        // Account for rounding of warp, the face rotation, and corner dot
-        // products when using the bound to prune an entire subtree.
-        min_cos = 64.0f64.mul_add(-f64::EPSILON, min_cos).clamp(0.0, 1.0);
-        (center, min_cos)
+        Self {
+            axis,
+            chord: (chord + Self::ROUNDOFF).min(2.0),
+        }
     }
 
-    fn new(
-        face: crate::cubemap::Face,
-        x0: u32,
-        x1: u32,
-        y0: u32,
-        y1: u32,
-        query: &ProjectionQuery,
-    ) -> Self {
-        let (center, min_cos) = Self::cone(face, x0, x1, y0, y1, query.resolution);
-        // A displaced vertex is R*v + h*normalize(v), where v is a convex
-        // combination of the face's unit corner directions. The dot product
-        // with the cone axis is at least R*min_cos plus h*min_cos for h>=0
-        // (or h itself for negative h). Every point inside a triangle is
-        // itself a convex combination of its displaced vertices, so this
-        // remains a valid radial *lower* bound for triangle interiors.
-        // Bounding only vertex lengths would be unsound: a raised flat
-        // triangle's interior can lie much closer to the planet center.
-        let min_height_projection = if query.min_height >= 0.0 {
-            query.min_height * min_cos
+    fn cosine(self) -> f64 {
+        (-0.5 * self.chord).mul_add(self.chord, 1.0)
+    }
+
+    fn half_cosine(self) -> f64 {
+        (-0.25 * self.chord)
+            .mul_add(self.chord, 1.0)
+            .max(0.0)
+            .sqrt()
+    }
+
+    /// Conservative radial lower bound, including chord sag and negative
+    /// displacement. A nonpositive bound means angular clipping is unsafe.
+    fn minimum_radius(self, radius: f64, min_height: f64) -> f64 {
+        let cos = (self.cosine() - Self::ROUNDOFF).max(0.0);
+        let height = if min_height >= 0.0 {
+            min_height * cos
         } else {
-            query.min_height
+            min_height
         };
-        let min_radius = query.planet_radius.mul_add(min_cos, min_height_projection);
+        radius.mul_add(cos, height)
+    }
+
+    /// Smallest unit-direction chord separating a query direction from the
+    /// cone. Use the half-angle subtraction identity, without subtracting
+    /// nearly equal dot products or taking acos near one.
+    fn separation_chord(self, direction: Vector) -> f64 {
+        let sin_half = 0.5 * self.axis.distance(direction);
+        let cos_half = 0.5 * (self.axis + direction).length();
+        let difference = sin_half.mul_add(self.half_cosine(), -cos_half * 0.5 * self.chord);
+        difference.mul_add(2.0, -Self::ROUNDOFF).max(0.0)
+    }
+
+    /// Support of the cone with any radius in the supplied interval.
+    fn radial_interval(self, direction: Vector, min_radius: f64, max_radius: f64) -> (f64, f64) {
+        if min_radius <= 0.0 {
+            return (-max_radius, max_radius);
+        }
+        let cosine = self.cosine();
+        let transverse = self.axis.cross(direction).length() * self.chord * self.half_cosine();
+        let center = self.axis.dot(direction).clamp(-1.0, 1.0);
+        let low = if (self.axis + direction).length() <= self.chord {
+            -1.0
+        } else {
+            center.mul_add(cosine, -transverse) - Self::ROUNDOFF
+        }
+        .max(-1.0);
+        let high = if self.axis.distance(direction) <= self.chord {
+            1.0
+        } else {
+            center.mul_add(cosine, transverse) + Self::ROUNDOFF
+        }
+        .min(1.0);
+        (
+            low * if low >= 0.0 { min_radius } else { max_radius },
+            high * if high >= 0.0 { max_radius } else { min_radius },
+        )
+    }
+
+    fn rotated(self, pose: &Pose) -> Self {
+        Self {
+            axis: pose.rotation * self.axis,
+            ..self
+        }
+    }
+
+    fn aabb(self, min_radius: f64, max_radius: f64, pad: Vector) -> Aabb {
+        let (lx, ux) = self.radial_interval(Vector::X, min_radius, max_radius);
+        let (ly, uy) = self.radial_interval(Vector::Y, min_radius, max_radius);
+        let (lz, uz) = self.radial_interval(Vector::Z, min_radius, max_radius);
+        Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
+    }
+}
+
+impl RankedRegion {
+    fn projection(region: FaceRegion, query: &ProjectionQuery) -> Self {
+        let cone = DirectionCone::from_region(region, query.resolution);
+        let min_radius = cone.minimum_radius(query.planet_radius, query.min_height);
         let max_radius =
             outer_displaced_radius(query.planet_radius, query.min_height, query.max_height);
         let lower_distance2 = if min_radius <= 0.0 {
@@ -1088,66 +1027,42 @@ impl ProjectionRegion {
             // triangle points have a positive radius in the cone.
             0.0
         } else {
-            let cos_center = center.dot(query.query_axis).clamp(-1.0, 1.0);
-            let cos_distance = if cos_center >= min_cos {
-                1.0
-            } else {
-                let sin_center = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
-                let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-                cos_center.mul_add(min_cos, sin_center * sin_cone).min(1.0)
-            };
-            // Closest possible radius at this angular distance, clamped to
-            // the global height envelope and chord sag of this region.
+            let chord = cone.separation_chord(query.query_axis);
+            let chord_squared = chord * chord;
+            let cos_distance = (-0.5 * chord).mul_add(chord, 1.0);
+            // Squared distance = radial delta squared + product of the
+            // radii times chord squared. Avoid cancellation at small angles.
             let radius = (query.query_radius * cos_distance).clamp(min_radius, max_radius);
             let delta = query.query_radius - radius;
-            let bound2 = delta.mul_add(
-                delta,
-                2.0 * query.query_radius * radius * (1.0 - cos_distance),
-            );
+            let bound2 = delta.mul_add(delta, query.query_radius * radius * chord_squared);
             let rounding =
                 128.0 * f64::EPSILON * (query.query_radius + max_radius + query.planet_radius);
             (bound2.max(0.0).sqrt() - rounding).max(0.0).powi(2)
         };
         Self {
-            face,
-            x0,
-            x1,
-            y0,
-            y1,
-            lower_distance2,
+            region,
+            lower_bound: lower_distance2,
         }
     }
 }
 
-impl PartialEq for ProjectionRegion {
+impl PartialEq for RankedRegion {
     fn eq(&self, other: &Self) -> bool {
-        self.lower_distance2
-            .total_cmp(&other.lower_distance2)
-            .is_eq()
-            && (self.face as u8, self.x0, self.x1, self.y0, self.y1)
-                == (other.face as u8, other.x0, other.x1, other.y0, other.y1)
+        self.lower_bound.total_cmp(&other.lower_bound).is_eq() && self.region == other.region
     }
 }
-impl Eq for ProjectionRegion {}
-impl PartialOrd for ProjectionRegion {
+impl Eq for RankedRegion {}
+impl PartialOrd for RankedRegion {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ProjectionRegion {
+impl Ord for RankedRegion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other
-            .lower_distance2
-            .total_cmp(&self.lower_distance2)
-            .then_with(|| {
-                (self.face as u8, self.x0, self.x1, self.y0, self.y1).cmp(&(
-                    other.face as u8,
-                    other.x0,
-                    other.x1,
-                    other.y0,
-                    other.y1,
-                ))
-            })
+            .lower_bound
+            .total_cmp(&self.lower_bound)
+            .then_with(|| self.region.cmp(&other.region))
     }
 }
 
@@ -1240,48 +1155,27 @@ impl Planet {
         nearest: &mut Option<ProjectionWinner>,
     ) {
         let mut regions = BinaryHeap::new();
-        for face in crate::cubemap::Face::iter() {
-            regions.push(ProjectionRegion::new(
-                face,
-                0,
-                query.resolution,
-                0,
-                query.resolution,
-                query,
-            ));
-        }
+        regions.extend(
+            FaceRegion::roots(query.resolution)
+                .map(|region| RankedRegion::projection(region, query)),
+        );
         while let Some(region) = regions.pop() {
             let best_distance2 = nearest.as_ref().map_or(f64::INFINITY, |x| x.distance2);
-            if region.lower_distance2 > best_distance2 {
+            if region.lower_bound > best_distance2 {
                 break;
             }
-            if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
-                let coords = Coords {
-                    face: region.face,
-                    x: region.x0,
-                    y: region.y0,
-                };
+            if let Some(coords) = region.region.leaf() {
                 self.update_projection_from_patch(coords, pt, query.query_radius, nearest);
                 continue;
             }
 
-            let mid_x = region.x0 + (region.x1 - region.x0) / 2;
-            let mid_y = region.y0 + (region.y1 - region.y0) / 2;
-            // Do not create empty rectangles when one axis is already one tile wide.
-            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
-                if x0 == x1 {
-                    continue;
-                }
-                for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
-                    if y0 == y1 {
-                        continue;
-                    }
-                    let candidate = ProjectionRegion::new(region.face, x0, x1, y0, y1, query);
-                    if candidate.lower_distance2 <= best_distance2 {
-                        regions.push(candidate);
-                    }
-                }
-            }
+            regions.extend(
+                region
+                    .region
+                    .children()
+                    .map(|child| RankedRegion::projection(child, query))
+                    .filter(|candidate| candidate.lower_bound <= best_distance2),
+            );
         }
     }
 }
@@ -1374,7 +1268,7 @@ impl Planet {
         // a handful of cells. More demanding queries use the hierarchy below.
         let mut cap_searched = false;
         if query_radius > 0.0 {
-            let source_direction = na3f32(query.query_axis);
+            let source_direction = cube_vector(query.query_axis);
             let seed = Coords::from_vector(face_resolution, &source_direction);
             self.update_projection_from_patch(seed, pt, query_radius, &mut nearest);
             let distance = nearest
@@ -1385,14 +1279,7 @@ impl Planet {
                     > self.radius * 64.0 * f64::EPSILON
             {
                 let theta = (distance / query_radius).asin();
-                // Leave space for cubemap angular and f32 conversion slack;
-                // Coords::neighborhood also pads its cone by 1e-6 radians.
-                if (theta + 2.0e-6) * f64::from(face_resolution) <= 2.0 {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "The validated near-surface cone is much smaller than pi radians"
-                    )]
-                    let theta = (theta + 2.0e-6) as f32;
+                if theta * f64::from(face_resolution) <= 2.0 {
                     for coords in Coords::neighborhood(face_resolution, source_direction, theta) {
                         if coords != seed {
                             self.update_projection_from_patch(
@@ -1552,15 +1439,6 @@ const QUAD_BLOCK_WIDTH: u32 = 8;
 /// collision query should not build every vertex and bounding box.
 const QUAD_INDEX_BUILD_AFTER_QUERIES: u8 = 3;
 
-/// A rectangle of quad cells, with exclusive upper bounds.
-#[derive(Clone, Copy, Debug)]
-struct QuadCellRegion {
-    x0: u32,
-    x1: u32,
-    y0: u32,
-    y1: u32,
-}
-
 /// Sparse, proof-backed search for quads in a cold terrain chunk. It uses
 /// only four to six evaluations of the *undisplaced* piecewise-affine patch
 /// for each visited region, and displaces geometry only at candidate leaves.
@@ -1580,7 +1458,7 @@ impl SparseQuadSearch<'_> {
     /// A displaced vertex is R*v + h*normalize(v), whose height contribution
     /// lies component-wise within `max(abs(min_height), abs(max_height))`.
     /// Convex combinations preserve this AABB for complete triangle interiors.
-    fn conservative_bounds(&self, region: QuadCellRegion) -> Aabb {
+    fn conservative_bounds(&self, region: GridRect) -> Aabb {
         let scale = 1.0 / f64::from(self.resolution - 1);
         let left = f64::from(region.x0) * scale;
         let right = f64::from(region.x1) * scale;
@@ -1624,11 +1502,11 @@ impl SparseQuadSearch<'_> {
     }
 
     /// Returns false only if the callback explicitly terminates traversal.
-    fn visit(&self, region: QuadCellRegion, emit: &mut impl FnMut(Quad) -> bool) -> bool {
+    fn visit(&self, region: GridRect, emit: &mut impl FnMut(Quad) -> bool) -> bool {
         if !self.conservative_bounds(region).intersects(self.query) {
             return true;
         }
-        if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
+        if region.is_leaf() {
             let quad = Quad::new(
                 self.patch,
                 self.resolution - 1,
@@ -1640,19 +1518,7 @@ impl SparseQuadSearch<'_> {
             let upper = top_left.max(top_right).max(bottom_left).max(bottom_right);
             return !Aabb::new(lower, upper).intersects(self.query) || emit(quad);
         }
-        let mid_x = region.x0 + (region.x1 - region.x0) / 2;
-        let mid_y = region.y0 + (region.y1 - region.y0) / 2;
-        for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
-            if y0 == y1 {
-                continue;
-            }
-            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
-                if x0 != x1 && !self.visit(QuadCellRegion { x0, x1, y0, y1 }, emit) {
-                    return false;
-                }
-            }
-        }
-        true
+        region.children().all(|child| self.visit(child, emit))
     }
 }
 
@@ -1771,14 +1637,6 @@ impl Planet {
     /// center, evaluating just two real triangles. Any valid candidate is a
     /// global *upper* distance bound, never an assumption about which patch
     /// wins; all closer faces are still visited by the proven hierarchy.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Validated normalized patch positions are clamped to the u32 quad grid"
-    )]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "Clamped normalized patch coordinates are never negative"
-    )]
     fn visit_proximity_seed_quad(
         &self,
         center: Vector,
@@ -1790,18 +1648,9 @@ impl Planet {
             Vector::X
         };
         let resolution = self.face_resolution;
-        let coords = Coords::from_vector(resolution, &na3f32(axis));
+        let coords = Coords::from_vector(resolution, &cube_vector(axis));
         let patch = Patch::new(&coords, resolution);
-        let side = self.chunk_resolution - 1;
-        let uv = patch.project(&axis) * f64::from(side);
-        let quad = Quad::new(
-            &patch,
-            side,
-            na::Vector2::new(
-                (uv.x.floor() as u32).min(side - 1),
-                (uv.y.floor() as u32).min(side - 1),
-            ),
-        );
+        let quad = patch.quad_at_direction(self.chunk_resolution - 1, &axis);
         let (_, data) = self.cached_chunk(&coords);
         for (index, triangle) in quad
             .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -1824,10 +1673,6 @@ impl Planet {
     /// ball covers every possible winner, including across face seams.
     /// Returns None when the cap cannot be certified; the global hierarchy
     /// then remains the correctness-preserving fallback.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Only finite small angular cones are cast to f32, with 2e-6 radians padding"
-    )]
     fn visit_proximity_cap(
         &self,
         bounds: &BoundingSphere,
@@ -1846,12 +1691,12 @@ impl Planet {
             return None;
         }
         let theta = (cap_radius / distance).asin();
-        if (theta + 2.0e-6) * f64::from(self.face_resolution) > 2.0 {
+        if theta * f64::from(self.face_resolution) > 2.0 {
             return None;
         }
-        let axis = na3f32(bounds.center() / distance);
+        let axis = cube_vector(bounds.center() / distance);
         let face_resolution = self.face_resolution;
-        for coords in Coords::neighborhood(face_resolution, axis, (theta + 2.0e-6) as f32) {
+        for coords in Coords::neighborhood(face_resolution, axis, theta) {
             let rounding = 512.0
                 * f64::EPSILON
                 * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
@@ -1969,27 +1814,16 @@ impl Planet {
             * f64::EPSILON
             * (self.max_radius() + center.abs().max_element() + bounds.radius());
         let mut regions = BinaryHeap::new();
-        for face in crate::cubemap::Face::iter() {
-            regions.push(ProjectionRegion::new(
-                face,
-                0,
-                query.resolution,
-                0,
-                query.resolution,
-                &query,
-            ));
-        }
+        regions.extend(
+            FaceRegion::roots(query.resolution)
+                .map(|region| RankedRegion::projection(region, &query)),
+        );
         while let Some(region) = regions.pop() {
             let threshold = bounds.radius() + *max_distance + roundoff;
-            if region.lower_distance2 > threshold * threshold {
+            if region.lower_bound > threshold * threshold {
                 break;
             }
-            if region.x1 - region.x0 == 1 && region.y1 - region.y0 == 1 {
-                let coords = Coords {
-                    face: region.face,
-                    x: region.x0,
-                    y: region.y0,
-                };
+            if let Some(coords) = region.region.leaf() {
                 if !self.visit_proximity_leaf(
                     coords,
                     &bounds,
@@ -2002,22 +1836,13 @@ impl Planet {
                 }
                 continue;
             }
-            let mid_x = region.x0 + (region.x1 - region.x0) / 2;
-            let mid_y = region.y0 + (region.y1 - region.y0) / 2;
-            for (x0, x1) in [(region.x0, mid_x), (mid_x, region.x1)] {
-                if x0 == x1 {
-                    continue;
-                }
-                for (y0, y1) in [(region.y0, mid_y), (mid_y, region.y1)] {
-                    if y0 == y1 {
-                        continue;
-                    }
-                    let next = ProjectionRegion::new(region.face, x0, x1, y0, y1, &query);
-                    if next.lower_distance2 <= threshold * threshold {
-                        regions.push(next);
-                    }
-                }
-            }
+            regions.extend(
+                region
+                    .region
+                    .children()
+                    .map(|child| RankedRegion::projection(child, &query))
+                    .filter(|candidate| candidate.lower_bound <= threshold * threshold),
+            );
         }
     }
 
@@ -2029,89 +1854,20 @@ impl Planet {
     }
 }
 
-/// A best-first cubemap region ordered by the smallest possible vertex
-/// projection along a given plane normal. The bounds include all triangle
-/// interiors, and remain safe if large negative heights invert their rays.
-#[derive(Clone, Copy, Debug)]
-struct PlaneSupportRegion {
-    region: ProjectionRegion,
-    lower_dot: f64,
-}
-
-impl PlaneSupportRegion {
-    fn new(
-        planet: &Planet,
-        face: crate::cubemap::Face,
-        x0: u32,
-        x1: u32,
-        y0: u32,
-        y1: u32,
-        normal: Vector,
-    ) -> Self {
-        let resolution = planet.face_resolution;
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, resolution);
+impl RankedRegion {
+    fn plane(planet: &Planet, region: FaceRegion, normal: Vector) -> Self {
+        let cone = DirectionCone::from_region(region, planet.face_resolution);
         let min_height = f64::from(planet.min_height);
-        let min_height_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let min_radius = planet.radius.mul_add(min_cos, min_height_projection);
+        let min_radius = cone.minimum_radius(planet.radius, min_height);
         let max_radius = planet.max_radius();
-        let cos_center = axis.dot(normal).clamp(-1.0, 1.0);
-        let min_direction_dot = if -cos_center >= min_cos {
-            -1.0
-        } else {
-            let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt();
-            let aperture = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-            cos_center
-                .mul_add(min_cos, -transverse * aperture)
-                .max(-1.0)
-        };
-        let minimum = if min_radius <= 0.0 {
-            // An inward-flipped triangle is no longer confined to this
-            // positive angular cone. The enclosing planet sphere remains
-            // a conservative bound on every possible projected component.
-            -max_radius
-        } else if min_direction_dot >= 0.0 {
-            min_direction_dot * min_radius
-        } else {
-            min_direction_dot * max_radius
-        };
+        let (minimum, _) = cone.radial_interval(normal, min_radius, max_radius);
         let slack = 512.0 * f64::EPSILON * (max_radius + planet.radius);
         Self {
-            region: ProjectionRegion {
-                face,
-                x0,
-                x1,
-                y0,
-                y1,
-                lower_distance2: 0.0,
-            },
-            lower_dot: minimum - slack,
+            region,
+            lower_bound: minimum - slack,
         }
     }
 }
-impl PartialEq for PlaneSupportRegion {
-    fn eq(&self, other: &Self) -> bool {
-        self.lower_dot.total_cmp(&other.lower_dot).is_eq() && self.region == other.region
-    }
-}
-impl Eq for PlaneSupportRegion {}
-impl PartialOrd for PlaneSupportRegion {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for PlaneSupportRegion {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .lower_dot
-            .total_cmp(&self.lower_dot)
-            .then_with(|| self.region.cmp(&other.region))
-    }
-}
-
 struct PlaneSupportWinner {
     coords: Coords,
     triangle: u32,
@@ -2156,25 +1912,17 @@ impl Planet {
         );
         let mut regions = BinaryHeap::new();
         let resolution = self.face_resolution;
-        for face in crate::cubemap::Face::iter() {
-            regions.push(PlaneSupportRegion::new(
-                self, face, 0, resolution, 0, resolution, normal,
-            ));
-        }
+        regions.extend(
+            FaceRegion::roots(resolution).map(|region| RankedRegion::plane(self, region, normal)),
+        );
         while let Some(region) = regions.pop() {
             if winner
                 .as_ref()
-                .is_some_and(|best| region.lower_dot > best.dot)
+                .is_some_and(|best| region.lower_bound > best.dot)
             {
                 break;
             }
-            if region.region.x1 - region.region.x0 == 1 && region.region.y1 - region.region.y0 == 1
-            {
-                let coords = Coords {
-                    face: region.region.face,
-                    x: region.region.x0,
-                    y: region.region.y0,
-                };
+            if let Some(coords) = region.region.leaf() {
                 let (_, data) = self.cached_chunk(&coords);
                 let patch = Patch::new(&coords, resolution);
                 for quad in patch.quads(self.chunk_resolution) {
@@ -2197,26 +1945,17 @@ impl Planet {
                 }
                 continue;
             }
-            let mid_x = region.region.x0 + (region.region.x1 - region.region.x0) / 2;
-            let mid_y = region.region.y0 + (region.region.y1 - region.region.y0) / 2;
-            for (x0, x1) in [(region.region.x0, mid_x), (mid_x, region.region.x1)] {
-                if x0 == x1 {
-                    continue;
-                }
-                for (y0, y1) in [(region.region.y0, mid_y), (mid_y, region.region.y1)] {
-                    if y0 == y1 {
-                        continue;
-                    }
-                    let candidate =
-                        PlaneSupportRegion::new(self, region.region.face, x0, x1, y0, y1, normal);
-                    if winner
-                        .as_ref()
-                        .is_none_or(|best| candidate.lower_dot <= best.dot)
-                    {
-                        regions.push(candidate);
-                    }
-                }
-            }
+            regions.extend(
+                region
+                    .region
+                    .children()
+                    .map(|child| RankedRegion::plane(self, child, normal))
+                    .filter(|candidate| {
+                        winner
+                            .as_ref()
+                            .is_none_or(|best| candidate.lower_bound <= best.dot)
+                    }),
+            );
         }
         // Every validated planet has at least one populated triangle, and
         // the seed evaluates both triangles of a valid quad.
@@ -2307,12 +2046,11 @@ fn planet_halfspace_contact(
 /// deeply negative terrain; they are the same cone bounds as the ray BVH.
 #[derive(Clone, Copy, Debug)]
 struct PatchBounds {
-    region: ProjectionRegion,
+    region: FaceRegion,
     aabb: Aabb,
     // Shape1 frame; the cone contains all displaced triangle interiors.
     origin: Vector,
-    cone_axis: Vector,
-    cone_cos: f64,
+    cone: DirectionCone,
     radial_min: f64,
     radial_max: f64,
     sphere_center: Vector,
@@ -2321,24 +2059,11 @@ struct PatchBounds {
 }
 
 impl PatchBounds {
-    fn new(
-        planet: &Planet,
-        pose: &Pose,
-        face: crate::cubemap::Face,
-        x0: u32,
-        x1: u32,
-        y0: u32,
-        y1: u32,
-    ) -> Self {
-        let (axis, min_cos) = ProjectionRegion::cone(face, x0, x1, y0, y1, planet.face_resolution);
+    fn new(planet: &Planet, pose: &Pose, region: FaceRegion) -> Self {
+        let cone = DirectionCone::from_region(region, planet.face_resolution);
         let min_height = f64::from(planet.min_height);
         let max_height = f64::from(planet.max_height);
-        let min_projection = if min_height >= 0.0 {
-            min_height * min_cos
-        } else {
-            min_height
-        };
-        let radial_min = planet.radius.mul_add(min_cos, min_projection);
+        let radial_min = cone.minimum_radius(planet.radius, min_height);
         let radial_max = outer_displaced_radius(planet.radius, min_height, max_height);
         let pad = Vector::splat(
             512.0
@@ -2347,41 +2072,28 @@ impl PatchBounds {
         );
         // Convexity of the squared distance to a point on the cone axis
         // makes the extremal radial value occur at an endpoint.
-        let cone_axis = pose.rotation * axis;
+        let world_cone = cone.rotated(pose);
         let (sphere_center, sphere_radius) = if radial_min <= 0.0 {
             (pose.translation, radial_max + pad.x)
         } else {
             let center_radius = radial_min.midpoint(radial_max);
             let radius_at = |radial: f64| {
-                radial
-                    .mul_add(
-                        radial,
-                        center_radius
-                            .mul_add(center_radius, -2.0 * radial * center_radius * min_cos),
-                    )
-                    .max(0.0)
+                let delta = radial - center_radius;
+                delta
+                    .mul_add(delta, radial * center_radius * cone.chord.powi(2))
                     .sqrt()
             };
             (
-                pose.translation + cone_axis * center_radius,
+                pose.translation + world_cone.axis * center_radius,
                 radius_at(radial_min).max(radius_at(radial_max)) + pad.x,
             )
         };
-        let aabb =
-            displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad).transform_by(pose);
+        let aabb = cone.aabb(radial_min, radial_max, pad).transform_by(pose);
         Self {
-            region: ProjectionRegion {
-                face,
-                x0,
-                x1,
-                y0,
-                y1,
-                lower_distance2: 0.0,
-            },
+            region,
             aabb,
             origin: pose.translation,
-            cone_axis,
-            cone_cos: min_cos,
+            cone: world_cone,
             radial_min,
             radial_max,
             sphere_center,
@@ -2394,59 +2106,22 @@ impl PatchBounds {
     /// along a unit world direction. Inverted cones use the outer sphere.
     fn support_interval(&self, direction: Vector) -> (f64, f64) {
         let shift = self.origin.dot(direction);
-        if self.radial_min <= 0.0 {
-            return (
-                shift - self.radial_max - self.padding,
-                shift + self.radial_max + self.padding,
-            );
-        }
-        let cos_center = self.cone_axis.dot(direction).clamp(-1.0, 1.0);
-        let transverse = cos_center.mul_add(-cos_center, 1.0).max(0.0).sqrt()
-            * self.cone_cos.mul_add(-self.cone_cos, 1.0).max(0.0).sqrt();
-        let min_direction = if -cos_center >= self.cone_cos {
-            -1.0
-        } else {
-            cos_center.mul_add(self.cone_cos, -transverse).max(-1.0)
-        };
-        let max_direction = if cos_center >= self.cone_cos {
-            1.0
-        } else {
-            cos_center.mul_add(self.cone_cos, transverse).min(1.0)
-        };
-        let low = min_direction
-            * if min_direction >= 0.0 {
-                self.radial_min
-            } else {
-                self.radial_max
-            };
-        let high = max_direction
-            * if max_direction >= 0.0 {
-                self.radial_max
-            } else {
-                self.radial_min
-            };
+        let (low, high) = self
+            .cone
+            .radial_interval(direction, self.radial_min, self.radial_max);
         (shift + low - self.padding, shift + high + self.padding)
     }
 
     const fn is_leaf(&self) -> bool {
-        self.region.x1 - self.region.x0 == 1 && self.region.y1 - self.region.y0 == 1
+        self.region.cells.is_leaf()
     }
 
     /// Generate ready-to-use child bounds, dropping empty rectangles
     /// before evaluating costly angular cone geometry.
     fn children<'a>(&self, planet: &'a Planet, pose: &'a Pose) -> impl Iterator<Item = Self> + 'a {
-        let r = self.region;
-        let mid_x = r.x0 + (r.x1 - r.x0) / 2;
-        let mid_y = r.y0 + (r.y1 - r.y0) / 2;
-        [
-            (r.x0, mid_x, r.y0, mid_y),
-            (mid_x, r.x1, r.y0, mid_y),
-            (r.x0, mid_x, mid_y, r.y1),
-            (mid_x, r.x1, mid_y, r.y1),
-        ]
-        .into_iter()
-        .filter(|(x0, x1, y0, y1)| x0 < x1 && y0 < y1)
-        .map(move |(x0, x1, y0, y1)| Self::new(planet, pose, r.face, x0, x1, y0, y1))
+        self.region
+            .children()
+            .map(move |region| Self::new(planet, pose, region))
     }
 
     fn extent_squared(&self) -> f64 {
@@ -2558,10 +2233,10 @@ fn visit_planet_pair_triangles(
     let mut queue = BinaryHeap::new();
     let res1 = first.face_resolution;
     let res2 = second.face_resolution;
-    for f1 in crate::cubemap::Face::iter() {
-        let a = PatchBounds::new(first, &Pose::IDENTITY, f1, 0, res1, 0, res1);
-        for f2 in crate::cubemap::Face::iter() {
-            let b = PatchBounds::new(second, pos12, f2, 0, res2, 0, res2);
+    for region1 in FaceRegion::roots(res1) {
+        let a = PatchBounds::new(first, &Pose::IDENTITY, region1);
+        for region2 in FaceRegion::roots(res2) {
+            let b = PatchBounds::new(second, pos12, region2);
             let candidate = PlanetPairRegion::new(a, b);
             if candidate.lower <= *limit + roundoff {
                 queue.push(candidate);
@@ -2572,19 +2247,10 @@ fn visit_planet_pair_triangles(
         if candidate.lower > *limit + roundoff {
             break;
         }
-        if candidate.first.is_leaf() && candidate.second.is_leaf() {
-            let a = candidate.first.region;
-            let b = candidate.second.region;
-            let coords1 = Coords {
-                face: a.face,
-                x: a.x0,
-                y: a.y0,
-            };
-            let coords2 = Coords {
-                face: b.face,
-                x: b.x0,
-                y: b.y0,
-            };
+        if let (Some(coords1), Some(coords2)) = (
+            candidate.first.region.leaf(),
+            candidate.second.region.leaf(),
+        ) {
             let enlarged = candidate.second.aabb.loosened(*limit + roundoff);
             let bounds = enlarged.bounding_sphere();
             let mut continue_query = true;
@@ -3222,19 +2888,14 @@ fn visit_swept_triangles(
 ) {
     let bounds = aabb.bounding_sphere();
     let resolution = planet.face_resolution;
-    let mut stack: Vec<_> = crate::cubemap::Face::iter()
-        .map(|face| PatchBounds::new(planet, &Pose::IDENTITY, face, 0, resolution, 0, resolution))
+    let mut stack: Vec<_> = FaceRegion::roots(resolution)
+        .map(|region| PatchBounds::new(planet, &Pose::IDENTITY, region))
         .collect();
     while let Some(patch) = stack.pop() {
         if !patch.aabb.intersects(aabb) {
             continue;
         }
-        if patch.is_leaf() {
-            let coords = Coords {
-                face: patch.region.face,
-                x: patch.region.x0,
-                y: patch.region.y0,
-            };
+        if let Some(coords) = patch.region.leaf() {
             if !planet.map_elements_in_chunk(coords, &bounds, aabb, &mut visit) {
                 return;
             }
@@ -3758,6 +3419,12 @@ impl Patch {
         result.clamp(Vec2::ZERO, Vec2::ONE)
     }
 
+    fn quad_at_direction(&self, side: u32, direction: &Vector) -> Quad {
+        let uv = self.project(direction);
+        let (x, y) = crate::cubemap::discretize(side, na::Point2::new(uv.x, uv.y));
+        Quad::new(self, side, na::Vector2::new(x, y))
+    }
+
     fn quads(&self, chunk_resolution: u32) -> impl Iterator<Item = Quad> + '_ {
         let quad_resolution = chunk_resolution - 1;
         (0..quad_resolution).flat_map(move |y| {
@@ -4190,7 +3857,7 @@ mod tests {
         let planet = Planet::new(Arc::new(Depression(depressed)), 1, 10.0).unwrap();
         let direction = low.direction(4, &na::Point2::new(0.999, 0.5)).into_inner();
         let query = Vector::new(direction.x, direction.y, direction.z) * 3.0;
-        assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+        assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
         let (_, expected_surface, winner) = brute_force_projection(&planet, query);
         assert_eq!(winner, depressed);
         let (projection, _) = planet.project_local_point_and_get_feature(query);
@@ -4255,6 +3922,87 @@ mod tests {
     }
 
     #[test]
+    fn shared_grid_partition_covers_odd_and_narrow_rectangles_exactly_once() {
+        for width in 1..=17 {
+            for height in 1..=17 {
+                let mut stack = vec![GridRect::new(u32::MAX - width, u32::MAX, 0, height)];
+                let mut leaves = std::collections::HashSet::new();
+                while let Some(rect) = stack.pop() {
+                    if rect.is_leaf() {
+                        assert!(leaves.insert((rect.x0, rect.y0)));
+                        assert_eq!(rect.children().count(), 0);
+                    } else {
+                        stack.extend(rect.children());
+                    }
+                }
+                assert_eq!(leaves.len(), (width * height) as usize);
+                for x in u32::MAX - width..u32::MAX {
+                    for y in 0..height {
+                        assert!(leaves.contains(&(x, y)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_patch_bounds_remain_tight_and_enclose_real_geometry() {
+        const RADIUS: f64 = 6_371_000.0;
+        const RESOLUTION: u32 = 1 << 31;
+        let planet = Planet::new(
+            Arc::new(FlatTerrain::new(RESOLUTION, 3).unwrap()),
+            1,
+            RADIUS,
+        )
+        .unwrap();
+        for face in Face::iter() {
+            for (x, y) in [
+                (0, 0),
+                (RESOLUTION / 2, RESOLUTION / 2),
+                (RESOLUTION - 1, RESOLUTION - 1),
+            ] {
+                let coords = Coords { face, x, y };
+                let bounds =
+                    PatchBounds::new(&planet, &Pose::IDENTITY, FaceRegion::from_coords(coords));
+                assert!(
+                    (bounds.aabb.maxs - bounds.aabb.mins).length() < 0.03,
+                    "{bounds:?}"
+                );
+                assert!(bounds.sphere_radius < 0.02, "{bounds:?}");
+                let patch = Patch::new(&coords, RESOLUTION);
+                for (_, triangle) in patch.triangles(RADIUS, 3, &[0.0; 9]) {
+                    for point in [
+                        triangle.a,
+                        triangle.b,
+                        triangle.c,
+                        (triangle.a + triangle.b + triangle.c) / 3.0,
+                    ] {
+                        assert!(
+                            bounds.aabb.mins.cmple(point).all()
+                                && bounds.aabb.maxs.cmpge(point).all(),
+                            "{point:?} outside {bounds:?}"
+                        );
+                        assert!(bounds.sphere_center.distance(point) <= bounds.sphere_radius);
+                        for direction in [
+                            Vector::X,
+                            Vector::Y,
+                            Vector::Z,
+                            Vector::new(1.0, 2.0, -3.0).normalize(),
+                        ] {
+                            let (lo, hi) = bounds.support_interval(direction);
+                            let projected = direction.dot(point);
+                            assert!(
+                                lo <= projected && projected <= hi,
+                                "{lo} <= {projected} <= {hi}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn projection_region_bound_includes_interiors_of_raised_triangles() {
         // A face with all four corner vertices displaced to radius 20 has
         // triangle points at radius 20/sqrt(3). A vertex-only radial lower
@@ -4267,12 +4015,12 @@ mod tests {
             min_height: 10.0,
             max_height: 10.0,
         };
-        let region = ProjectionRegion::new(Face::Px, 0, 1, 0, 1, &query);
+        let region = RankedRegion::projection(FaceRegion::new(Face::Px, 0, 1, 0, 1), &query);
         let actual_distance2 = (20.0_f64 / 3.0_f64.sqrt()).powi(2);
         assert!(
-            region.lower_distance2 <= actual_distance2,
+            region.lower_bound <= actual_distance2,
             "pruning bound {} exceeds closest triangle interior {actual_distance2}",
-            region.lower_distance2
+            region.lower_bound
         );
     }
 
@@ -4340,16 +4088,19 @@ mod tests {
                                     min_height: min_h,
                                     max_height: max_h,
                                 };
-                                let region = ProjectionRegion::new(face, x0, x1, y0, y1, &query);
+                                let region = RankedRegion::projection(
+                                    FaceRegion::new(face, x0, x1, y0, y1),
+                                    &query,
+                                );
                                 let query_point = axis * query_radius;
                                 for &point in &mesh_points {
                                     let d2 = point.distance_squared(query_point);
                                     assert!(
-                                        region.lower_distance2 <= d2 + 1.0e-9,
+                                        region.lower_bound <= d2 + 1.0e-9,
                                         "region bound {} > point distance {d2}; \
 face={face:?}, res={resolution}, rect=({x0},{x1},{y0},{y1}), \
 heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
-                                        region.lower_distance2
+                                        region.lower_bound
                                     );
                                 }
                             }
@@ -4385,7 +4136,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
             let planet = Planet::new(source, 1, 10.0).unwrap();
             let direction = low.direction(4, &na::Point2::from(uv)).into_inner();
             let query = Vector::new(direction.x, direction.y, direction.z) * 15.0;
-            assert_eq!(Coords::from_vector(4, &na3f32(query)), low);
+            assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
             let (expected_dist2, expected_pt, winning_patch) =
                 brute_force_projection(&planet, query);
             assert_eq!(winning_patch, high);
@@ -4757,7 +4508,7 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                         let x1 = x0 + 1 + next() % (side - x0);
                         let y0 = next() % side;
                         let y1 = y0 + 1 + next() % (side - y0);
-                        let region = QuadCellRegion { x0, x1, y0, y1 };
+                        let region = GridRect { x0, x1, y0, y1 };
                         let bound = search.conservative_bounds(region);
                         for row in y0..y1 {
                             for col in x0..x1 {
@@ -5594,7 +5345,8 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                     (0, 1, 1, 2),
                     (1, 2, 1, 2),
                 ] {
-                    let region = PatchBounds::new(planet, &pose, face, x0, x1, y0, y1);
+                    let region =
+                        PatchBounds::new(planet, &pose, FaceRegion::new(face, x0, x1, y0, y1));
                     for (coords, tris) in tiles {
                         if coords.face != face
                             || coords.x < x0
@@ -5639,25 +5391,9 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
         let dispatcher = DefaultQueryDispatcher;
         for pose in poses {
             for (at1, tris1) in &first_tiles {
-                let a = PatchBounds::new(
-                    &first,
-                    &Pose::IDENTITY,
-                    at1.face,
-                    at1.x,
-                    at1.x + 1,
-                    at1.y,
-                    at1.y + 1,
-                );
+                let a = PatchBounds::new(&first, &Pose::IDENTITY, FaceRegion::from_coords(*at1));
                 for (at2, tris2) in &second_tiles {
-                    let b = PatchBounds::new(
-                        &second,
-                        &pose,
-                        at2.face,
-                        at2.x,
-                        at2.x + 1,
-                        at2.y,
-                        at2.y + 1,
-                    );
+                    let b = PatchBounds::new(&second, &pose, FaceRegion::from_coords(*at2));
                     let lower = PlanetPairRegion::new(a, b).lower;
                     let mut exact = f64::INFINITY;
                     for tri1 in tris1 {

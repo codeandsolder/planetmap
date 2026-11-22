@@ -160,7 +160,7 @@ impl<T> CubeMap<T> {
     #[must_use]
     pub fn from_fn(
         resolution: u32,
-        mut f: impl FnMut(na::Unit<na::Vector3<f32>>) -> T,
+        mut f: impl FnMut(na::Unit<na::Vector3<f64>>) -> T,
     ) -> Option<Box<Self>> {
         Self::allocate_with(resolution, |i| get_dir(resolution, i).map(&mut f))
     }
@@ -235,29 +235,27 @@ impl<T> IndexMut<Coords> for CubeMap<T> {
     }
 }
 
-impl<'a, T> Index<&'a na::Vector3<f32>> for CubeMap<T> {
+impl<'a, T> Index<&'a na::Vector3<f64>> for CubeMap<T> {
     type Output = T;
-    fn index(&self, x: &'a na::Vector3<f32>) -> &T {
+    fn index(&self, x: &'a na::Vector3<f64>) -> &T {
         &self.data[index(self.resolution, x)]
     }
 }
 
-impl<'a, T> IndexMut<&'a na::Vector3<f32>> for CubeMap<T> {
-    fn index_mut(&mut self, x: &'a na::Vector3<f32>) -> &mut T {
+impl<'a, T> IndexMut<&'a na::Vector3<f64>> for CubeMap<T> {
+    fn index_mut(&mut self, x: &'a na::Vector3<f64>) -> &mut T {
         &mut self.data[index(self.resolution, x)]
     }
 }
 
-fn index(resolution: u32, x: &na::Vector3<f32>) -> usize {
-    let (face, coords) = Face::coords(x);
-    let texcoords = coords * 0.5 + na::Vector2::new(0.5, 0.5);
-    let texel = discretize(resolution, texcoords);
+fn index(resolution: u32, direction: &na::Vector3<f64>) -> usize {
+    let Coords { x, y, face } = Coords::from_vector(resolution, direction);
     let dimension = resolution as usize;
-    face as usize * dimension * dimension + (texel.1 as usize) * dimension + texel.0 as usize
+    face as usize * dimension * dimension + y as usize * dimension + x as usize
 }
 
 impl<'a, T> IntoIterator for &'a CubeMap<T> {
-    type Item = (na::Unit<na::Vector3<f32>>, &'a T);
+    type Item = (na::Unit<na::Vector3<f64>>, &'a T);
     type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -276,7 +274,7 @@ pub struct Iter<'a, T> {
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = (na::Unit<na::Vector3<f32>>, &'a T);
+    type Item = (na::Unit<na::Vector3<f64>>, &'a T);
     fn next(&mut self) -> Option<Self::Item> {
         let dir = get_dir(self.resolution, self.index)?;
         let value = &self.data[self.index];
@@ -297,7 +295,7 @@ impl<T> ExactSizeIterator for Iter<'_, T> {
 }
 
 impl<'a, T> IntoIterator for &'a mut CubeMap<T> {
-    type Item = (na::Unit<na::Vector3<f32>>, &'a mut T);
+    type Item = (na::Unit<na::Vector3<f64>>, &'a mut T);
     type IntoIter = IterMut<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -314,7 +312,7 @@ pub struct IterMut<'a, T> {
 }
 
 impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = (na::Unit<na::Vector3<f32>>, &'a mut T);
+    type Item = (na::Unit<na::Vector3<f64>>, &'a mut T);
     fn next(&mut self) -> Option<Self::Item> {
         let (index, value) = self.data.next()?;
         Some((get_dir(self.resolution, index)?, value))
@@ -331,7 +329,7 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {
     }
 }
 
-fn get_dir(resolution: u32, index: usize) -> Option<na::Unit<na::Vector3<f32>>> {
+fn get_dir(resolution: u32, index: usize) -> Option<na::Unit<na::Vector3<f64>>> {
     let dimension = usize::try_from(resolution).ok()?;
     let face_size = dimension.checked_mul(dimension)?;
     let total = face_size.checked_mul(6)?;
@@ -508,6 +506,59 @@ impl Face {
     }
 }
 
+// Conservative rounding allowance in unit-direction and unit-grid space.
+const ANGULAR_ROUNDOFF: f64 = 64.0 * f64::EPSILON;
+
+fn face_to_grid(x: f64) -> f64 {
+    unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0).clamp(0.0, 1.0)
+}
+
+// Range of one component of a unit vector inside an angular cap.
+// The extrema may be at the +/- cardinal directions, not the rim.
+fn cap_range(axis: f64, transverse: f64, cos: f64, sin: f64) -> (f64, f64) {
+    let perpendicular = transverse * sin;
+    let min = if -axis >= cos {
+        -1.0
+    } else {
+        axis.mul_add(cos, -perpendicular)
+    };
+    let max = if axis >= cos {
+        1.0
+    } else {
+        axis.mul_add(cos, perpendicular)
+    };
+    (min, max)
+}
+
+// Exact maximum angular dot product for points in the face's
+// projective square. The maximum is attained at an interior point,
+// a stationary point on one of its four edges, or a corner.
+fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
+    if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
+        return 1.0;
+    }
+    let mut best = f64::NEG_INFINITY;
+    let mut consider = |x: f64, y: f64| {
+        let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
+        let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
+        best = best.max(dot / length);
+    };
+    for edge in [-1.0, 1.0] {
+        for corner in [-1.0, 1.0] {
+            consider(edge, corner);
+        }
+        let x_edge = direction.x.mul_add(edge, direction.z);
+        if x_edge > 0.0 {
+            consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
+        }
+        let y_edge = direction.y.mul_add(edge, direction.z);
+        if y_edge > 0.0 {
+            consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
+        }
+    }
+    best
+}
+
 /// Coordinates in a discretized cubemap
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Coords {
@@ -518,34 +569,25 @@ pub struct Coords {
 
 impl Coords {
     #[must_use]
-    pub fn from_vector(resolution: u32, vector: &na::Vector3<f32>) -> Self {
+    pub fn from_vector(resolution: u32, vector: &na::Vector3<f64>) -> Self {
         Self::from_vector_with_coords(resolution, vector).0
     }
 
-    /// Compute the coordinates of the cell containing `vector`, and its [0..1]^2 coordinates within
-    /// that cell
+    /// Compute the coordinates of the cell containing a finite nonzero vector,
+    /// and its [0..1]^2 coordinates within that cell.
     #[must_use]
     pub fn from_vector_with_coords(
         resolution: u32,
-        vector: &na::Vector3<f32>,
-    ) -> (Self, na::Point2<f32>) {
+        vector: &na::Vector3<f64>,
+    ) -> (Self, na::Point2<f64>) {
         let (face, coords) = Face::coords(vector);
         let coords = coords * 0.5 + na::Vector2::new(0.5, 0.5);
         let (x, y) = discretize(resolution, coords);
-        let local = if resolution == 0 {
-            na::Point2::origin()
-        } else {
-            let scale = f64::from(resolution);
-            na::Point2::new(
-                f64::from(coords.x)
-                    .mul_add(scale, -f64::from(x))
-                    .clamp(0.0, 1.0),
-                f64::from(coords.y)
-                    .mul_add(scale, -f64::from(y))
-                    .clamp(0.0, 1.0),
-            )
-            .cast()
-        };
+        let scale = f64::from(resolution);
+        let local = na::Point2::new(
+            coords.x.mul_add(scale, -f64::from(x)).clamp(0.0, 1.0),
+            coords.y.mul_add(scale, -f64::from(y)).clamp(0.0, 1.0),
+        );
         (Self { x, y, face }, local)
     }
 
@@ -604,77 +646,21 @@ impl Coords {
     /// produce an empty iterator.
     pub fn neighborhood(
         resolution: u32,
-        direction: na::Vector3<f32>,
-        theta: f32,
+        direction: na::Vector3<f64>,
+        theta: f64,
     ) -> impl Iterator<Item = Self> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "cubemap discretization is defined in f32 and the coordinate is bounded to [0, 1]"
-        )]
-        fn to_grid(x: f64) -> f32 {
-            (unwarp(x.clamp(-1.0, 1.0)).midpoint(1.0) as f32).clamp(0.0, 1.0)
-        }
-
-        // Range of one component of a unit vector inside an angular cap.
-        // The extrema may be at the +/- cardinal directions, not the rim.
-        fn cap_range(axis: f64, cos: f64, sin: f64) -> (f64, f64) {
-            let perpendicular = axis.mul_add(-axis, 1.0).max(0.0).sqrt() * sin;
-            let min = if -axis >= cos {
-                -1.0
-            } else {
-                axis.mul_add(cos, -perpendicular)
-            };
-            let max = if axis >= cos {
-                1.0
-            } else {
-                axis.mul_add(cos, perpendicular)
-            };
-            (min, max)
-        }
-
-        // Exact maximum angular dot product for points in the face's
-        // projective square. The maximum is attained at an interior point,
-        // a stationary point on one of its four edges, or a corner.
-        fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
-            if direction.z >= direction.x.abs() && direction.z >= direction.y.abs() {
-                return 1.0;
-            }
-            let mut best = f64::NEG_INFINITY;
-            let mut consider = |x: f64, y: f64| {
-                let dot = direction.x.mul_add(x, direction.y.mul_add(y, direction.z));
-                let length = x.mul_add(x, y.mul_add(y, 1.0)).sqrt();
-                best = best.max(dot / length);
-            };
-            for edge in [-1.0, 1.0] {
-                for corner in [-1.0, 1.0] {
-                    consider(edge, corner);
-                }
-                let x_edge = direction.x.mul_add(edge, direction.z);
-                if x_edge > 0.0 {
-                    consider(edge, (2.0 * direction.y / x_edge).clamp(-1.0, 1.0));
-                }
-                let y_edge = direction.y.mul_add(edge, direction.z);
-                if y_edge > 0.0 {
-                    consider((2.0 * direction.x / y_edge).clamp(-1.0, 1.0), edge);
-                }
-            }
-            best
-        }
-
         let valid = resolution != 0 && theta.is_finite() && theta >= 0.0;
-        let axis = na::Vector3::new(
-            f64::from(direction.x),
-            f64::from(direction.y),
-            f64::from(direction.z),
-        );
-        let axis = if axis.iter().all(|x| x.is_finite()) {
-            axis.try_normalize(0.0)
+        // Scale first: normalization must also work for finite vectors whose
+        // squared norm would overflow or underflow.
+        let scale = direction.amax();
+        let axis = if direction.iter().all(|x| x.is_finite()) && scale > 0.0 {
+            (direction / scale).try_normalize(0.0)
         } else {
             None
         };
-        // The small angular margin includes face and texel boundaries after
-        // the final f32 discretization, without moving interior samples.
-        let angle = (f64::from(theta) + 1.0e-6).min(std::f64::consts::PI);
+        // Roundoff at the cap/face or cap/cell boundary must not discard
+        // geometrically touching cells.
+        let angle = (theta + ANGULAR_ROUNDOFF).min(std::f64::consts::PI);
         let (sin, cos) = angle.sin_cos();
         Face::iter()
             .filter_map(move |face| {
@@ -686,16 +672,16 @@ impl Coords {
                 // Reject faces that the cone cannot physically reach. Without
                 // this check, a tiny cone near a face's horizon could scan
                 // every texel of that face due to the 1/z projection.
-                if face_max_dot(local) < cos {
+                if face_max_dot(local) < cos - ANGULAR_ROUNDOFF {
                     return None;
                 }
-                let (lo_x, hi_x) = cap_range(local.x, cos, sin);
-                let (lo_y, hi_y) = cap_range(local.y, cos, sin);
-                let (lo_z, hi_z) = cap_range(local.z, cos, sin);
-                if hi_z <= 0.0 {
+                let (lo_x, hi_x) = cap_range(local.x, local.y.hypot(local.z), cos, sin);
+                let (lo_y, hi_y) = cap_range(local.y, local.x.hypot(local.z), cos, sin);
+                let (lo_z, hi_z) = cap_range(local.z, local.x.hypot(local.y), cos, sin);
+                if hi_z < -ANGULAR_ROUNDOFF {
                     return None;
                 }
-                let ((x_min, y_min), (x_max, y_max)) = if lo_z <= 0.0 {
+                let ((x_min, y_min), (x_max, y_max)) = if lo_z <= ANGULAR_ROUNDOFF {
                     // The cone touches the projection horizon; even finite
                     // component bounds can correspond to unbounded x/z,y/z.
                     ((-1.0, -1.0), (1.0, 1.0))
@@ -707,13 +693,27 @@ impl Coords {
                         (ratio_max(hi_x), ratio_max(hi_y)),
                     )
                 };
-                if x_min > 1.0 || y_min > 1.0 || x_max < -1.0 || y_max < -1.0 {
+                if x_min > 1.0 + ANGULAR_ROUNDOFF
+                    || y_min > 1.0 + ANGULAR_ROUNDOFF
+                    || x_max < -1.0 - ANGULAR_ROUNDOFF
+                    || y_max < -1.0 - ANGULAR_ROUNDOFF
+                {
                     return None;
                 }
-                let (x0, y0) =
-                    discretize(resolution, na::Point2::new(to_grid(x_min), to_grid(y_min)));
-                let (x1, y1) =
-                    discretize(resolution, na::Point2::new(to_grid(x_max), to_grid(y_max)));
+                let (x0, y0) = discretize(
+                    resolution,
+                    na::Point2::new(
+                        face_to_grid(x_min) - ANGULAR_ROUNDOFF,
+                        face_to_grid(y_min) - ANGULAR_ROUNDOFF,
+                    ),
+                );
+                let (x1, y1) = discretize(
+                    resolution,
+                    na::Point2::new(
+                        face_to_grid(x_max) + ANGULAR_ROUNDOFF,
+                        face_to_grid(y_max) + ANGULAR_ROUNDOFF,
+                    ),
+                );
                 Some((face, x0, x1, y0, y1))
             })
             .flat_map(move |(face, x0, x1, y0, y1)| {
@@ -721,29 +721,36 @@ impl Coords {
             })
     }
 
-    /// The approximate direction represented by these coordinates
+    /// The direction through the center of this cell.
     #[must_use]
     pub fn center<N: RealField + Copy>(&self, resolution: u32) -> na::Unit<na::Vector3<N>> {
-        let denominator = f64::from(resolution);
-        let centered = |index| (f64::from(index).mul_add(2.0, 1.0) - denominator) / denominator;
-        self.face
-            .direction(&na::Point2::new(centered(self.x), centered(self.y)).cast())
+        self.face.direction(
+            &self
+                .face_position(resolution, na::Point2::new(0.5, 0.5))
+                .cast(),
+        )
+    }
+
+    fn face_position(&self, resolution: u32, local: na::Point2<f64>) -> na::Point2<f64> {
+        let scale = f64::from(resolution);
+        let centered =
+            |index, uv: f64| uv.mul_add(2.0, f64::from(index).mul_add(2.0, -scale)) / scale;
+        na::Point2::new(centered(self.x, local.x), centered(self.y, local.y))
     }
 
     /// Compute the direction identified by a point in the [0..1]^2 area covered by these
-    /// coordinates
+    /// coordinates. Address arithmetic is performed in f64 before conversion to the output type.
     #[must_use]
-    pub fn direction<N: RealField + Copy>(
+    pub fn direction<N: RealField + Copy + Into<f64>>(
         &self,
         resolution: u32,
         coords: &na::Point2<N>,
     ) -> na::Unit<na::Vector3<N>> {
-        let edge_length = Self::edge_length::<N>(resolution);
-        let origin_on_face = na::Point2::from(
-            na::Vector2::new(f64::from(self.x), f64::from(self.y)).cast() * edge_length,
-        ) - na::Vector2::new(1.0, 1.0).cast();
-        let pos_on_face = origin_on_face + coords.coords * edge_length;
-        self.face.direction(&pos_on_face)
+        self.face.direction(
+            &self
+                .face_position(resolution, coords.map(Into::into))
+                .cast(),
+        )
     }
 
     /// Length of an edge of the bounding square of the cubemap-space area covered by a coordinate
@@ -839,7 +846,7 @@ pub(crate) fn unwarp<N: RealField + Copy>(x: N) -> N {
         * x;
 
     // Refine estimate with newton's method
-    for _ in 0..2 {
+    for _ in 0..4 {
         estimate -= (warp(estimate) - x) / dwarp(estimate);
     }
 
@@ -901,6 +908,17 @@ impl<T> IndexMut<Edge> for [T] {
     }
 }
 
+fn sample_position(index: u64, resolution: u32) -> Option<na::Point2<f64>> {
+    if resolution == 1 {
+        return Some(na::Point2::new(0.5, 0.5));
+    }
+    let edge = u64::from(resolution);
+    let x = u32::try_from(index % edge).ok()?;
+    let y = u32::try_from(index / edge).ok()?;
+    let max = f64::from(resolution - 1);
+    Some(na::Point2::new(f64::from(x) / max, f64::from(y) / max))
+}
+
 /// Iterator over sample points distributed in a regular grid across a chunk, including its edges
 #[derive(Debug)]
 pub struct SampleIter<N> {
@@ -919,16 +937,9 @@ impl<N: RealField + Copy> Iterator for SampleIter<N> {
         if self.index >= edge * edge {
             return None;
         }
-        let max = self.chunk_resolution - 1;
-        let coords = if max == 0 {
-            na::Point2::new(0.5, 0.5).cast::<N>()
-        } else {
-            let step = 1.0 / f64::from(max);
-            let x = u32::try_from(self.index % edge).ok()?;
-            let y = u32::try_from(self.index / edge).ok()?;
-            na::Point2::new(f64::from(x), f64::from(y)).cast::<N>() * na::convert::<f64, N>(step)
-        };
-        let dir = self.coords.direction(self.face_resolution, &coords);
+        let local = sample_position(self.index, self.chunk_resolution)?;
+        let pos = self.coords.face_position(self.face_resolution, local);
+        let dir = self.coords.face.direction(&pos.cast());
         self.index += 1;
         Some(dir)
     }
@@ -966,8 +977,8 @@ pub struct SampleIterSimd<S> {
 impl<S: Simd> Iterator for SampleIterSimd<S> {
     type Item = [S::f32s; 3];
     #[expect(
-        clippy::cast_precision_loss,
-        reason = "The SIMD terrain sample interface uses f32 lanes, so u32 grid indices are necessarily rounded to f32"
+        clippy::cast_possible_truncation,
+        reason = "The SIMD interface deliberately returns f32 samples; normalized face positions are narrowed only after f64 addressing"
     )]
     fn next(&mut self) -> Option<Self::Item> {
         let edge = u64::from(self.chunk_resolution);
@@ -975,33 +986,23 @@ impl<S: Simd> Iterator for SampleIterSimd<S> {
         if self.index >= total {
             return None;
         }
-        let edge_length = Coords::edge_length::<f32>(self.face_resolution);
-        let origin_on_face_x = (self.coords.x as f32).mul_add(edge_length, -1.0);
-        let origin_on_face_y = (self.coords.y as f32).mul_add(edge_length, -1.0);
-        let max = self.chunk_resolution - 1;
-        let (offset_x, offset_y) = if max == 0 {
-            let v = S::f32s::splat(self.simd, 0.5 * edge_length);
-            (v, v)
-        } else {
-            let step = edge_length / max as f32;
-            let mut xs = S::f32s::splat(self.simd, 0.0);
-            for (lane, x) in xs.as_mut_slice().iter_mut().enumerate() {
-                let lane = u64::try_from(lane).ok()?;
-                let sample = self.index.saturating_add(lane).min(total - 1);
-                let column = u32::try_from(sample % edge).ok()?;
-                *x = column as f32;
-            }
-            let mut ys = S::f32s::splat(self.simd, 0.0);
-            for (lane, y) in ys.as_mut_slice().iter_mut().enumerate() {
-                let lane = u64::try_from(lane).ok()?;
-                let sample = self.index.saturating_add(lane).min(total - 1);
-                let row = u32::try_from(sample / edge).ok()?;
-                *y = row as f32;
-            }
-            (xs * step, ys * step)
-        };
-        let pos_on_face_x = offset_x + origin_on_face_x;
-        let pos_on_face_y = offset_y + origin_on_face_y;
+        let mut pos_on_face_x = S::f32s::splat(self.simd, 0.0);
+        let mut pos_on_face_y = S::f32s::splat(self.simd, 0.0);
+        for (lane, (x, y)) in pos_on_face_x
+            .as_mut_slice()
+            .iter_mut()
+            .zip(pos_on_face_y.as_mut_slice())
+            .enumerate()
+        {
+            let lane = u64::try_from(lane).ok()?;
+            let sample = self.index.saturating_add(lane).min(total - 1);
+            let position = self.coords.face_position(
+                self.face_resolution,
+                sample_position(sample, self.chunk_resolution)?,
+            );
+            *x = position.x as f32;
+            *y = position.y as f32;
+        }
 
         let warped_x = warp_ps(pos_on_face_x);
         let warped_y = warp_ps(pos_on_face_y);
@@ -1053,23 +1054,19 @@ impl<S: Simd> ExactSizeIterator for SampleIterSimd<S> {
 /// covers exactly the same distance
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "The normalized f32 grid position is bounded before converting to a u32 cell index"
+    reason = "The normalized f64 grid position is bounded before converting to a u32 cell index"
 )]
 #[expect(
     clippy::cast_sign_loss,
     reason = "Negative and non-finite coordinates are normalized before converting to a u32 cell index"
 )]
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "The cubemap address space is defined in f32; preserving f32 multiplication also preserves edge rounding"
-)]
-fn discretize(resolution: u32, texcoords: na::Point2<f32>) -> (u32, u32) {
+pub(crate) fn discretize(resolution: u32, texcoords: na::Point2<f64>) -> (u32, u32) {
     if resolution == 0 {
         return (0, 0);
     }
     let last = resolution - 1;
-    let grid = resolution as f32;
-    let to_grid = |coordinate: f32| {
+    let grid = f64::from(resolution);
+    let to_grid = |coordinate: f64| {
         let normalized = if coordinate.is_finite() {
             coordinate.clamp(0.0, 1.0)
         } else {
@@ -1272,7 +1269,85 @@ mod test {
                 let (coords, local) = Coords::from_vector_with_coords(resolution, &direction);
                 assert!((local.x - 0.5).abs() < 1.0e-5);
                 assert!((local.y - 0.5).abs() < 1.0e-5);
-                assert_abs_diff_eq!(coords.center::<f32>(resolution), direction);
+                assert_abs_diff_eq!(coords.center::<f64>(resolution), direction);
+            }
+        }
+    }
+
+    #[test]
+    fn deepest_grid_addresses_roundtrip_across_every_face() {
+        for resolution in [1 << 24, 1 << 31, u32::MAX] {
+            let mut random = 0x85f2_4c97_u32;
+            let mut next = || {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                random % resolution
+            };
+            for face in Face::iter() {
+                for (x, y) in [
+                    (0, 0),
+                    (resolution - 1, resolution - 1),
+                    (resolution / 2, resolution / 2),
+                    (resolution / 2 - 1, resolution / 2 + 1),
+                ]
+                .into_iter()
+                .chain((0..128).map(|_| (next(), next())))
+                {
+                    let coords = Coords { x, y, face };
+                    for local in [na::Point2::new(0.5, 0.5), na::Point2::new(0.2, 0.8)] {
+                        let direction = coords.direction(resolution, &local);
+                        let (actual, uv) = Coords::from_vector_with_coords(resolution, &direction);
+                        assert_eq!(actual, coords);
+                        assert_abs_diff_eq!(uv, local, epsilon = 1e-5);
+                        let nearby: Vec<_> =
+                            Coords::neighborhood(resolution, *direction, 0.0).collect();
+                        assert!(nearby.contains(&coords), "missed {coords:?} in {nearby:?}");
+                        assert!(
+                            nearby.len() <= 4,
+                            "unnecessarily broad zero-angle cone: {nearby:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cone_addressing_is_invariant_to_extreme_direction_magnitude() {
+        let direction = na::Vector3::new(1.0, 0.5, -0.25);
+        let expected: Vec<_> = Coords::neighborhood(128, direction, 0.01).collect();
+        for scale in [1e-310, 1e300] {
+            let scaled = direction * scale;
+            let actual: Vec<_> = Coords::neighborhood(128, scaled, 0.01).collect();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                Coords::from_vector(128, &scaled),
+                Coords::from_vector(128, &direction)
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_samples_match_at_non_power_of_two_and_deep_resolutions() {
+        for resolution in [3, 11, 1 << 24, 1 << 31, u32::MAX] {
+            for x in [0, resolution / 2, resolution - 2] {
+                let left = Coords {
+                    x,
+                    y: resolution / 2,
+                    face: Face::Pz,
+                };
+                let right = Coords { x: x + 1, ..left };
+                for samples in [2, 5, 8, 17] {
+                    let a: Vec<_> = left.samples::<f64>(resolution, samples).collect();
+                    let b: Vec<_> = right.samples::<f64>(resolution, samples).collect();
+                    for row in 0..samples as usize {
+                        assert_eq!(
+                            a[row * samples as usize + samples as usize - 1],
+                            b[row * samples as usize]
+                        );
+                    }
+                }
             }
         }
     }
@@ -1281,7 +1356,7 @@ mod test {
     fn vector_lookup_returns_local_coordinates_within_selected_cell() {
         for face in Face::iter() {
             let coords = Coords { x: 2, y: 5, face };
-            let local = na::Point2::new(0.2_f32, 0.8);
+            let local = na::Point2::new(0.2_f64, 0.8);
             let direction = coords.direction(8, &local);
             let (actual, uv) = Coords::from_vector_with_coords(8, &direction);
             assert_eq!(coords, actual);
@@ -1405,9 +1480,9 @@ mod test {
     fn discretize_sanity() {
         assert_eq!(discretize(100, na::Point2::new(1.0, 1.0)), (99, 99));
         assert_eq!(discretize(100, na::Point2::new(0.0, 0.0)), (0, 0));
-        assert_eq!(discretize(100, na::Point2::new(0.990, 0.990)), (99, 99));
+        assert_eq!(discretize(100, na::Point2::new(0.99, 0.99)), (99, 99));
         assert_eq!(discretize(100, na::Point2::new(0.989, 0.989)), (98, 98));
-        assert_eq!(discretize(100, na::Point2::new(0.010, 0.010)), (1, 1));
+        assert_eq!(discretize(100, na::Point2::new(0.01, 0.01)), (1, 1));
         assert_eq!(discretize(100, na::Point2::new(0.009, 0.009)), (0, 0));
 
         assert_eq!(discretize(2, na::Point2::new(0.49, 0.49)), (0, 0));
@@ -1537,14 +1612,14 @@ mod test {
         ];
         for direction in directions {
             let axis = direction.normalize();
-            for theta in [0.01_f32, 0.2, 0.5, 0.8, 1.2, 1.8, std::f32::consts::PI] {
+            for theta in [0.01_f64, 0.2, 0.5, 0.8, 1.2, 1.8, std::f64::consts::PI] {
                 let actual: HashSet<_> =
                     Coords::neighborhood(RESOLUTION, direction, theta).collect();
                 for face in Face::iter() {
                     for y in 0..RESOLUTION {
                         for x in 0..RESOLUTION {
                             let coords = Coords { x, y, face };
-                            let sample = coords.center::<f32>(RESOLUTION);
+                            let sample = coords.center::<f64>(RESOLUTION);
                             if axis.dot(sample.as_ref()) > theta.cos() + 1e-4 {
                                 assert!(
                                     actual.contains(&coords),

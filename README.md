@@ -28,6 +28,10 @@ level along a ray originating at the center of a planet. Streaming and
 level of detail can then be implemented with a `CacheManager`
 associated with GPU-resident buffers.
 
+For an exact capacity requirement for a particular set of viewpoints, use
+`cache::Config::slots_needed(viewpoints)`. It counts every desired chunk,
+including ancestors and roots, rather than assuming a worst-case direction.
+
 A transfer allocation returns an opaque generation-qualified token.
 Use its `slot()` to locate the GPU buffer region, then pass the token to
 `release` on successful completion or `cancel` on abandonment. An abandoned
@@ -47,6 +51,15 @@ interpolation in a vertex shader.
 - `fearless_simd` exposes `fearless_simd`-based iterators for data-parallel
   computation of sample coordinates within a `Chunk` or
   `cubemap::Coords`, useful for fast noise sampling
+
+## Coordinate precision
+
+Cubemap direction addressing, dense-map iteration, and angular neighborhood
+queries use f64 throughout so the entire supported u32 grid remains
+addressable. Scalar and SIMD sampling share the same exact cell positions;
+the SIMD interface narrows positions to f32 only at the final sampling stage.
+Use f64 scalar samples when distinct directions at the deepest quadtree
+levels are required.
 
 ## Collision query contracts
 
