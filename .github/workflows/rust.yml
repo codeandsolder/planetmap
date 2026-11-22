@@ -16,13 +16,13 @@ concurrency:
 jobs:
   strict-rust:
     name: Strict Rust and source policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@c9dbc011bec3c43a65b62a16cbf2a3f2e31a13cb # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@c2e8e783839a7d72e3a26d95e4a55027b26b53f3 # main
     with:
       cargo-args: --locked --workspace --all-targets --all-features
 
   tests:
     name: Rust 1.100.0 all-feature tests
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@411fd9e8b72b47b2d086b6c18671434cc019699a # main
     with:
       rust-toolchain: "1.100.0"
       command: cargo +1.100.0 test --locked --workspace --all-targets --all-features
