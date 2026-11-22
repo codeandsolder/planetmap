@@ -28,6 +28,10 @@ level along a ray originating at the center of a planet. Streaming and
 level of detail can then be implemented with a `CacheManager`
 associated with GPU-resident buffers.
 
+For an exact capacity requirement for a particular set of viewpoints, use
+`cache::Config::slots_needed(viewpoints)`. It counts every desired chunk,
+including ancestors and roots, rather than assuming a worst-case direction.
+
 A transfer allocation returns an opaque generation-qualified token.
 Use its `slot()` to locate the GPU buffer region, then pass the token to
 `release` on successful completion or `cancel` on abandonment. An abandoned

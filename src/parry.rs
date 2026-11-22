@@ -677,21 +677,7 @@ impl Planet {
         }
         let coords = Coords::from_vector(self.face_resolution, &cube_vector(ray.origin));
         let patch = Patch::new(&coords, self.face_resolution);
-        let quad_resolution = self.chunk_resolution - 1;
-        let uv = patch.project(&ray.origin) * f64::from(quad_resolution);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "The clamped normalized patch coordinate is within the u32 quad range"
-        )]
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "Patch coordinates are clamped nonnegative"
-        )]
-        let address = na::Vector2::new(
-            (uv.x.floor() as u32).min(quad_resolution - 1),
-            (uv.y.floor() as u32).min(quad_resolution - 1),
-        );
-        let quad = Quad::new(&patch, quad_resolution, address);
+        let quad = patch.quad_at_direction(self.chunk_resolution - 1, &ray.origin);
         let [a, b, c, d] = quad.corners;
         let margin = 512.0
             * f64::EPSILON
@@ -1651,14 +1637,6 @@ impl Planet {
     /// center, evaluating just two real triangles. Any valid candidate is a
     /// global *upper* distance bound, never an assumption about which patch
     /// wins; all closer faces are still visited by the proven hierarchy.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Validated normalized patch positions are clamped to the u32 quad grid"
-    )]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "Clamped normalized patch coordinates are never negative"
-    )]
     fn visit_proximity_seed_quad(
         &self,
         center: Vector,
@@ -1672,16 +1650,7 @@ impl Planet {
         let resolution = self.face_resolution;
         let coords = Coords::from_vector(resolution, &cube_vector(axis));
         let patch = Patch::new(&coords, resolution);
-        let side = self.chunk_resolution - 1;
-        let uv = patch.project(&axis) * f64::from(side);
-        let quad = Quad::new(
-            &patch,
-            side,
-            na::Vector2::new(
-                (uv.x.floor() as u32).min(side - 1),
-                (uv.y.floor() as u32).min(side - 1),
-            ),
-        );
+        let quad = patch.quad_at_direction(self.chunk_resolution - 1, &axis);
         let (_, data) = self.cached_chunk(&coords);
         for (index, triangle) in quad
             .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -3448,6 +3417,12 @@ impl Patch {
             project(self.a, self.b - self.a, self.d - self.b, *dir)
         };
         result.clamp(Vec2::ZERO, Vec2::ONE)
+    }
+
+    fn quad_at_direction(&self, side: u32, direction: &Vector) -> Quad {
+        let uv = self.project(direction);
+        let (x, y) = crate::cubemap::discretize(side, na::Point2::new(uv.x, uv.y));
+        Quad::new(self, side, na::Vector2::new(x, y))
     }
 
     fn quads(&self, chunk_resolution: u32) -> impl Iterator<Item = Quad> + '_ {

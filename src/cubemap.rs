@@ -1060,7 +1060,7 @@ impl<S: Simd> ExactSizeIterator for SampleIterSimd<S> {
     clippy::cast_sign_loss,
     reason = "Negative and non-finite coordinates are normalized before converting to a u32 cell index"
 )]
-fn discretize(resolution: u32, texcoords: na::Point2<f64>) -> (u32, u32) {
+pub(crate) fn discretize(resolution: u32, texcoords: na::Point2<f64>) -> (u32, u32) {
     if resolution == 0 {
         return (0, 0);
     }

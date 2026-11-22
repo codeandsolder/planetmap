@@ -85,24 +85,32 @@ impl Config {
         self.max_neighbor_delta
     }
 
-    /// Number of slots needed by this config to represent maximum detail for a worst-case viewpoint
+    /// Number of slots required to retain every chunk selected by these viewpoints,
+    /// including all ancestors and the six roots. Returns `None` if the count
+    /// cannot be represented as a `usize`.
     #[must_use]
-    pub fn slots_needed(&self) -> Option<usize> {
+    pub fn slots_needed(&self, viewpoints: &[na::Point3<f64>]) -> Option<usize> {
         Face::iter()
             .map(Chunk::root)
             .try_fold(0_usize, |sum, chunk| {
-                sum.checked_add(self.slots_needed_inner(&chunk)?)
+                sum.checked_add(self.slots_needed_inner(&chunk, viewpoints)?)
             })
     }
 
-    fn slots_needed_inner(&self, chunk: &Chunk) -> Option<usize> {
-        let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
-        if chunk.depth == self.max_depth || !needs_subdivision(chunk, &viewpoint) {
+    fn should_subdivide(&self, chunk: &Chunk, viewpoints: &[na::Point3<f64>]) -> bool {
+        chunk.depth < self.max_depth
+            && viewpoints
+                .iter()
+                .any(|viewpoint| needs_subdivision(chunk, viewpoint))
+    }
+
+    fn slots_needed_inner(&self, chunk: &Chunk, viewpoints: &[na::Point3<f64>]) -> Option<usize> {
+        if !self.should_subdivide(chunk, viewpoints) {
             return Some(1);
         }
         let children = chunk.children()?;
         children.iter().try_fold(1_usize, |sum, child| {
-            sum.checked_add(self.slots_needed_inner(child)?)
+            sum.checked_add(self.slots_needed_inner(child, viewpoints)?)
         })
     }
 }
@@ -400,10 +408,7 @@ impl Manager {
             transfers.push(chunk.chunk);
         }
 
-        let subdivide = chunk.chunk.depth < self.config.max_depth
-            && viewpoints
-                .iter()
-                .any(|v| needs_subdivision(&chunk.chunk, v));
+        let subdivide = self.config.should_subdivide(&chunk.chunk, viewpoints);
         if !subdivide {
             if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
                 self.render
@@ -729,18 +734,33 @@ mod test {
     }
 
     #[test]
-    fn slots_needed() {
-        let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
-        for max_depth in 0..12 {
+    fn slots_needed_matches_actual_viewpoint_tree() {
+        let diagonal = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
+        let oblique = na::Point3::new(
+            0.657_498_407_154_899_7,
+            -0.740_001_004_213_294_4,
+            -0.143_312_659_512_093_27,
+        );
+        let multiple = [diagonal, oblique, na::Point3::new(-1.0, 0.0, 0.0)];
+        let config = Config::default();
+        assert!(
+            config.slots_needed(&[oblique]).unwrap() > config.slots_needed(&[diagonal]).unwrap()
+        );
+        for max_depth in 0..=12 {
             let config = Config {
                 max_depth,
                 ..Config::default()
             };
-            let needed = config.slots_needed().unwrap();
-            let mut mgr = Manager::new(2048, config).expect("valid test cache configuration");
-            let mut transfers = Vec::new();
-            mgr.update(&[viewpoint], &mut transfers);
-            assert_eq!(transfers.len(), needed);
+            for viewpoints in [&[][..], &multiple[..1], &multiple[1..2], &multiple[..]] {
+                let needed = config.slots_needed(viewpoints).unwrap();
+                let mut mgr = Manager::new(needed, config.clone()).unwrap();
+                let mut transfers = Vec::new();
+                let mut visited = Vec::new();
+                mgr.update_with_visited(viewpoints, &mut transfers, &mut visited);
+                assert_eq!(visited.len(), needed);
+                assert_eq!(transfers.len(), needed);
+                assert!(needed >= 6);
+            }
         }
     }
 

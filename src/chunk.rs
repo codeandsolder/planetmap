@@ -4,7 +4,7 @@ use na::RealField;
 
 #[cfg(feature = "fearless_simd")]
 use crate::cubemap::SampleIterSimd;
-use crate::cubemap::{Coords, Edge, Face, SampleIter};
+use crate::cubemap::{Coords, Face, SampleIter};
 
 /// A node of a quadtree on a particular cubemap face
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -178,26 +178,10 @@ impl Chunk {
     /// Chunks that share an edge with this chunk
     #[must_use]
     pub fn neighbors(&self) -> [Self; 4] {
-        let x = self.coords.neighbors(self.resolution());
-        let depth = self.depth;
-        [
-            Self {
-                coords: x[Edge::Nx],
-                depth,
-            },
-            Self {
-                coords: x[Edge::Ny],
-                depth,
-            },
-            Self {
-                coords: x[Edge::Px],
-                depth,
-            },
-            Self {
-                coords: x[Edge::Py],
-                depth,
-            },
-        ]
+        self.coords.neighbors(self.resolution()).map(|coords| Self {
+            coords,
+            depth: self.depth,
+        })
     }
 
     /// Length of one of this chunk's edges before mapping onto the sphere
@@ -241,8 +225,8 @@ impl Chunk {
 
     /// Number of chunks at this depth along a cubemap edge, i.e. 2^depth
     #[must_use]
-    pub fn resolution(&self) -> u32 {
-        2u32.pow(u32::from(self.depth))
+    pub const fn resolution(&self) -> u32 {
+        1u32 << self.depth
     }
 }
 
@@ -523,7 +507,7 @@ mod test {
             31,
         )
         .unwrap();
-        let right = left.neighbors()[Edge::Px];
+        let right = left.neighbors()[crate::cubemap::Edge::Px];
         assert_ne!(left.origin::<f64>(), right.origin::<f64>());
         for chunk in [left, right] {
             assert_eq!(Chunk::from_vector(31, &chunk.origin()).unwrap(), chunk);
