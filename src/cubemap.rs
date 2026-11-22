@@ -268,7 +268,7 @@ impl<T> IndexMut<Coords> for CubeMap<T> {
 
 // Only used after checking resolution against an allocated map, whose
 // payload size is known to fit usize. Test callers use small grids.
-fn cell_index(coord: Coords) -> usize {
+const fn cell_index(coord: Coords) -> usize {
     let dimension = coord.resolution() as usize;
     coord.face as usize * dimension * dimension + coord.y as usize * dimension + coord.x as usize
 }
