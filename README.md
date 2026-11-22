@@ -20,13 +20,19 @@ addresses multiple challenges:
 - Addressing the surface of the sphere without singularities
 - Maintaining numerical stability over massive distances
 
-This is accomplished by organizing data into a 6 virtual quadtrees,
+This is accomplished by organizing data into six virtual quadtrees,
 each corresponding to one face of a cubemap. Each node in a quadtree,
 referred to as a `Chunk`, can be associated with a square grid of
 height samples, each of which represents the altitude relative to sea
 level along a ray originating at the center of a planet. Streaming and
 level of detail can then be implemented with a `CacheManager`
 associated with GPU-resident buffers.
+
+A transfer allocation returns an opaque generation-qualified token.
+Use its `slot()` to locate the GPU buffer region, then pass the token to
+`release` on successful completion or `cancel` on abandonment. An abandoned
+transfer must stop writing before the slot is recycled. Stale completion
+notifications are rejected even if the physical slot has been reused.
 
 When generating geometry to be displaced by the heightmap, care must
 be taken to ensure numerical stability and avoid hairline cracks
@@ -41,3 +47,16 @@ interpolation in a vertex shader.
 - `fearless_simd` exposes `fearless_simd`-based iterators for data-parallel
   computation of sample coordinates within a `Chunk` or
   `cubemap::Coords`, useful for fast noise sampling
+
+## Collision query contracts
+
+Terrain dimensions and declared height bounds are fixed per planet. Sampling
+must be deterministic, finite, and within those bounds; independent cache
+misses may invoke the sampler concurrently. Subshape IDs identify the current
+collision-cache slots, not permanent world-space triangles. Queries returning
+multiple live IDs require enough resident slots to represent those chunks
+simultaneously; persistent manifolds report an unsupported query when that is
+not possible. Planet-versus-planet continuous casts and persistent contact
+manifolds are not implemented.
+
+The minimum supported compiler is Rust 1.100.

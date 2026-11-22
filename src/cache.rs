@@ -1,13 +1,15 @@
 use hashbrown::HashMap;
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use slab::Slab;
 
-use crate::cubemap::{Edge, Face};
 use crate::Chunk;
+use crate::cubemap::{Edge, Face};
 
 struct Slot {
     chunk: Chunk,
+    generation: u64,
     /// Whether the slot is ready for reading
     ready: bool,
     /// Sequence number of the most recent frame this slot was visited in
@@ -105,24 +107,47 @@ impl Config {
     }
 }
 
-/// Failure to cancel an unfinished cache slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelError {
-    /// The slot was never allocated or has already been removed.
-    InvalidSlot(u32),
-    /// Ready slots must instead be evicted by the manager after a viewpoint update.
-    CompletedSlot(u32),
+/// Identifies one allocation, not just its reusable physical cache slot.
+/// Retain this token until the asynchronous transfer finishes or is cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Allocation {
+    slot: u32,
+    generation: u64,
 }
 
-impl std::fmt::Display for CancelError {
+impl Allocation {
+    /// Physical slot to which the caller writes the terrain data.
+    #[must_use]
+    pub const fn slot(self) -> u32 {
+        self.slot
+    }
+}
+
+// Unique even across managers; ordering with other memory is unnecessary.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Failure to complete or cancel a pending allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationError {
+    /// This allocation no longer exists or belongs to a different manager.
+    InvalidAllocation(Allocation),
+    /// This allocation has already completed.
+    CompletedAllocation(Allocation),
+}
+
+impl std::fmt::Display for AllocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidSlot(slot) => write!(f, "invalid cache slot {slot}"),
-            Self::CompletedSlot(slot) => write!(f, "cache slot {slot} is already ready"),
+            Self::InvalidAllocation(allocation) => {
+                write!(f, "invalid cache allocation {allocation:?}")
+            }
+            Self::CompletedAllocation(allocation) => {
+                write!(f, "cache allocation {allocation:?} is already ready")
+            }
         }
     }
 }
-impl std::error::Error for CancelError {}
+impl std::error::Error for AllocationError {}
 
 /// Helper for streaming `Chunk`-oriented `LoD` into a fixed-size cache
 pub struct Manager {
@@ -165,7 +190,8 @@ impl Manager {
     /// Viewpoints should be positioned with regard to the sphere's origin, and scaled such
     /// viewpoints on the surface are 1.0 units from the sphere's origin.
     ///
-    /// Writes unavailable chunks needed for target quality to `transfer`.
+    /// Writes unavailable chunks needed for target quality to `transfer`,
+    /// ordered by increasing depth so coarse coverage can load first.
     pub fn update(&mut self, viewpoints: &[na::Point3<f64>], transfer: &mut Vec<Chunk>) {
         self.update_inner(viewpoints, transfer, None);
     }
@@ -201,6 +227,9 @@ impl Manager {
         }
         self.render.clear();
         self.walk(viewpoints, transfer, &mut visited);
+        // Resolve ancestors before descendants, across all faces. A small
+        // cache must not fill with one deep subtree before other roots load.
+        transfer.sort_unstable_by_key(Chunk::depth);
 
         // Make room for transfers by discarding chunks that we don't currently need.
         let mut available = self.max_slots - self.chunks.len();
@@ -219,7 +248,15 @@ impl Manager {
             available += 1;
         }
         transfer.truncate(available);
-        self.frame += 1;
+        if let Some(next) = self.frame.checked_add(1) {
+            self.frame = next;
+        } else {
+            // Reset visit marks before the frame counter can alias an old one.
+            for (_, slot) in &mut self.chunks {
+                slot.in_frame = u64::MAX;
+            }
+            self.frame = 0;
+        }
     }
 
     /// Chunks that can be rendered immediately, with their `LoD` neighborhood and slot index
@@ -233,16 +270,20 @@ impl Manager {
     ///
     /// Determines where in the cache to transfer chunk data to. Returns `None` if the cache is
     /// full or the chunk already has a slot (pending or ready).
-    pub fn allocate(&mut self, chunk: Chunk) -> Option<u32> {
+    pub fn allocate(&mut self, chunk: Chunk) -> Option<Allocation> {
         if self.index.contains_key(&chunk) || self.chunks.len() == self.max_slots {
             return None;
         }
         let entry = self.chunks.vacant_entry();
         let slot = u32::try_from(entry.key()).ok()?;
+        let generation = NEXT_GENERATION
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()?;
         entry.insert(Slot {
             chunk,
+            generation,
             ready: false,
-            in_frame: 0,
+            in_frame: self.frame.wrapping_sub(1),
             drawn: false,
         });
         let old = self.index.insert(chunk, slot);
@@ -250,42 +291,43 @@ impl Manager {
             old.is_none(),
             "a slot has already been allocated for this chunk"
         );
-        Some(slot)
+        Some(Allocation { slot, generation })
     }
 
-    /// Revoke an unfinished allocation and make its slot immediately
-    /// reusable. The caller is responsible for invalidating any asynchronous
-    /// writer/completion associated with this allocation before another job
-    /// can use the recycled slot.
+    /// Revoke an unfinished allocation and make its slot immediately reusable.
     ///
-    /// This operation never discards completed terrain. It intentionally
-    /// returns the removed chunk so external schedulers can verify ownership.
+    /// The caller must stop asynchronous writes before recycling the physical
+    /// slot. Late completion notifications cannot complete a new allocation.
     ///
     /// # Errors
-    ///
-    /// Returns [`CancelError::InvalidSlot`] for an unknown slot or
-    /// [`CancelError::CompletedSlot`] when the slot has already been released.
-    pub fn cancel(&mut self, slot: u32) -> Result<Chunk, CancelError> {
-        let idx = slot as usize;
-        let Some(entry) = self.chunks.get(idx) else {
-            return Err(CancelError::InvalidSlot(slot));
-        };
-        if entry.ready {
-            return Err(CancelError::CompletedSlot(slot));
-        }
-        let chunk = self.chunks.remove(idx).chunk;
+    /// Returns an allocation error if the token is stale, foreign, or already ready.
+    pub fn cancel(&mut self, allocation: Allocation) -> Result<Chunk, AllocationError> {
+        self.pending_slot(allocation)?;
+        let chunk = self.chunks.remove(allocation.slot as usize).chunk;
         let previous = self.index.remove(&chunk);
-        debug_assert_eq!(previous, Some(slot));
+        debug_assert_eq!(previous, Some(allocation.slot));
         Ok(chunk)
     }
 
-    /// Indicate that a previously `allocate`d slot can now be safely read or reused
-    pub fn release(&mut self, slot: u32) {
-        debug_assert!(
-            !self.chunks[slot as usize].ready,
-            "slot must be allocated to be released"
-        );
-        self.chunks[slot as usize].ready = true;
+    /// Mark the allocation's terrain data ready for reading.
+    ///
+    /// # Errors
+    /// Returns an allocation error if the token is stale, foreign, or already ready.
+    pub fn release(&mut self, allocation: Allocation) -> Result<(), AllocationError> {
+        self.pending_slot(allocation)?.ready = true;
+        Ok(())
+    }
+
+    fn pending_slot(&mut self, allocation: Allocation) -> Result<&mut Slot, AllocationError> {
+        let slot = self
+            .chunks
+            .get_mut(allocation.slot as usize)
+            .filter(|slot| slot.generation == allocation.generation)
+            .ok_or(AllocationError::InvalidAllocation(allocation))?;
+        if slot.ready {
+            return Err(AllocationError::CompletedAllocation(allocation));
+        }
+        Ok(slot)
     }
 
     fn get(&self, chunk: &Chunk) -> Option<u32> {
@@ -385,11 +427,9 @@ impl Manager {
             .iter()
             .all(|slot| slot.is_some_and(|x| self.chunks[x as usize].ready));
         // If this subtree should be rendered and the children can't be rendered, this chunk must be rendered.
-        if !children_renderable {
-            if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
-                self.render
-                    .push((chunk.chunk, Neighborhood::default(), slot));
-            }
+        if !children_renderable && let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
+            self.render
+                .push((chunk.chunk, Neighborhood::default(), slot));
         }
         // Recurse into the children
         for (&child, &slot) in children.iter().zip(child_slots.iter()) {
@@ -505,7 +545,7 @@ mod test {
         let mut manager = Manager::new(100_000_000, config).unwrap();
         assert_eq!(manager.chunks.capacity(), 0);
         let slot = manager.allocate(Chunk::root(Face::Px)).unwrap();
-        assert_eq!(slot, 0);
+        assert_eq!(slot.slot(), 0);
         assert!(manager.chunks.capacity() < 32);
     }
 
@@ -522,10 +562,10 @@ mod test {
         assert_eq!(manager.cancel(slot), Ok(first));
         assert_eq!(manager.cancel(other_slot), Ok(second));
         let reused = manager.allocate(first).unwrap();
-        manager.release(reused);
+        manager.release(reused).unwrap();
         assert_eq!(
             manager.cancel(reused),
-            Err(CancelError::CompletedSlot(reused))
+            Err(AllocationError::CompletedAllocation(reused))
         );
         assert_eq!(manager.allocate(first), None);
     }
@@ -543,11 +583,62 @@ mod test {
         let root = Chunk::root(Face::Px);
         let slot = mgr.allocate(root).expect("room for first patch");
         assert_eq!(mgr.cancel(slot), Ok(root));
-        assert_eq!(mgr.cancel(slot), Err(CancelError::InvalidSlot(slot)));
+        assert_eq!(
+            mgr.cancel(slot),
+            Err(AllocationError::InvalidAllocation(slot))
+        );
         let reused = mgr.allocate(root).expect("cancel frees cache slot");
-        assert_eq!(reused, slot);
-        mgr.release(reused);
-        assert_eq!(mgr.cancel(reused), Err(CancelError::CompletedSlot(reused)));
+        assert_eq!(reused.slot(), slot.slot());
+        assert_ne!(reused, slot);
+        mgr.release(reused).unwrap();
+        assert_eq!(
+            mgr.cancel(reused),
+            Err(AllocationError::CompletedAllocation(reused))
+        );
+    }
+
+    #[test]
+    fn stale_and_foreign_completion_cannot_publish_recycled_slot() {
+        let mut manager = Manager::new(1, Config::default()).unwrap();
+        let mut other = Manager::new(1, Config::default()).unwrap();
+        let root = Chunk::root(Face::Px);
+        let first = manager.allocate(root).unwrap();
+        manager.cancel(first).unwrap();
+        let second = manager.allocate(root).unwrap();
+        let foreign = other.allocate(root).unwrap();
+        assert_eq!(first.slot(), second.slot());
+        for wrong in [first, foreign] {
+            assert_eq!(
+                manager.release(wrong),
+                Err(AllocationError::InvalidAllocation(wrong))
+            );
+            assert_eq!(
+                manager.cancel(wrong),
+                Err(AllocationError::InvalidAllocation(wrong))
+            );
+        }
+        assert!(!manager.chunks[second.slot() as usize].ready);
+        manager.release(second).unwrap();
+        assert_eq!(
+            manager.release(second),
+            Err(AllocationError::CompletedAllocation(second))
+        );
+    }
+
+    #[test]
+    fn constrained_cache_loads_all_roots_before_descendants() {
+        let mut manager = Manager::new(6, Config::new(8, 1).unwrap()).unwrap();
+        let mut transfer = Vec::new();
+        let viewpoint = na::Point3::new(1.0, 0.0, 0.0);
+        manager.update(&[viewpoint], &mut transfer);
+        assert_eq!(transfer.len(), 6);
+        assert!(transfer.iter().all(|chunk| chunk.depth() == 0));
+        for chunk in transfer.drain(..) {
+            let allocation = manager.allocate(chunk).unwrap();
+            manager.release(allocation).unwrap();
+        }
+        manager.update(&[viewpoint], &mut transfer);
+        assert_eq!(manager.renderable().len(), 6);
     }
 
     #[test]
@@ -600,7 +691,7 @@ mod test {
         .expect("valid test cache configuration");
         for face in Face::iter() {
             let slot = mgr.allocate(Chunk::root(face)).unwrap();
-            mgr.release(slot);
+            mgr.release(slot).unwrap();
         }
         let viewpoint = na::Point3::new(1.001, 0.0, 0.0);
         let mut transfer = Vec::new();
@@ -630,7 +721,7 @@ mod test {
         assert_eq!(mgr.renderable().len(), 0);
         for &transfer in &transfers {
             let slot = mgr.allocate(transfer).unwrap();
-            mgr.release(slot);
+            mgr.release(slot).unwrap();
         }
         mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
         assert_eq!(transfers.len(), 0);
@@ -715,7 +806,7 @@ mod test {
         ] {
             assert!(transfers.contains(&chunk));
             let slot = mgr.allocate(chunk).unwrap();
-            mgr.release(slot);
+            mgr.release(slot).unwrap();
         }
 
         // Validate output
@@ -763,7 +854,7 @@ mod test {
             for &chunk in transfers.iter().take(BATCH_SIZE) {
                 actual += 1;
                 let slot = mgr.allocate(chunk).unwrap();
-                mgr.release(slot);
+                mgr.release(slot).unwrap();
             }
             transfers.clear();
             mgr.update(&[viewpoint], &mut transfers);
@@ -796,7 +887,7 @@ mod test {
                 || (chunk.depth == 3 && (chunk.coords.x / 2 + chunk.coords.y / 2) % 2 == 0)
             {
                 let slot = manager.allocate(chunk).unwrap();
-                manager.release(slot);
+                manager.release(slot).unwrap();
             }
         }
         manager.update(&viewpoints, &mut Vec::new());
@@ -843,7 +934,7 @@ mod test {
             for (idx, &chunk) in transfers.iter().enumerate() {
                 if chunk.depth == 0 || idx % 3 == frame % 3 {
                     if let Some(slot) = manager.allocate(chunk) {
-                        manager.release(slot);
+                        manager.release(slot).unwrap();
                     }
                 }
             }
