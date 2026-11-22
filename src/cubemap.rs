@@ -733,9 +733,10 @@ impl Coords {
 
     fn face_position(&self, resolution: u32, local: na::Point2<f64>) -> na::Point2<f64> {
         let scale = f64::from(resolution);
-        let centered =
-            |index, uv: f64| uv.mul_add(2.0, f64::from(index).mul_add(2.0, -scale)) / scale;
-        na::Point2::new(centered(self.x, local.x), centered(self.y, local.y))
+        na::Point2::new(
+            centered_axis(f64::from(self.x) * 2.0 - scale, scale, local.x),
+            centered_axis(f64::from(self.y) * 2.0 - scale, scale, local.y),
+        )
     }
 
     /// Compute the direction identified by a point in the [0..1]^2 area covered by these
@@ -777,10 +778,8 @@ impl Coords {
         chunk_resolution: u32,
     ) -> SampleIter<N> {
         SampleIter {
-            coords: *self,
-            face_resolution,
-            chunk_resolution,
-            index: 0,
+            face: self.face,
+            positions: SampleGrid::new(*self, face_resolution, chunk_resolution),
             _marker: PhantomData,
         }
     }
@@ -791,17 +790,15 @@ impl Coords {
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
     #[must_use]
-    pub const fn samples_ps<S: Simd>(
+    pub fn samples_ps<S: Simd>(
         &self,
         simd: S,
         face_resolution: u32,
         chunk_resolution: u32,
     ) -> SampleIterSimd<S> {
         SampleIterSimd {
-            coords: *self,
-            face_resolution,
-            chunk_resolution,
-            index: 0,
+            face: self.face,
+            positions: SampleGrid::new(*self, face_resolution, chunk_resolution),
             simd,
         }
     }
@@ -908,45 +905,94 @@ impl<T> IndexMut<Edge> for [T] {
     }
 }
 
-fn sample_position(index: u64, resolution: u32) -> Option<na::Point2<f64>> {
-    if resolution == 1 {
-        return Some(na::Point2::new(0.5, 0.5));
+// The factors of two are exact for finite normalized coordinates and u32
+// indices. Keep cancellation before the division so even the deepest cells
+// adjacent to a face center remain distinguishable.
+fn centered_axis(origin: f64, scale: f64, local: f64) -> f64 {
+    (origin + local * 2.0) / scale
+}
+
+/// Scanline grid shared by scalar and SIMD samplers. Increment the cell
+/// coordinates instead of recovering them by division and remainder for every
+/// sample. The y position changes only when starting a new row.
+#[derive(Debug)]
+struct SampleGrid {
+    origin: na::Point2<f64>,
+    scale: f64,
+    side: u32,
+    column: u32,
+    row: u32,
+    y: f64,
+}
+
+impl SampleGrid {
+    fn new(coords: Coords, face_resolution: u32, side: u32) -> Self {
+        let scale = f64::from(face_resolution);
+        let origin = na::Point2::new(
+            f64::from(coords.x) * 2.0 - scale,
+            f64::from(coords.y) * 2.0 - scale,
+        );
+        Self {
+            origin,
+            scale,
+            side,
+            column: 0,
+            row: 0,
+            y: centered_axis(origin.y, scale, Self::local(0, side)),
+        }
     }
-    let edge = u64::from(resolution);
-    let x = u32::try_from(index % edge).ok()?;
-    let y = u32::try_from(index / edge).ok()?;
-    let max = f64::from(resolution - 1);
-    Some(na::Point2::new(f64::from(x) / max, f64::from(y) / max))
+
+    fn local(index: u32, side: u32) -> f64 {
+        if side <= 1 {
+            0.5
+        } else {
+            f64::from(index) / f64::from(side - 1)
+        }
+    }
+
+    fn next(&mut self) -> Option<na::Point2<f64>> {
+        if self.row >= self.side {
+            return None;
+        }
+        let x = centered_axis(
+            self.origin.x,
+            self.scale,
+            Self::local(self.column, self.side),
+        );
+        let position = na::Point2::new(x, self.y);
+        self.column += 1;
+        if self.column == self.side {
+            self.column = 0;
+            self.row += 1;
+            if self.row < self.side {
+                self.y = centered_axis(self.origin.y, self.scale, Self::local(self.row, self.side));
+            }
+        }
+        Some(position)
+    }
+
+    fn remaining(&self) -> u64 {
+        u64::from(self.side - self.row) * u64::from(self.side) - u64::from(self.column)
+    }
 }
 
 /// Iterator over sample points distributed in a regular grid across a chunk, including its edges
 #[derive(Debug)]
 pub struct SampleIter<N> {
-    coords: Coords,
-    face_resolution: u32,
-    chunk_resolution: u32,
-    // A full u32-by-u32 grid needs u64 indexing.
-    index: u64,
+    face: Face,
+    positions: SampleGrid,
     _marker: PhantomData<fn() -> N>,
 }
 
 impl<N: RealField + Copy> Iterator for SampleIter<N> {
     type Item = na::Unit<na::Vector3<N>>;
     fn next(&mut self) -> Option<Self::Item> {
-        let edge = u64::from(self.chunk_resolution);
-        if self.index >= edge * edge {
-            return None;
-        }
-        let local = sample_position(self.index, self.chunk_resolution)?;
-        let pos = self.coords.face_position(self.face_resolution, local);
-        let dir = self.coords.face.direction(&pos.cast());
-        self.index += 1;
-        Some(dir)
+        let position = self.positions.next()?;
+        Some(self.face.direction(&position.cast()))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let edge = u64::from(self.chunk_resolution);
-        let remaining = (edge * edge).saturating_sub(self.index);
+        let remaining = self.positions.remaining();
         usize::try_from(remaining).map_or((usize::MAX, None), |count| (count, Some(count)))
     }
 }
@@ -966,10 +1012,8 @@ impl<N: RealField + Copy> ExactSizeIterator for SampleIter<N> {
 #[derive(Debug)]
 #[cfg(feature = "fearless_simd")]
 pub struct SampleIterSimd<S> {
-    coords: Coords,
-    face_resolution: u32,
-    chunk_resolution: u32,
-    index: u64,
+    face: Face,
+    positions: SampleGrid,
     simd: S,
 }
 
@@ -981,11 +1025,7 @@ impl<S: Simd> Iterator for SampleIterSimd<S> {
         reason = "The SIMD interface deliberately returns f32 samples; normalized face positions are narrowed only after f64 addressing"
     )]
     fn next(&mut self) -> Option<Self::Item> {
-        let edge = u64::from(self.chunk_resolution);
-        let total = edge * edge;
-        if self.index >= total {
-            return None;
-        }
+        let mut position = self.positions.next()?;
         let mut pos_on_face_x = S::f32s::splat(self.simd, 0.0);
         let mut pos_on_face_y = S::f32s::splat(self.simd, 0.0);
         for (lane, (x, y)) in pos_on_face_x
@@ -994,12 +1034,13 @@ impl<S: Simd> Iterator for SampleIterSimd<S> {
             .zip(pos_on_face_y.as_mut_slice())
             .enumerate()
         {
-            let lane = u64::try_from(lane).ok()?;
-            let sample = self.index.saturating_add(lane).min(total - 1);
-            let position = self.coords.face_position(
-                self.face_resolution,
-                sample_position(sample, self.chunk_resolution)?,
-            );
+            // Padding repeats the final valid sample, including when the
+            // last batch crosses multiple short rows.
+            if lane != 0
+                && let Some(next) = self.positions.next()
+            {
+                position = next;
+            }
             *x = position.x as f32;
             *y = position.y as f32;
         }
@@ -1014,7 +1055,7 @@ impl<S: Simd> Iterator for SampleIterSimd<S> {
         let dir_y = warped_y / len;
         let dir_z = S::f32s::splat(self.simd, 1.0) / len;
 
-        let basis = self.coords.face.basis::<f32>();
+        let basis = self.face.basis::<f32>();
         let basis = basis.matrix();
         let x = S::f32s::splat(self.simd, basis.m11).mul_add(
             dir_x,
@@ -1029,14 +1070,11 @@ impl<S: Simd> Iterator for SampleIterSimd<S> {
             S::f32s::splat(self.simd, basis.m32).mul_add(dir_y, dir_z * basis.m33),
         );
 
-        let lanes = u64::try_from(S::f32s::LEN).ok()?;
-        self.index = self.index.saturating_add(lanes);
         Some([x, y, z])
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let edge = u64::from(self.chunk_resolution);
-        let remaining = (edge * edge).saturating_sub(self.index);
+        let remaining = self.positions.remaining();
         let lanes = u64::try_from(S::f32s::LEN).unwrap_or(u64::MAX).max(1);
         let batches = remaining.div_ceil(lanes);
         usize::try_from(batches).map_or((usize::MAX, None), |count| (count, Some(count)))
@@ -1525,6 +1563,113 @@ mod test {
                 na::Vector3::new(corner.x, corner.y, -corner.z),
             ][..]
         );
+    }
+
+    #[test]
+    fn scanline_sampling_matches_exact_centered_addressing() {
+        for face in Face::iter() {
+            for resolution in [1, 3, 4096, 1 << 31, u32::MAX] {
+                for x in [0, resolution / 2, resolution - 1] {
+                    let coords = Coords {
+                        x,
+                        y: resolution / 2,
+                        face,
+                    };
+                    for side in [0, 1, 2, 3, 7, 8, 17, 33] {
+                        let mut samples = coords.samples::<f64>(resolution, side);
+                        for y in 0..side {
+                            for x in 0..side {
+                                let scale = f64::from(resolution);
+                                let uv = |i| {
+                                    if side == 1 {
+                                        0.5
+                                    } else {
+                                        f64::from(i) / f64::from(side - 1)
+                                    }
+                                };
+                                let axis = |i, j| {
+                                    uv(j).mul_add(2.0, f64::from(i).mul_add(2.0, -scale)) / scale
+                                };
+                                let reference = face.direction(&na::Point2::new(
+                                    axis(coords.x, x),
+                                    axis(coords.y, y),
+                                ));
+                                assert_eq!(samples.next(), Some(reference));
+                                assert_eq!(
+                                    samples.size_hint().0,
+                                    (side * side - (y * side + x + 1)) as usize
+                                );
+                            }
+                        }
+                        assert_eq!(samples.next(), None);
+                        assert_eq!(samples.size_hint(), (0, Some(0)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_scanline_dimensions_preserve_full_length_and_final_cell() {
+        let coords = Coords {
+            x: u32::MAX - 1,
+            y: u32::MAX - 1,
+            face: Face::Pz,
+        };
+        let mut grid = SampleGrid::new(coords, u32::MAX, u32::MAX);
+        assert_eq!(grid.remaining(), u64::from(u32::MAX).pow(2));
+        // Reach the final column and row without consuming 2^64 samples.
+        grid.column = u32::MAX - 1;
+        grid.row = u32::MAX - 1;
+        grid.y = 1.0;
+        assert_eq!(grid.remaining(), 1);
+        assert_eq!(grid.next(), Some(na::Point2::new(1.0, 1.0)));
+        assert_eq!(grid.remaining(), 0);
+        assert_eq!(grid.next(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "fearless_simd")]
+    fn simd_batches_preserve_scanline_order_and_pad_only_at_the_end() {
+        use fearless_simd::{Fallback, Level, dispatch};
+
+        fn check<S: Simd>(simd: S) {
+            for face in Face::iter() {
+                for resolution in [3, 4096, 1 << 31, u32::MAX] {
+                    let coords = Coords {
+                        x: resolution / 2,
+                        y: resolution / 3,
+                        face,
+                    };
+                    for side in [0, 1, 2, 3, 7, 8, 17, 33] {
+                        let mut scalar = coords.samples::<f32>(resolution, side);
+                        let mut vector = coords.samples_ps(simd, resolution, side);
+                        let mut last = None;
+                        while let Some(batch) = vector.next() {
+                            for i in 0..S::f32s::LEN {
+                                let reference = scalar.next().or(last).unwrap();
+                                last = Some(reference);
+                                let actual = na::Vector3::from(batch.map(|v| v.as_slice()[i]));
+                                assert_abs_diff_eq!(
+                                    actual,
+                                    *reference,
+                                    epsilon = 3.0 * f32::EPSILON
+                                );
+                            }
+                            assert_eq!(
+                                vector.size_hint().0,
+                                scalar.size_hint().0.div_ceil(S::f32s::LEN)
+                            );
+                        }
+                        assert!(scalar.next().is_none());
+                        assert!(vector.next().is_none());
+                    }
+                }
+            }
+        }
+
+        check(Fallback::new());
+        dispatch!(Level::new(), simd => check(simd));
     }
 
     #[test]

@@ -210,7 +210,7 @@ impl Chunk {
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
     #[must_use]
-    pub const fn samples_ps<S: Simd>(&self, simd: S, resolution: u32) -> SampleIterSimd<S> {
+    pub fn samples_ps<S: Simd>(&self, simd: S, resolution: u32) -> SampleIterSimd<S> {
         self.coords.samples_ps(simd, self.resolution(), resolution)
     }
 
