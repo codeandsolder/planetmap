@@ -3,10 +3,8 @@ use parry3d_f64::math::{Matrix, Vec2, Vector};
 use parry3d_f64::shape::Triangle;
 
 /// Direction on a face at `[0..1]^2` coordinates within a chunk
-pub(super) fn corner(coords: &Coords, face_resolution: u32, uv: [f64; 2]) -> Vector {
-    let dir = coords
-        .direction(face_resolution, &na::Point2::from(uv))
-        .into_inner();
+pub(super) fn corner(coords: &Coords, uv: [f64; 2]) -> Vector {
+    let dir = coords.direction(&na::Point2::from(uv)).into_inner();
     Vector::new(dir.x, dir.y, dir.z)
 }
 
@@ -26,12 +24,12 @@ pub(super) struct Patch {
 }
 
 impl Patch {
-    pub(super) fn new(coords: &Coords, face_resolution: u32) -> Self {
+    pub(super) fn new(coords: &Coords) -> Self {
         Self {
-            a: corner(coords, face_resolution, [0.0, 0.0]),
-            b: corner(coords, face_resolution, [1.0, 0.0]),
-            c: corner(coords, face_resolution, [0.0, 1.0]),
-            d: corner(coords, face_resolution, [1.0, 1.0]),
+            a: corner(coords, [0.0, 0.0]),
+            b: corner(coords, [1.0, 0.0]),
+            c: corner(coords, [0.0, 1.0]),
+            d: corner(coords, [1.0, 1.0]),
         }
     }
 

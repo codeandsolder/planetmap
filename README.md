@@ -61,6 +61,21 @@ the SIMD interface narrows positions to f32 only at the final sampling stage.
 Use f64 scalar samples when distinct directions at the deepest quadtree
 levels are required.
 
+## Coordinate addressing
+
+`Coords::new(resolution, face, x, y)` validates a cell address. Its resolution
+is part of its identity, and the indices and face are available through
+`x()`, `y()`, and `face()`. `Coords::from_vector` returns `None` for an
+invalid direction or empty grid. Direction, center, neighbor, and sampling
+methods use the address's own resolution; callers supply only local offsets
+or the desired sample count.
+
+Use `Chunk::try_new(depth, face, x, y)` for checked quadtree construction.
+`CubeMap::get` and `get_mut` reject addresses from a different grid
+resolution, while `get_direction` and `get_direction_mut` provide fallible
+direction-based lookup. Indexing with a coordinate of the wrong resolution
+panics. An empty cubemap has no valid coordinate addresses.
+
 ## Collision query contracts
 
 Terrain dimensions and declared height bounds are fixed per planet. Sampling

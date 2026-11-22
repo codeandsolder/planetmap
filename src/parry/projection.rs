@@ -85,7 +85,7 @@ impl Planet {
         } else {
             // Keep the API general for very large sample grids without
             // multiplying their persistent memory footprint by six.
-            let patch = Patch::new(&coords, self.face_resolution);
+            let patch = Patch::new(&coords);
             for quad in patch.quads(self.chunk_resolution) {
                 let corners = quad
                     .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -221,9 +221,10 @@ impl Planet {
         // patch interpolation can flip the source ray) and the cone fits in
         // a handful of cells. More demanding queries use the hierarchy below.
         let mut cap_searched = false;
-        if query_radius > 0.0 {
-            let source_direction = cube_vector(query.query_axis);
-            let seed = Coords::from_vector(face_resolution, &source_direction);
+        let source_direction = cube_vector(query.query_axis);
+        if query_radius > 0.0
+            && let Some(seed) = Coords::from_vector(face_resolution, &source_direction)
+        {
             self.update_projection_from_patch(seed, pt, query_radius, &mut nearest);
             let distance = nearest
                 .as_ref()

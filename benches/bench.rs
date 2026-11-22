@@ -310,8 +310,8 @@ fn collision(c: &mut Criterion) {
 }
 
 #[cfg(feature = "fearless_simd")]
-fn sample_batch<S: fearless_simd::Simd>(simd: S, coords: cubemap::Coords, face: u32, side: u32) {
-    for directions in coords.samples_ps(simd, face, side) {
+fn sample_batch<S: fearless_simd::Simd>(simd: S, coords: cubemap::Coords, side: u32) {
+    for directions in coords.samples_ps(simd, side) {
         std::hint::black_box(directions);
     }
 }
@@ -323,22 +323,20 @@ fn samples(c: &mut Criterion) {
     let mut group = c.benchmark_group("direction samples");
     let level = Level::new();
     for (face, side) in [(64u32, 17u32), (4096, 65), (1 << 31, 17), (u32::MAX, 129)] {
-        let coords = cubemap::Coords {
-            x: face / 2,
-            y: face / 3,
-            face: cubemap::Face::Py,
-        };
+        let coords = cubemap::Coords::new(face, cubemap::Face::Py, face / 2, face / 3).unwrap();
         group.throughput(Throughput::Elements(u64::from(side).pow(2)));
         let id = format!("{face}/{side}");
         group.bench_function(BenchmarkId::new("scalar f32", &id), |b| {
             b.iter(|| {
-                for direction in std::hint::black_box(coords).samples::<f32>(face, side) {
+                for direction in std::hint::black_box(coords).samples::<f32>(side) {
                     std::hint::black_box(direction);
                 }
             });
         });
         group.bench_function(BenchmarkId::new("native SIMD", &id), |b| {
-            b.iter(|| dispatch!(level, simd => sample_batch(simd, std::hint::black_box(coords), face, side)));
+            b.iter(
+                || dispatch!(level, simd => sample_batch(simd, std::hint::black_box(coords), side)),
+            );
         });
     }
     group.finish();

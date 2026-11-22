@@ -39,12 +39,14 @@ impl GridRect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FaceRegion {
+    resolution: u32,
     pub(super) face: crate::cubemap::Face,
     pub(super) cells: GridRect,
 }
 
 impl FaceRegion {
     pub(super) const fn new(
+        resolution: u32,
         face: crate::cubemap::Face,
         x0: u32,
         x1: u32,
@@ -52,26 +54,31 @@ impl FaceRegion {
         y1: u32,
     ) -> Self {
         Self {
+            resolution,
             face,
             cells: GridRect::new(x0, x1, y0, y1),
         }
     }
 
     pub(super) const fn from_coords(coords: Coords) -> Self {
-        Self::new(coords.face, coords.x, coords.x + 1, coords.y, coords.y + 1)
+        Self::new(
+            coords.resolution(),
+            coords.face(),
+            coords.x(),
+            coords.x() + 1,
+            coords.y(),
+            coords.y() + 1,
+        )
     }
 
     pub(super) fn roots(resolution: u32) -> impl Iterator<Item = Self> {
-        crate::cubemap::Face::iter().map(move |face| Self::new(face, 0, resolution, 0, resolution))
+        crate::cubemap::Face::iter()
+            .map(move |face| Self::new(resolution, face, 0, resolution, 0, resolution))
     }
 
     pub(super) const fn leaf(self) -> Option<Coords> {
         if self.cells.is_leaf() {
-            Some(Coords {
-                face: self.face,
-                x: self.cells.x0,
-                y: self.cells.y0,
-            })
+            Coords::new(self.resolution, self.face, self.cells.x0, self.cells.y0)
         } else {
             None
         }
@@ -92,7 +99,11 @@ impl PartialOrd for FaceRegion {
 
 impl Ord for FaceRegion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.face as u8, self.cells).cmp(&(other.face as u8, other.cells))
+        (self.resolution, self.face as u8, self.cells).cmp(&(
+            other.resolution,
+            other.face as u8,
+            other.cells,
+        ))
     }
 }
 
@@ -129,8 +140,9 @@ impl DirectionCone {
     // unit-sphere scale, rather than inflating every angle by sqrt(epsilon).
     const ROUNDOFF: f64 = 64.0 * f64::EPSILON;
 
-    pub(super) fn from_region(region: FaceRegion, resolution: u32) -> Self {
+    pub(super) fn from_region(region: FaceRegion) -> Self {
         let FaceRegion {
+            resolution,
             face,
             cells: GridRect { x0, x1, y0, y1 },
         } = region;
@@ -242,7 +254,7 @@ impl DirectionCone {
 
 impl RankedRegion {
     pub(super) fn projection(region: FaceRegion, query: &ProjectionQuery) -> Self {
-        let cone = DirectionCone::from_region(region, query.resolution);
+        let cone = DirectionCone::from_region(region);
         let min_radius = cone.minimum_radius(query.planet_radius, query.min_height);
         let max_radius =
             outer_displaced_radius(query.planet_radius, query.min_height, query.max_height);
@@ -310,7 +322,7 @@ pub(super) struct PatchBounds {
 
 impl PatchBounds {
     pub(super) fn new(planet: &Planet, pose: &Pose, region: FaceRegion) -> Self {
-        let cone = DirectionCone::from_region(region, planet.face_resolution);
+        let cone = DirectionCone::from_region(region);
         let min_height = f64::from(planet.min_height);
         let max_height = f64::from(planet.max_height);
         let radial_min = cone.minimum_radius(planet.radius, min_height);

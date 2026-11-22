@@ -157,7 +157,7 @@ impl ChunkData {
     /// them. Raycasts and collision callbacks still use the original samples.
     pub(super) fn projection_vertices(&self, planet: &Planet) -> &[Vector] {
         self.projection_vertices.get_or_init(|| {
-            let patch = Patch::new(&self.coords, planet.face_resolution);
+            let patch = Patch::new(&self.coords);
             let resolution = planet.chunk_resolution;
             let quads = f64::from(resolution - 1);
             let mut vertices = Vec::with_capacity(self.samples.len());
