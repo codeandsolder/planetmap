@@ -66,10 +66,10 @@ impl Terrain for ProjectionTerrain {
         self.samples
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let height = if self.patterned {
-            let hash = (coords.face as u32)
+            let hash = (coords.face() as u32)
                 .wrapping_mul(7)
-                .wrapping_add(coords.x.wrapping_mul(13))
-                .wrapping_add(coords.y.wrapping_mul(17));
+                .wrapping_add(coords.x().wrapping_mul(13))
+                .wrapping_add(coords.y().wrapping_mul(17));
             (hash % 6) as f32 - 1.0
         } else if self.peak == Some(*coords) {
             5.0
@@ -99,9 +99,9 @@ fn brute_force_projection(planet: &Planet, pt: Vector) -> (f64, Vector, Coords) 
     for face in Face::iter() {
         for y in 0..planet.face_resolution {
             for x in 0..planet.face_resolution {
-                let coords = Coords { face, x, y };
+                let coords = Coords::new(planet.face_resolution, face, x, y).unwrap();
                 let samples = planet.sample(&coords);
-                let patch = Patch::new(&coords, planet.face_resolution);
+                let patch = Patch::new(&coords);
                 for (_, tri) in patch.triangles(planet.radius, planet.chunk_resolution, &samples) {
                     let projection = tri.project_local_point(pt, false);
                     let distance2 = projection.point.distance_squared(pt);
@@ -252,8 +252,8 @@ fn solid_classification_preserves_cube_edges_and_three_face_corners() {
     for (radius, delta) in [(10.0, 0.001), (6_371_000.0, 0.1)] {
         let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, radius).unwrap();
         for face in Face::iter() {
-            let coords = Coords { face, x: 0, y: 0 };
-            let corners = Quad::new(&Patch::new(&coords, 1), 1, na::Vector2::zeros())
+            let coords = Coords::root(face);
+            let corners = Quad::new(&Patch::new(&coords), 1, na::Vector2::zeros())
                 .displace(radius, 2, &planet.sample(&coords))
                 .corners;
             let [a, b, c, d] = corners;
@@ -293,8 +293,8 @@ fn solid_classification_tracks_face_and_quad_triangle_offsets() {
         let planet = Planet::new(Arc::new(FlatTerrain::new(3, 5).unwrap()), 1, radius).unwrap();
         for face in Face::iter() {
             for (x, y) in [(0, 0), (1, 1), (2, 2), (0, 2), (2, 0)] {
-                let coords = Coords { face, x, y };
-                let patch = Patch::new(&coords, 3);
+                let coords = Coords::new(3, face, x, y).unwrap();
+                let patch = Patch::new(&coords);
                 let samples = planet.sample(&coords);
                 for position in [na::Vector2::new(0, 0), na::Vector2::new(3, 3)] {
                     let quad = Quad::new(&patch, 4, position);
@@ -356,20 +356,12 @@ fn contained_point_feature_keeps_winning_chunk_live_after_ray_classification() {
             0.0
         }
     }
-    let depressed = Coords {
-        face: Face::Pz,
-        x: 2,
-        y: 1,
-    };
-    let low = Coords {
-        face: Face::Pz,
-        x: 1,
-        y: 1,
-    };
+    let depressed = Coords::new(4, Face::Pz, 2, 1).unwrap();
+    let low = Coords::new(4, Face::Pz, 1, 1).unwrap();
     let planet = Planet::new(Arc::new(Depression(depressed)), 1, 10.0).unwrap();
-    let direction = low.direction(4, &na::Point2::new(0.999, 0.5)).into_inner();
+    let direction = low.direction(&na::Point2::new(0.999, 0.5)).into_inner();
     let query = Vector::new(direction.x, direction.y, direction.z) * 3.0;
-    assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
+    assert_eq!(Coords::from_vector(4, &cube_vector(query)), Some(low));
     let (_, expected_surface, winner) = brute_force_projection(&planet, query);
     assert_eq!(winner, depressed);
     let (projection, _) = planet.project_local_point_and_get_feature(query);
@@ -473,7 +465,7 @@ fn deep_patch_bounds_remain_tight_and_enclose_real_geometry() {
             (RESOLUTION / 2, RESOLUTION / 2),
             (RESOLUTION - 1, RESOLUTION - 1),
         ] {
-            let coords = Coords { face, x, y };
+            let coords = Coords::new(RESOLUTION, face, x, y).unwrap();
             let bounds =
                 PatchBounds::new(&planet, &Pose::IDENTITY, FaceRegion::from_coords(coords));
             assert!(
@@ -481,7 +473,7 @@ fn deep_patch_bounds_remain_tight_and_enclose_real_geometry() {
                 "{bounds:?}"
             );
             assert!(bounds.sphere_radius < 0.02, "{bounds:?}");
-            let patch = Patch::new(&coords, RESOLUTION);
+            let patch = Patch::new(&coords);
             for (_, triangle) in patch.triangles(RADIUS, 3, &[0.0; 9]) {
                 for point in [
                     triangle.a,
@@ -526,7 +518,7 @@ fn projection_region_bound_includes_interiors_of_raised_triangles() {
         min_height: 10.0,
         max_height: 10.0,
     };
-    let region = RankedRegion::projection(FaceRegion::new(Face::Px, 0, 1, 0, 1), &query);
+    let region = RankedRegion::projection(FaceRegion::new(1, Face::Px, 0, 1, 0, 1), &query);
     let actual_distance2 = (20.0_f64 / 3.0_f64.sqrt()).powi(2);
     assert!(
         region.lower_bound <= actual_distance2,
@@ -559,8 +551,8 @@ fn projection_region_distance_bounds_enclose_sampled_triangle_interiors() {
                     let mut mesh_points = Vec::new();
                     for y in y0..y1 {
                         for x in x0..x1 {
-                            let coords = Coords { x, y, face };
-                            let patch = Patch::new(&coords, resolution);
+                            let coords = Coords::new(resolution, face, x, y).unwrap();
+                            let patch = Patch::new(&coords);
                             let samples: Vec<_> = (0..9)
                                 .map(|i| {
                                     if (i + x + 2 * y + u32::from(face as u8)) % 3 == 0 {
@@ -600,7 +592,7 @@ fn projection_region_distance_bounds_enclose_sampled_triangle_interiors() {
                                 max_height: max_h,
                             };
                             let region = RankedRegion::projection(
-                                FaceRegion::new(face, x0, x1, y0, y1),
+                                FaceRegion::new(resolution, face, x0, x1, y0, y1),
                                 &query,
                             );
                             let query_point = axis * query_radius;
@@ -624,19 +616,15 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
 
 #[test]
 fn projection_finds_cliff_across_adjacent_patch_and_cube_face() {
-    let near = Coords {
-        x: 1,
-        y: 1,
-        face: Face::Pz,
-    };
-    let across_face = Coords {
-        x: 3,
-        y: 1,
-        face: Face::Pz,
-    };
+    let near = Coords::new(4, Face::Pz, 1, 1).unwrap();
+    let across_face = Coords::new(4, Face::Pz, 3, 1).unwrap();
     for (low, high, uv) in [
-        (near, Coords { x: 2, ..near }, [0.98, 0.5]),
-        (across_face, across_face.neighbors(4)[Edge::Px], [0.98, 0.5]),
+        (
+            near,
+            Coords::new(4, near.face(), 2, near.y()).unwrap(),
+            [0.98, 0.5],
+        ),
+        (across_face, across_face.neighbors()[Edge::Px], [0.98, 0.5]),
     ] {
         let source = Arc::new(ProjectionTerrain {
             face_resolution: 4,
@@ -645,9 +633,9 @@ fn projection_finds_cliff_across_adjacent_patch_and_cube_face() {
             samples: std::sync::atomic::AtomicUsize::new(0),
         });
         let planet = Planet::new(source, 1, 10.0).unwrap();
-        let direction = low.direction(4, &na::Point2::from(uv)).into_inner();
+        let direction = low.direction(&na::Point2::from(uv)).into_inner();
         let query = Vector::new(direction.x, direction.y, direction.z) * 15.0;
-        assert_eq!(Coords::from_vector(4, &cube_vector(query)), low);
+        assert_eq!(Coords::from_vector(4, &cube_vector(query)), Some(low));
         let (expected_dist2, expected_pt, winning_patch) = brute_force_projection(&planet, query);
         assert_eq!(winning_patch, high);
         let (actual, _) = planet.project_local_point_and_get_feature(query);
@@ -684,8 +672,8 @@ fn projection_matches_exhaustive_mesh_at_boundaries_and_varied_radii() {
     let mut points = vec![Vector::ZERO];
     for face in Face::iter() {
         for uv in [[0.0, 0.0], [0.99, 0.01], [0.51, 0.50], [1.0, 1.0]] {
-            let coords = Coords { x: 1, y: 1, face };
-            let dir = coords.direction(3, &na::Point2::from(uv)).into_inner();
+            let coords = Coords::new(3, face, 1, 1).unwrap();
+            let dir = coords.direction(&na::Point2::from(uv)).into_inner();
             let axis = Vector::new(dir.x, dir.y, dir.z);
             for distance in [5.0, 11.0, 16.0] {
                 points.push(axis * distance);
@@ -725,7 +713,7 @@ fn projection_handles_negative_radial_interpolation() {
     struct InwardTerrain;
     impl Terrain for InwardTerrain {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            out.fill(if coords.face == Face::Px { -9.0 } else { 0.0 });
+            out.fill(if coords.face() == Face::Px { -9.0 } else { 0.0 });
         }
         fn face_resolution(&self) -> u32 {
             1
@@ -772,21 +760,9 @@ fn projection_vertex_cache_preserves_quad_geometry_exactly() {
     });
     let planet = Planet::new(source, 2, 10.0).unwrap();
     for coords in [
-        Coords {
-            face: Face::Pz,
-            x: 0,
-            y: 2,
-        },
-        Coords {
-            face: Face::Nx,
-            x: 2,
-            y: 0,
-        },
-        Coords {
-            face: Face::Py,
-            x: 1,
-            y: 1,
-        },
+        Coords::new(3, Face::Pz, 0, 2).unwrap(),
+        Coords::new(3, Face::Nx, 2, 0).unwrap(),
+        Coords::new(3, Face::Py, 1, 1).unwrap(),
     ] {
         let (_, data) = planet.cached_chunk(&coords);
         let vertices = data.projection_vertices(&planet);
@@ -798,7 +774,7 @@ fn projection_vertex_cache_preserves_quad_geometry_exactly() {
             vertices.len(),
             (planet.chunk_resolution * planet.chunk_resolution) as usize
         );
-        let patch = Patch::new(&coords, planet.face_resolution);
+        let patch = Patch::new(&coords);
         for quad in patch.quads(planet.chunk_resolution) {
             let p = quad.position;
             let idx = (p.y * planet.chunk_resolution + p.x) as usize;
@@ -888,9 +864,9 @@ fn deeply_negative_height_encloses_inverted_geometry_for_all_queries() {
     let aabb = planet.compute_local_aabb();
     let mut inverted = 0;
     for face in Face::iter() {
-        let coords = Coords { face, x: 0, y: 0 };
+        let coords = Coords::root(face);
         let samples = planet.sample(&coords);
-        for (idx, triangle) in Patch::new(&coords, 1).triangles(10.0, 3, &samples) {
+        for (idx, triangle) in Patch::new(&coords).triangles(10.0, 3, &samples) {
             for vertex in [triangle.a, triangle.b, triangle.c] {
                 assert!(
                     vertex.length() <= envelope,
@@ -899,7 +875,7 @@ fn deeply_negative_height_encloses_inverted_geometry_for_all_queries() {
                 assert!(vertex.cmpge(aabb.mins).all() && vertex.cmple(aabb.maxs).all());
             }
             let point = (triangle.a + triangle.b + triangle.c) / 3.0;
-            let outward = coords.center::<f64>(1).into_inner();
+            let outward = coords.center::<f64>().into_inner();
             if point.dot(Vector::new(outward.x, outward.y, outward.z)) < 0.0 {
                 inverted += 1;
                 let (expected_dist2, _, _) = brute_force_projection(&planet, point);
@@ -929,12 +905,8 @@ fn deeply_negative_height_encloses_inverted_geometry_for_all_queries() {
 #[test]
 fn first_collision_query_does_not_build_whole_chunk_mesh() {
     let planet = Planet::new(Arc::new(FlatTerrain::new(1, 17).unwrap()), 1, 10.0).unwrap();
-    let coords = Coords {
-        face: Face::Px,
-        x: 0,
-        y: 0,
-    };
-    let patch = Patch::new(&coords, 1);
+    let coords = Coords::root(Face::Px);
+    let patch = Patch::new(&coords);
     let samples = planet.sample(&coords);
     let triangle = Quad::new(&patch, 16, na::Vector2::new(8, 8))
         .displace(10.0, 17, &samples)
@@ -991,8 +963,8 @@ fn sparse_region_bounds_cover_every_displaced_sample_in_nonuniform_terrain() {
     for (radius, radius_f32) in [(10.0, 10.0_f32), (6_371_000.0, 6_371_000.0_f32)] {
         for resolution in [3, 4, 5, 9, 17] {
             for face in Face::iter() {
-                let coords = Coords { face, x: 0, y: 0 };
-                let patch = Patch::new(&coords, 1);
+                let coords = Coords::root(face);
+                let patch = Patch::new(&coords);
                 let mut samples = vec![0.0_f32; (resolution * resolution) as usize];
                 for (index, height) in samples.iter_mut().enumerate() {
                     let modulus = (index * 37 + usize::from(face as u8) * 13) % 101;
@@ -1050,9 +1022,9 @@ fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
             for (index, sample) in out.iter_mut().enumerate() {
                 let modulus = (index * 31
-                    + usize::try_from(coords.x).unwrap() * 13
-                    + usize::try_from(coords.y).unwrap() * 11
-                    + usize::from(coords.face as u8) * 17)
+                    + usize::try_from(coords.x()).unwrap() * 13
+                    + usize::try_from(coords.y()).unwrap() * 11
+                    + usize::from(coords.face() as u8) * 17)
                     % 101;
                 *sample = f32::from(u8::try_from(modulus).unwrap()).mul_add(0.14, -9.0);
             }
@@ -1084,9 +1056,9 @@ fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
         for face in Face::iter() {
             for y in 0..face_resolution {
                 for x in 0..face_resolution {
-                    let coords = Coords { face, x, y };
+                    let coords = Coords::new(face_resolution, face, x, y).unwrap();
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, face_resolution);
+                    let patch = Patch::new(&coords);
                     for (index, triangle) in patch.triangles(10.0, resolution, &samples) {
                         triangles.push((coords, index, triangle));
                     }
@@ -1133,14 +1105,14 @@ fn cold_collision_broadphase_covers_variable_heights_with_inverted_samples() {
 fn cached_displaced_quad_boxes_match_actual_quad_geometry() {
     let planet = Planet::new(Arc::new(FlatTerrain::new(3, 17).unwrap()), 1, 10.0).unwrap();
     for face in Face::iter() {
-        let coords = Coords { face, x: 1, y: 1 };
+        let coords = Coords::new(3, face, 1, 1).unwrap();
         let (_, data) = planet.cached_chunk(&coords);
         assert!(data.quad_bounds.get().is_none());
         let boxes = data.quad_bounds(&planet);
         assert_eq!(boxes.quads.len(), 256);
         assert_eq!(boxes.rows.len(), 16);
         assert_eq!(boxes.blocks.len(), 32);
-        let patch = Patch::new(&coords, 3);
+        let patch = Patch::new(&coords);
         for quad in patch.quads(17) {
             let [a, b, c, d] = quad.displace(10.0, 17, &data.samples).corners;
             let expected = Aabb::new(a.min(b).min(c).min(d), a.max(b).max(c).max(d));
@@ -1178,7 +1150,7 @@ fn broadphase_wide_caps_prune_before_sampling_high_resolution_terrain() {
     );
     let mut faces = std::collections::HashSet::new();
     planet.map_elements_in_local_sphere(&stripe.bounding_sphere(), &stripe, |coords, _, _, _| {
-        faces.insert(coords.face);
+        faces.insert(coords.face());
         true
     });
     assert_eq!(faces, [Face::Px, Face::Nx].into_iter().collect());
@@ -1192,7 +1164,7 @@ fn broadphase_handles_volume_centered_on_planet_origin() {
     let aabb = Aabb::from_half_extents(Vector::ZERO, Vector::splat(15.0));
     let mut found = std::collections::HashSet::new();
     planet.map_elements_in_local_sphere(&aabb.bounding_sphere(), &aabb, |&coords, _, _, _| {
-        found.insert(coords.face);
+        found.insert(coords.face());
         true
     });
     assert_eq!(
@@ -1207,7 +1179,7 @@ fn broadphase_inward_displacement_reaches_opposite_direction() {
     struct Inward;
     impl Terrain for Inward {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            out.fill(if coords.face == Face::Px { -9.0 } else { 0.0 });
+            out.fill(if coords.face() == Face::Px { -9.0 } else { 0.0 });
         }
         fn face_resolution(&self) -> u32 {
             1
@@ -1223,12 +1195,8 @@ fn broadphase_inward_displacement_reaches_opposite_direction() {
         }
     }
     let planet = Planet::new(Arc::new(Inward), 1, 10.0).unwrap();
-    let target = Coords {
-        face: Face::Px,
-        x: 0,
-        y: 0,
-    };
-    let patch = Patch::new(&target, 1);
+    let target = Coords::root(Face::Px);
+    let patch = Patch::new(&target);
     let samples = planet.sample(&target);
     let mut inverted = 0;
     for (idx, tri) in patch.triangles(10.0, 3, &samples) {
@@ -1267,8 +1235,8 @@ fn broadphase_includes_planetary_radius_face_seams_and_quad_corners() {
     for face in Face::iter() {
         for x in [0, 1, RES / 2, RES - 2, RES - 1] {
             for y in [0, 1, RES / 2, RES - 2, RES - 1] {
-                let coords = Coords { face, x, y };
-                let patch = Patch::new(&coords, RES);
+                let coords = Coords::new(RES, face, x, y).unwrap();
+                let patch = Patch::new(&coords);
                 let samples = planet.sample(&coords);
                 for xy in [
                     na::Vector2::new(0, 0),
@@ -1332,9 +1300,9 @@ fn broadphase_covers_randomly_oriented_boxes_and_variable_heights() {
         for face in Face::iter() {
             for y in 0..resolution {
                 for x in 0..resolution {
-                    let coords = Coords { face, x, y };
+                    let coords = Coords::new(resolution, face, x, y).unwrap();
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, resolution);
+                    let patch = Patch::new(&coords);
                     for (idx, tri) in patch.triangles(10.0, 3, &samples) {
                         exhaustive.push((coords, idx, tri));
                     }
@@ -1408,8 +1376,8 @@ fn broadphase_reports_every_triangle_whose_aabb_intersects_query() {
         for face in Face::iter() {
             for x in 0..resolution {
                 for y in 0..resolution {
-                    let coords = Coords { face, x, y };
-                    let patch = Patch::new(&coords, resolution);
+                    let coords = Coords::new(resolution, face, x, y).unwrap();
+                    let patch = Patch::new(&coords);
                     let samples = planet.sample(&coords);
                     for tri in patch
                         .triangles(planet.radius, planet.chunk_resolution, &samples)
@@ -1433,13 +1401,10 @@ fn broadphase_reports_every_triangle_whose_aabb_intersects_query() {
                             for test_face in Face::iter() {
                                 for yy in 0..resolution {
                                     for xx in 0..resolution {
-                                        let at = Coords {
-                                            face: test_face,
-                                            x: xx,
-                                            y: yy,
-                                        };
+                                        let at =
+                                            Coords::new(resolution, test_face, xx, yy).unwrap();
                                         let samples = planet.sample(&at);
-                                        let patch = Patch::new(&at, resolution);
+                                        let patch = Patch::new(&at);
                                         for (idx, triangle) in patch.triangles(
                                             planet.radius,
                                             planet.chunk_resolution,
@@ -1519,9 +1484,9 @@ fn brute_force_planet_pair(
         for face in Face::iter() {
             for y in 0..planet.face_resolution {
                 for x in 0..planet.face_resolution {
-                    let coords = Coords { face, x, y };
+                    let coords = Coords::new(planet.face_resolution, face, x, y).unwrap();
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, planet.face_resolution);
+                    let patch = Patch::new(&coords);
                     result.extend(
                         patch
                             .triangles(planet.radius, planet.chunk_resolution, &samples)
@@ -1666,7 +1631,7 @@ fn planet_pair_deeply_inward_heights_match_exhaustive_meshes() {
     struct InwardTerrain;
     impl Terrain for InwardTerrain {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            let level = match coords.face {
+            let level = match coords.face() {
                 Face::Px => -9.0,
                 Face::Nz => -5.0,
                 _ => 0.0,
@@ -1807,10 +1772,10 @@ fn pair_region_bounds_enclose_every_triangle_in_variable_height_terrain() {
         fn sample(&self, at: &Coords, out: &mut [f32]) {
             let values = [self.low, self.low * 0.5, 0.0, self.high * 0.5, self.high];
             for (index, sample) in out.iter_mut().enumerate() {
-                let hash = (at.face as u32)
+                let hash = (at.face() as u32)
                     .wrapping_mul(17)
-                    .wrapping_add(at.x.wrapping_mul(7))
-                    .wrapping_add(at.y.wrapping_mul(11))
+                    .wrapping_add(at.x().wrapping_mul(7))
+                    .wrapping_add(at.y().wrapping_mul(11))
                     .wrapping_add(u32::try_from(index).unwrap().wrapping_mul(23));
                 *sample = values[(hash % 5) as usize];
             }
@@ -1863,8 +1828,8 @@ fn pair_region_bounds_enclose_every_triangle_in_variable_height_terrain() {
         for face in Face::iter() {
             for y in 0..2 {
                 for x in 0..2 {
-                    let coords = Coords { face, x, y };
-                    let patch = Patch::new(&coords, 2);
+                    let coords = Coords::new(2, face, x, y).unwrap();
+                    let patch = Patch::new(&coords);
                     let samples = planet.sample(&coords);
                     let tris: Vec<_> = patch
                         .triangles(planet.radius, 3, &samples)
@@ -1890,13 +1855,14 @@ fn pair_region_bounds_enclose_every_triangle_in_variable_height_terrain() {
                 (0, 1, 1, 2),
                 (1, 2, 1, 2),
             ] {
-                let region = PatchBounds::new(planet, &pose, FaceRegion::new(face, x0, x1, y0, y1));
+                let region =
+                    PatchBounds::new(planet, &pose, FaceRegion::new(2, face, x0, x1, y0, y1));
                 for (coords, tris) in tiles {
-                    if coords.face != face
-                        || coords.x < x0
-                        || coords.x >= x1
-                        || coords.y < y0
-                        || coords.y >= y1
+                    if coords.face() != face
+                        || coords.x() < x0
+                        || coords.x() >= x1
+                        || coords.y() < y0
+                        || coords.y() >= y1
                     {
                         continue;
                     }
@@ -2065,9 +2031,9 @@ fn exhaustive_proximity_reference(
     for face in Face::iter() {
         for y in 0..planet.face_resolution {
             for x in 0..planet.face_resolution {
-                let coords = Coords { face, x, y };
+                let coords = Coords::new(planet.face_resolution, face, x, y).unwrap();
                 let samples = planet.sample(&coords);
-                let patch = Patch::new(&coords, planet.face_resolution);
+                let patch = Patch::new(&coords);
                 for (_, triangle) in
                     patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                 {
@@ -2403,9 +2369,9 @@ fn infinite_halfspace_proximity_matches_exhaustive_surface_support() {
             for face in Face::iter() {
                 for y in 0..planet.face_resolution {
                     for x in 0..planet.face_resolution {
-                        let coords = Coords { face, x, y };
+                        let coords = Coords::new(planet.face_resolution, face, x, y).unwrap();
                         let samples = planet.sample(&coords);
-                        let patch = Patch::new(&coords, planet.face_resolution);
+                        let patch = Patch::new(&coords);
                         for (_, triangle) in
                             patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                         {
@@ -2475,9 +2441,9 @@ fn inward_inverted_halfspace_support_matches_exhaustive_vertices() {
     struct InvertedHeight;
     impl Terrain for InvertedHeight {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            let level = if coords.face == Face::Px {
+            let level = if coords.face() == Face::Px {
                 -9.0
-            } else if coords.face == Face::Nz {
+            } else if coords.face() == Face::Nz {
                 -5.0
             } else {
                 0.0
@@ -2520,9 +2486,9 @@ fn inward_inverted_halfspace_support_matches_exhaustive_vertices() {
         for face in Face::iter() {
             for y in 0..2 {
                 for x in 0..2 {
-                    let coords = Coords { face, x, y };
+                    let coords = Coords::new(2, face, x, y).unwrap();
                     let samples = planet.sample(&coords);
-                    let patch = Patch::new(&coords, 2);
+                    let patch = Patch::new(&coords);
                     for (_, triangle) in patch.triangles(10.0, 3, &samples) {
                         for vertex in [triangle.a, triangle.b, triangle.c] {
                             minimum = minimum.min(normal.dot(vertex - pose.translation));
@@ -2583,13 +2549,9 @@ fn collider_callback_can_reenter_cache_and_evict_current_chunk() {
         assert!(planet.cache.try_lock().is_ok());
         // Reenter a different cubemap face with capacity 1 to ensure the
         // outer Arc snapshot remains valid after its LRU slot is evicted.
-        let other = Coords {
-            x: 0,
-            y: 0,
-            face: Face::Py,
-        };
+        let other = Coords::root(Face::Py);
         let _ = planet.cached_chunk(&other);
-        assert_eq!(coords.face, Face::Px);
+        assert_eq!(coords.face(), Face::Px);
         seen += 1;
         true
     });
@@ -2706,20 +2668,13 @@ fn terrain_sample_panic_does_not_invalidate_existing_cache_entry() {
             0.0
         }
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            assert_ne!(coords.face, Face::Nx, "intentional sample panic");
+            assert_ne!(coords.face(), Face::Nx, "intentional sample panic");
             out.fill(0.0);
         }
     }
     let planet = Planet::new(Arc::new(PanickingTerrain), 1, 10.0).unwrap();
-    let first = Coords {
-        x: 0,
-        y: 0,
-        face: Face::Px,
-    };
-    let failed = Coords {
-        face: Face::Nx,
-        ..first
-    };
+    let first = Coords::new(2, Face::Px, 0, 0).unwrap();
+    let failed = Coords::new(2, Face::Nx, first.x(), first.y()).unwrap();
     let (slot, data) = planet.cached_chunk(&first);
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         planet.cached_chunk(&failed);
@@ -2741,26 +2696,14 @@ fn planet_subshape_ids_fit_exactly_and_cache_capacity_is_lazy() {
     let planet = Planet::new(terrain, 1 << 31, 1.0)
         .expect("maximum slot count is representable without preallocating all slots");
     assert_eq!(planet.lock_cache().slots.len(), 0);
-    let (first, _) = planet.cached_chunk(&Coords {
-        x: 0,
-        y: 0,
-        face: Face::Px,
-    });
+    let (first, _) = planet.cached_chunk(&Coords::root(Face::Px));
     assert_eq!(first, 0);
     assert_eq!(planet.subshape_id(first, 1), 1);
     assert!(planet.lock_cache().slots.capacity() < 32);
     // Ordinary LRU eviction must preserve the configured slot bound.
     let planet = Planet::new(Arc::new(FlatTerrain::new(1, 2).unwrap()), 1, 1.0).unwrap();
-    let (a, _) = planet.cached_chunk(&Coords {
-        x: 0,
-        y: 0,
-        face: Face::Px,
-    });
-    let (b, _) = planet.cached_chunk(&Coords {
-        x: 0,
-        y: 0,
-        face: Face::Py,
-    });
+    let (a, _) = planet.cached_chunk(&Coords::root(Face::Px));
+    let (b, _) = planet.cached_chunk(&Coords::root(Face::Py));
     assert_eq!(a, b);
     let cache = planet.lock_cache();
     assert_eq!(cache.slots.len(), 1);
@@ -2775,13 +2718,9 @@ fn triangles() {
         1.0,
     )
     .expect("valid test planet");
-    let coords = Coords {
-        x: 0,
-        y: 0,
-        face: Face::Pz,
-    };
+    let coords = Coords::new(planet.face_resolution, Face::Pz, 0, 0).unwrap();
     let samples = planet.sample(&coords);
-    let patch = Patch::new(&coords, planet.face_resolution);
+    let patch = Patch::new(&coords);
     assert_eq!(
         patch
             .triangles(planet.radius, planet.chunk_resolution, &samples)
@@ -3037,8 +2976,8 @@ fn nonlinear_cast_checks_rotational_arc_not_just_endpoints() {
     for face in Face::iter() {
         for y in 0..3 {
             for x in 0..3 {
-                let coords = Coords { x, y, face };
-                let patch = Patch::new(&coords, 3);
+                let coords = Coords::new(3, face, x, y).unwrap();
+                let patch = Patch::new(&coords);
                 let samples = planet.sample(&coords);
                 for (_, triangle) in patch.triangles(10.0, 3, &samples) {
                     if let Some(hit) = DefaultQueryDispatcher
@@ -3071,12 +3010,8 @@ fn nonlinear_cast_checks_rotational_arc_not_just_endpoints() {
 
 #[test]
 fn patch_triangle_indices_are_dense_and_bounded_by_chunk_stride() {
-    let coords = Coords {
-        x: 0,
-        y: 0,
-        face: Face::Pz,
-    };
-    let patch = Patch::new(&coords, 1);
+    let coords = Coords::root(Face::Pz);
+    let patch = Patch::new(&coords);
     for resolution in [2, 3, 5, 17] {
         let samples = vec![0.0; (resolution * resolution) as usize];
         let ids: Vec<_> = patch
@@ -3200,11 +3135,7 @@ fn manifold_workspace_survives_eviction_and_external_reset() {
         }
         for x in 0..4 {
             for y in 0..4 {
-                planet.cached_chunk(&Coords {
-                    x,
-                    y,
-                    face: Face::Nx,
-                });
+                planet.cached_chunk(&Coords::new(4, Face::Nx, x, y).unwrap());
             }
         }
     }
@@ -3305,9 +3236,9 @@ fn exhaustive_ray_hit(planet: &Planet, ray: &Ray, max_toi: f64) -> Option<RayInt
     for face in Face::iter() {
         for y in 0..planet.face_resolution {
             for x in 0..planet.face_resolution {
-                let coords = Coords { x, y, face };
+                let coords = Coords::new(planet.face_resolution, face, x, y).unwrap();
                 let samples = planet.sample(&coords);
-                let patch = Patch::new(&coords, planet.face_resolution);
+                let patch = Patch::new(&coords);
                 for (_, triangle) in
                     patch.triangles(planet.radius, planet.chunk_resolution, &samples)
                 {
@@ -3423,9 +3354,9 @@ fn raycast_matches_full_mesh_for_targeted_triangle_interiors() {
     for face in Face::iter() {
         for y in 0..3 {
             for x in 0..3 {
-                let coords = Coords { x, y, face };
+                let coords = Coords::new(3, face, x, y).unwrap();
                 let samples = planet.sample(&coords);
-                let patch = Patch::new(&coords, 3);
+                let patch = Patch::new(&coords);
                 for quad in patch.quads(3) {
                     for triangle in quad.displace(10.0, 3, &samples).triangles() {
                         for weights in [[0.33, 0.33, 0.34], [0.000001, 0.499999, 0.5]] {
@@ -3472,7 +3403,7 @@ fn raycast_deep_inward_displacements_match_exhaustive_reference() {
     struct InwardTerrain;
     impl Terrain for InwardTerrain {
         fn sample(&self, coords: &Coords, out: &mut [f32]) {
-            out.fill(if coords.face == Face::Px { -9.0 } else { 0.0 });
+            out.fill(if coords.face() == Face::Px { -9.0 } else { 0.0 });
         }
         fn face_resolution(&self) -> u32 {
             2
@@ -3564,9 +3495,9 @@ fn raycast_hits_targeted_face_seams_on_planetary_radius() {
     for face in Face::iter() {
         for x in [0, 1, RES / 2, RES - 2, RES - 1] {
             for y in [0, 1, RES / 2, RES - 2, RES - 1] {
-                let coords = Coords { x, y, face };
+                let coords = Coords::new(RES, face, x, y).unwrap();
                 let samples = planet.sample(&coords);
-                let patch = Patch::new(&coords, RES);
+                let patch = Patch::new(&coords);
                 for xy in [
                     na::Vector2::new(0, 0),
                     na::Vector2::new(7, 7),
@@ -3804,31 +3735,23 @@ fn cast_shape_nonlinear_smoke() {
 #[test]
 fn patch_interpolation() {
     let res = 2u32.pow(12);
-    let chunk = Coords {
-        x: 12,
-        y: 47,
-        face: Face::Px,
-    };
-    let patch = Patch::new(&chunk, res);
+    let chunk = Coords::new(res, Face::Px, 12, 47).unwrap();
+    let patch = Patch::new(&chunk);
 
     // Verify that the corners are consistent. All other points won't be, since
     // `Coords::direction` interpolates on the sphere.
     for coords in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]] {
         // Exact equality is intended here, as a prerequisite for neighboring patches to be
         // seamless.
-        assert_eq!(patch.get(&Vec2::from(coords)), corner(&chunk, res, coords));
+        assert_eq!(patch.get(&Vec2::from(coords)), corner(&chunk, coords));
     }
 }
 
 #[test]
 fn patch_projection() {
     let res = 2u32.pow(12);
-    let chunk = Coords {
-        x: 12,
-        y: 47,
-        face: Face::Px,
-    };
-    let patch = Patch::new(&chunk, res);
+    let chunk = Coords::new(res, Face::Px, 12, 47).unwrap();
+    let patch = Patch::new(&chunk);
 
     let coords = [0.1, 0.4];
     assert_abs_diff_eq!(

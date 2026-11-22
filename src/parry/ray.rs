@@ -83,7 +83,7 @@ impl Planet {
         solid: bool,
     ) -> Option<(u32, RayIntersection)> {
         let (_, data) = self.cached_chunk(&coords);
-        let patch = Patch::new(&coords, self.face_resolution);
+        let patch = Patch::new(&coords);
         let padding = Vector::splat(
             256.0 * f64::EPSILON * (self.max_radius() + ray.origin.abs().max_element()),
         );
@@ -147,8 +147,8 @@ impl Planet {
         if !end.is_finite() {
             return None;
         }
-        let coords = Coords::from_vector(self.face_resolution, &cube_vector(ray.origin));
-        let patch = Patch::new(&coords, self.face_resolution);
+        let coords = Coords::from_vector(self.face_resolution, &cube_vector(ray.origin))?;
+        let patch = Patch::new(&coords);
         let quad = patch.quad_at_direction(self.chunk_resolution - 1, &ray.origin);
         let [a, b, c, d] = quad.corners;
         let margin = 512.0
@@ -250,7 +250,7 @@ impl RayCast for Planet {
 
 impl RankedRegion {
     fn ray(planet: &Planet, region: FaceRegion, ray: &Ray, max_toi: f64) -> Option<Self> {
-        let cone = DirectionCone::from_region(region, planet.face_resolution);
+        let cone = DirectionCone::from_region(region);
         let radius = planet.radius;
         let min_height = f64::from(planet.min_height);
         let max_height = f64::from(planet.max_height);

@@ -30,8 +30,10 @@ impl Planet {
             Vector::X
         };
         let resolution = self.face_resolution;
-        let coords = Coords::from_vector(resolution, &cube_vector(axis));
-        let patch = Patch::new(&coords, resolution);
+        let Some(coords) = Coords::from_vector(resolution, &cube_vector(axis)) else {
+            return true; // No valid local seed; retain the global traversal.
+        };
+        let patch = Patch::new(&coords);
         let quad = patch.quad_at_direction(self.chunk_resolution - 1, &axis);
         let (_, data) = self.cached_chunk(&coords);
         for (index, triangle) in quad
@@ -115,7 +117,7 @@ impl Planet {
         visitor: &mut impl FnMut(Coords, u32, &Triangle, &mut Real) -> bool,
     ) -> bool {
         if max_distance.is_infinite() {
-            let patch = Patch::new(&coords, self.face_resolution);
+            let patch = Patch::new(&coords);
             let (_, data) = self.cached_chunk(&coords);
             for quad in patch.quads(self.chunk_resolution) {
                 for (index, triangle) in quad
@@ -285,7 +287,7 @@ impl Planet {
             }
             if let Some(coords) = region.region.leaf() {
                 let (_, data) = self.cached_chunk(&coords);
-                let patch = Patch::new(&coords, resolution);
+                let patch = Patch::new(&coords);
                 for quad in patch.quads(self.chunk_resolution) {
                     for (index, triangle) in quad
                         .displace(self.radius, self.chunk_resolution, &data.samples)
@@ -1108,7 +1110,7 @@ fn intersects(
 
 impl RankedRegion {
     fn plane(planet: &Planet, region: FaceRegion, normal: Vector) -> Self {
-        let cone = DirectionCone::from_region(region, planet.face_resolution);
+        let cone = DirectionCone::from_region(region);
         let min_height = f64::from(planet.min_height);
         let min_radius = cone.minimum_radius(planet.radius, min_height);
         let max_radius = planet.max_radius();

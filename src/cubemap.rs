@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::ops::{Index, IndexMut, Neg};
 use std::{alloc, fmt, mem, ptr};
 
@@ -210,48 +211,66 @@ impl<T> IndexMut<Face> for CubeMap<T> {
     }
 }
 
+impl<T> CubeMap<T> {
+    /// Access a cell only when it belongs to this map's resolution.
+    #[must_use]
+    pub fn get(&self, coord: Coords) -> Option<&T> {
+        if coord.resolution() != self.resolution {
+            return None;
+        }
+        self.data.get(cell_index(coord))
+    }
+
+    /// Mutably access a cell only when it belongs to this map's resolution.
+    #[must_use]
+    pub fn get_mut(&mut self, coord: Coords) -> Option<&mut T> {
+        if coord.resolution() != self.resolution {
+            return None;
+        }
+        self.data.get_mut(cell_index(coord))
+    }
+
+    /// Access the cell addressed by a finite nonzero direction.
+    #[must_use]
+    pub fn get_direction(&self, direction: &na::Vector3<f64>) -> Option<&T> {
+        self.get(Coords::from_vector(self.resolution, direction)?)
+    }
+
+    /// Mutably access the cell addressed by a finite nonzero direction.
+    #[must_use]
+    pub fn get_direction_mut(&mut self, direction: &na::Vector3<f64>) -> Option<&mut T> {
+        self.get_mut(Coords::from_vector(self.resolution, direction)?)
+    }
+}
+
 impl<T> Index<Coords> for CubeMap<T> {
     type Output = T;
     fn index(&self, coord: Coords) -> &T {
-        assert!(
-            coord.x < self.resolution && coord.y < self.resolution,
-            "cube map cell coordinates out of bounds"
+        assert_eq!(
+            coord.resolution(),
+            self.resolution,
+            "cell belongs to a different cubemap resolution"
         );
-        let face_size = self.resolution as usize * self.resolution as usize;
-        let offset = face_size * coord.face as usize;
-        &self.data[offset + self.resolution as usize * coord.y as usize + coord.x as usize]
+        &self.data[cell_index(coord)]
     }
 }
 
 impl<T> IndexMut<Coords> for CubeMap<T> {
     fn index_mut(&mut self, coord: Coords) -> &mut T {
-        assert!(
-            coord.x < self.resolution && coord.y < self.resolution,
-            "cube map cell coordinates out of bounds"
+        assert_eq!(
+            coord.resolution(),
+            self.resolution,
+            "cell belongs to a different cubemap resolution"
         );
-        let face_size = self.resolution as usize * self.resolution as usize;
-        let offset = face_size * coord.face as usize;
-        &mut self.data[offset + self.resolution as usize * coord.y as usize + coord.x as usize]
+        &mut self.data[cell_index(coord)]
     }
 }
 
-impl<'a, T> Index<&'a na::Vector3<f64>> for CubeMap<T> {
-    type Output = T;
-    fn index(&self, x: &'a na::Vector3<f64>) -> &T {
-        &self.data[index(self.resolution, x)]
-    }
-}
-
-impl<'a, T> IndexMut<&'a na::Vector3<f64>> for CubeMap<T> {
-    fn index_mut(&mut self, x: &'a na::Vector3<f64>) -> &mut T {
-        &mut self.data[index(self.resolution, x)]
-    }
-}
-
-fn index(resolution: u32, direction: &na::Vector3<f64>) -> usize {
-    let Coords { x, y, face } = Coords::from_vector(resolution, direction);
-    let dimension = resolution as usize;
-    face as usize * dimension * dimension + y as usize * dimension + x as usize
+// Only used after checking resolution against an allocated map, whose
+// payload size is known to fit usize. Test callers use small grids.
+const fn cell_index(coord: Coords) -> usize {
+    let dimension = coord.resolution() as usize;
+    coord.face as usize * dimension * dimension + coord.y as usize * dimension + coord.x as usize
 }
 
 impl<'a, T> IntoIterator for &'a CubeMap<T> {
@@ -340,7 +359,7 @@ fn get_dir(resolution: u32, index: usize) -> Option<na::Unit<na::Vector3<f64>>> 
     let rem = index % face_size;
     let y = u32::try_from(rem / dimension).ok()?;
     let x = u32::try_from(rem % dimension).ok()?;
-    Some(Coords { x, y, face }.center(resolution))
+    Some(Coords::new(resolution, face, x, y)?.center())
 }
 
 /// Face of a cube map, identified by direction
@@ -559,18 +578,74 @@ fn face_max_dot(direction: na::Vector3<f64>) -> f64 {
     best
 }
 
-/// Coordinates in a discretized cubemap
+/// A validated address in a nonempty cubemap face. The resolution is part
+/// of the address, so coordinates cannot accidentally be used on another grid.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Coords {
-    pub x: u32,
-    pub y: u32,
-    pub face: Face,
+    x: u32,
+    y: u32,
+    face: Face,
+    resolution: NonZeroU32,
 }
 
 impl Coords {
+    /// Construct an address only when both indices are within the nonempty face.
     #[must_use]
-    pub fn from_vector(resolution: u32, vector: &na::Vector3<f64>) -> Self {
-        Self::from_vector_with_coords(resolution, vector).0
+    pub const fn new(resolution: u32, face: Face, x: u32, y: u32) -> Option<Self> {
+        if x >= resolution || y >= resolution {
+            return None;
+        }
+        match NonZeroU32::new(resolution) {
+            Some(resolution) => Some(Self {
+                x,
+                y,
+                face,
+                resolution,
+            }),
+            None => None,
+        }
+    }
+
+    /// The sole address at resolution one.
+    #[must_use]
+    pub const fn root(face: Face) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            face,
+            resolution: NonZeroU32::MIN,
+        }
+    }
+
+    /// Column on this face.
+    #[must_use]
+    pub const fn x(self) -> u32 {
+        self.x
+    }
+
+    /// Row on this face.
+    #[must_use]
+    pub const fn y(self) -> u32 {
+        self.y
+    }
+
+    /// Face containing this address.
+    #[must_use]
+    pub const fn face(self) -> Face {
+        self.face
+    }
+
+    /// Number of addresses along either axis of a face.
+    #[must_use]
+    pub const fn resolution(self) -> u32 {
+        self.resolution.get()
+    }
+
+    /// Compute the cell containing a finite nonzero vector, or return None
+    /// for an invalid direction or empty grid.
+    #[must_use]
+    pub fn from_vector(resolution: u32, vector: &na::Vector3<f64>) -> Option<Self> {
+        Self::from_vector_with_coords(resolution, vector).map(|(coords, _)| coords)
     }
 
     /// Compute the coordinates of the cell containing a finite nonzero vector,
@@ -579,22 +654,42 @@ impl Coords {
     pub fn from_vector_with_coords(
         resolution: u32,
         vector: &na::Vector3<f64>,
-    ) -> (Self, na::Point2<f64>) {
+    ) -> Option<(Self, na::Point2<f64>)> {
+        let resolution = NonZeroU32::new(resolution)?;
+        if !vector.iter().all(|x| x.is_finite()) || vector.iter().all(|&x| x == 0.0) {
+            return None;
+        }
         let (face, coords) = Face::coords(vector);
+        if !coords.iter().all(|x| x.is_finite()) {
+            return None;
+        }
         let coords = coords * 0.5 + na::Vector2::new(0.5, 0.5);
-        let (x, y) = discretize(resolution, coords);
-        let scale = f64::from(resolution);
+        let (x, y) = discretize(resolution.get(), coords);
+        let scale = f64::from(resolution.get());
         let local = na::Point2::new(
             coords.x.mul_add(scale, -f64::from(x)).clamp(0.0, 1.0),
             coords.y.mul_add(scale, -f64::from(y)).clamp(0.0, 1.0),
         );
-        (Self { x, y, face }, local)
+        Some((
+            Self {
+                x,
+                y,
+                face,
+                resolution,
+            },
+            local,
+        ))
     }
 
     #[must_use]
-    pub fn neighbors(&self, resolution: u32) -> [Self; 4] {
-        let Self { x, y, face } = *self;
-        let max = resolution - 1;
+    pub fn neighbors(&self) -> [Self; 4] {
+        let Self {
+            x,
+            y,
+            face,
+            resolution,
+        } = *self;
+        let max = resolution.get() - 1;
         let neighbor_chunk = |face: Face, edge: Edge| {
             let (neighboring_face, neighbor_edge, parallel_axis) = face.neighbors()[edge];
             let other = match edge {
@@ -612,28 +707,49 @@ impl Coords {
                 x,
                 y,
                 face: neighboring_face,
+                resolution,
             }
         };
         [
             if x == 0 {
                 neighbor_chunk(face, Edge::Nx)
             } else {
-                Self { x: x - 1, y, face }
+                Self {
+                    x: x - 1,
+                    y,
+                    face,
+                    resolution,
+                }
             },
             if y == 0 {
                 neighbor_chunk(face, Edge::Ny)
             } else {
-                Self { x, y: y - 1, face }
+                Self {
+                    x,
+                    y: y - 1,
+                    face,
+                    resolution,
+                }
             },
             if x == max {
                 neighbor_chunk(face, Edge::Px)
             } else {
-                Self { x: x + 1, y, face }
+                Self {
+                    x: x + 1,
+                    y,
+                    face,
+                    resolution,
+                }
             },
             if y == max {
                 neighbor_chunk(face, Edge::Py)
             } else {
-                Self { x, y: y + 1, face }
+                Self {
+                    x,
+                    y: y + 1,
+                    face,
+                    resolution,
+                }
             },
         ]
     }
@@ -649,7 +765,8 @@ impl Coords {
         direction: na::Vector3<f64>,
         theta: f64,
     ) -> impl Iterator<Item = Self> {
-        let valid = resolution != 0 && theta.is_finite() && theta >= 0.0;
+        let resolution = NonZeroU32::new(resolution);
+        let valid = theta.is_finite() && theta >= 0.0;
         // Scale first: normalization must also work for finite vectors whose
         // squared norm would overflow or underflow.
         let scale = direction.amax();
@@ -667,6 +784,7 @@ impl Coords {
                 if !valid {
                     return None;
                 }
+                let resolution = resolution?;
                 let axis = axis?;
                 let local = face.basis::<f64>().inverse_transform_vector(&axis);
                 // Reject faces that the cone cannot physically reach. Without
@@ -701,37 +819,42 @@ impl Coords {
                     return None;
                 }
                 let (x0, y0) = discretize(
-                    resolution,
+                    resolution.get(),
                     na::Point2::new(
                         face_to_grid(x_min) - ANGULAR_ROUNDOFF,
                         face_to_grid(y_min) - ANGULAR_ROUNDOFF,
                     ),
                 );
                 let (x1, y1) = discretize(
-                    resolution,
+                    resolution.get(),
                     na::Point2::new(
                         face_to_grid(x_max) + ANGULAR_ROUNDOFF,
                         face_to_grid(y_max) + ANGULAR_ROUNDOFF,
                     ),
                 );
-                Some((face, x0, x1, y0, y1))
+                Some((face, x0, x1, y0, y1, resolution))
             })
-            .flat_map(move |(face, x0, x1, y0, y1)| {
-                (y0..=y1).flat_map(move |y| (x0..=x1).map(move |x| Self { x, y, face }))
+            .flat_map(move |(face, x0, x1, y0, y1, resolution)| {
+                (y0..=y1).flat_map(move |y| {
+                    (x0..=x1).map(move |x| Self {
+                        x,
+                        y,
+                        face,
+                        resolution,
+                    })
+                })
             })
     }
 
     /// The direction through the center of this cell.
     #[must_use]
-    pub fn center<N: RealField + Copy>(&self, resolution: u32) -> na::Unit<na::Vector3<N>> {
-        self.face.direction(
-            &self
-                .face_position(resolution, na::Point2::new(0.5, 0.5))
-                .cast(),
-        )
+    pub fn center<N: RealField + Copy>(&self) -> na::Unit<na::Vector3<N>> {
+        self.face
+            .direction(&self.face_position(na::Point2::new(0.5, 0.5)).cast())
     }
 
-    fn face_position(&self, resolution: u32, local: na::Point2<f64>) -> na::Point2<f64> {
+    fn face_position(&self, local: na::Point2<f64>) -> na::Point2<f64> {
+        let resolution = self.resolution();
         let scale = f64::from(resolution);
         na::Point2::new(
             centered_axis(centered_origin(self.x, resolution), scale, local.x),
@@ -744,26 +867,21 @@ impl Coords {
     #[must_use]
     pub fn direction<N: RealField + Copy + Into<f64>>(
         &self,
-        resolution: u32,
         coords: &na::Point2<N>,
     ) -> na::Unit<na::Vector3<N>> {
-        self.face.direction(
-            &self
-                .face_position(resolution, coords.map(Into::into))
-                .cast(),
-        )
+        self.face
+            .direction(&self.face_position(coords.map(Into::into)).cast())
     }
 
     /// Length of an edge of the bounding square of the cubemap-space area covered by a coordinate
-    /// in a cubemap with a particular `resolution`
+    /// in its cubemap grid.
     #[must_use]
-    pub fn edge_length<N: RealField>(resolution: u32) -> N {
-        na::convert::<_, N>(2.0) / na::convert::<_, N>(f64::from(resolution))
+    pub fn edge_length<N: RealField>(&self) -> N {
+        na::convert::<_, N>(2.0) / na::convert::<_, N>(f64::from(self.resolution()))
     }
 
     /// Returns a grid of resolution^2 directions contained by these coords, in scan-line order
     ///
-    /// - `face_resolution` represents the number of coordinates along an edge of the cubemap
     /// - `chunk_resolution` represents the number of samples along an edge of this specific coordinate
     ///
     /// Edge/corner samples lie *directly* on the edge/corner, and hence are *not* the centers of
@@ -772,14 +890,10 @@ impl Coords {
     /// for seamless interpolation in the neighborhood of chunk edges/corners without needing access
     /// to data for neighboring chunks.
     #[must_use]
-    pub fn samples<N: RealField + Copy>(
-        &self,
-        face_resolution: u32,
-        chunk_resolution: u32,
-    ) -> SampleIter<N> {
+    pub fn samples<N: RealField + Copy>(&self, chunk_resolution: u32) -> SampleIter<N> {
         SampleIter {
             face: self.face,
-            positions: SampleGrid::new(*self, face_resolution, chunk_resolution),
+            positions: SampleGrid::new(*self, chunk_resolution),
             _marker: PhantomData,
         }
     }
@@ -790,15 +904,10 @@ impl Coords {
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
     #[must_use]
-    pub fn samples_ps<S: Simd>(
-        &self,
-        simd: S,
-        face_resolution: u32,
-        chunk_resolution: u32,
-    ) -> SampleIterSimd<S> {
+    pub fn samples_ps<S: Simd>(&self, simd: S, chunk_resolution: u32) -> SampleIterSimd<S> {
         SampleIterSimd {
             face: self.face,
-            positions: SampleGrid::new(*self, face_resolution, chunk_resolution),
+            positions: SampleGrid::new(*self, chunk_resolution),
             simd,
         }
     }
@@ -932,7 +1041,8 @@ struct SampleGrid {
 }
 
 impl SampleGrid {
-    fn new(coords: Coords, face_resolution: u32, side: u32) -> Self {
+    fn new(coords: Coords, side: u32) -> Self {
+        let face_resolution = coords.resolution();
         let scale = f64::from(face_resolution);
         let origin = na::Point2::new(
             centered_origin(coords.x, face_resolution),
@@ -1129,6 +1239,10 @@ mod test {
     use super::*;
     use approx::*;
 
+    fn index(resolution: u32, direction: &na::Vector3<f64>) -> usize {
+        cell_index(Coords::from_vector(resolution, direction).unwrap())
+    }
+
     #[test]
     fn index_sanity() {
         const RES: u32 = 2048;
@@ -1193,43 +1307,84 @@ mod test {
     }
 
     #[test]
+    fn coordinate_identity_and_neighbors_preserve_resolution() {
+        let mut addresses = std::collections::HashSet::new();
+        for resolution in [1, 2, 3, u32::MAX] {
+            for face in Face::iter() {
+                let origin = Coords::new(resolution, face, 0, 0).unwrap();
+                assert!(addresses.insert(origin));
+                let last = resolution - 1;
+                for (x, y) in [
+                    (0, 0),
+                    (0, last),
+                    (last, 0),
+                    (last, last),
+                    (last / 2, last / 2),
+                ] {
+                    let address = Coords::new(resolution, face, x, y).unwrap();
+                    for neighbor in address.neighbors() {
+                        assert_eq!(neighbor.resolution(), resolution);
+                        assert!(neighbor.x() < resolution && neighbor.y() < resolution);
+                        assert!(neighbor.neighbors().contains(&address));
+                    }
+                }
+            }
+        }
+        assert_eq!(addresses.len(), 24);
+    }
+
+    #[test]
     fn invalid_coordinate_never_aliases_adjacent_cells_or_faces() {
         let mut map = CubeMap::new(2, 0_u32).unwrap();
-        let valid = Coords {
-            x: 1,
-            y: 0,
-            face: Face::Px,
-        };
+        let valid = Coords::new(2, Face::Px, 1, 0).unwrap();
         map[valid] = 42;
-        assert_eq!(map[valid], 42);
+        assert_eq!(map.get(valid), Some(&42));
         for (x, y) in [(2, 0), (0, 2), (u32::MAX, 0)] {
-            let invalid = Coords {
-                x,
-                y,
-                face: Face::Px,
-            };
+            assert!(Coords::new(2, Face::Px, x, y).is_none());
+        }
+        assert!(Coords::new(0, Face::Px, 0, 0).is_none());
+        // A valid address in a different grid must not alias this map,
+        // even when its indices happen to be in bounds here.
+        for resolution in [1, 3, u32::MAX] {
+            let wrong_grid = Coords::new(resolution, Face::Px, 0, 0).unwrap();
+            assert!(map.get(wrong_grid).is_none());
+            assert!(map.get_mut(wrong_grid).is_none());
             assert!(
                 std::panic::catch_unwind(|| {
-                    let _ = map[invalid];
+                    let _ = map[wrong_grid];
                 })
                 .is_err()
             );
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    map[invalid] = 99;
+                    map[wrong_grid] = 99;
                 }))
                 .is_err()
             );
         }
         assert_eq!(map[valid], 42);
-        assert_eq!(
-            map[Coords {
-                x: 0,
-                y: 0,
-                face: Face::Nx
-            }],
-            0
+        assert_eq!(map[Coords::new(2, Face::Nx, 0, 0).unwrap()], 0);
+        for invalid in [
+            na::Vector3::zeros(),
+            na::Vector3::new(f64::NAN, 1.0, 0.0),
+            na::Vector3::new(f64::INFINITY, 1.0, 0.0),
+        ] {
+            assert!(Coords::from_vector(2, &invalid).is_none());
+            assert!(Coords::from_vector_with_coords(2, &invalid).is_none());
+            assert!(map.get_direction(&invalid).is_none());
+            assert!(map.get_direction_mut(&invalid).is_none());
+        }
+        assert!(Coords::from_vector(0, &na::Vector3::x()).is_none());
+        assert!(
+            CubeMap::new(0, 0)
+                .unwrap()
+                .get_direction(&na::Vector3::x())
+                .is_none()
         );
+        let direction = valid.center::<f64>();
+        assert_eq!(map.get_direction(&direction), Some(&42));
+        *map.get_direction_mut(&direction).unwrap() = 43;
+        assert_eq!(map[valid], 43);
     }
 
     #[test]
@@ -1310,10 +1465,11 @@ mod test {
             for i in 0..count {
                 let direction = get_dir(resolution, i).unwrap();
                 assert_eq!(index(resolution, &direction), i);
-                let (coords, local) = Coords::from_vector_with_coords(resolution, &direction);
+                let (coords, local) =
+                    Coords::from_vector_with_coords(resolution, &direction).unwrap();
                 assert!((local.x - 0.5).abs() < 1.0e-5);
                 assert!((local.y - 0.5).abs() < 1.0e-5);
-                assert_abs_diff_eq!(coords.center::<f64>(resolution), direction);
+                assert_abs_diff_eq!(coords.center::<f64>(), direction);
             }
         }
     }
@@ -1338,10 +1494,11 @@ mod test {
                 .into_iter()
                 .chain((0..128).map(|_| (next(), next())))
                 {
-                    let coords = Coords { x, y, face };
+                    let coords = Coords::new(resolution, face, x, y).unwrap();
                     for local in [na::Point2::new(0.5, 0.5), na::Point2::new(0.2, 0.8)] {
-                        let direction = coords.direction(resolution, &local);
-                        let (actual, uv) = Coords::from_vector_with_coords(resolution, &direction);
+                        let direction = coords.direction(&local);
+                        let (actual, uv) =
+                            Coords::from_vector_with_coords(resolution, &direction).unwrap();
                         assert_eq!(actual, coords);
                         assert_abs_diff_eq!(uv, local, epsilon = 1e-5);
                         let nearby: Vec<_> =
@@ -1376,15 +1533,11 @@ mod test {
     fn adjacent_samples_match_at_non_power_of_two_and_deep_resolutions() {
         for resolution in [3, 11, 1 << 24, 1 << 31, u32::MAX] {
             for x in [0, resolution / 2, resolution - 2] {
-                let left = Coords {
-                    x,
-                    y: resolution / 2,
-                    face: Face::Pz,
-                };
-                let right = Coords { x: x + 1, ..left };
+                let left = Coords::new(resolution, Face::Pz, x, resolution / 2).unwrap();
+                let right = Coords::new(resolution, left.face(), x + 1, left.y()).unwrap();
                 for samples in [2, 5, 8, 17] {
-                    let a: Vec<_> = left.samples::<f64>(resolution, samples).collect();
-                    let b: Vec<_> = right.samples::<f64>(resolution, samples).collect();
+                    let a: Vec<_> = left.samples::<f64>(samples).collect();
+                    let b: Vec<_> = right.samples::<f64>(samples).collect();
                     for row in 0..samples as usize {
                         assert_eq!(
                             a[row * samples as usize + samples as usize - 1],
@@ -1399,10 +1552,10 @@ mod test {
     #[test]
     fn vector_lookup_returns_local_coordinates_within_selected_cell() {
         for face in Face::iter() {
-            let coords = Coords { x: 2, y: 5, face };
+            let coords = Coords::new(8, face, 2, 5).unwrap();
             let local = na::Point2::new(0.2_f64, 0.8);
-            let direction = coords.direction(8, &local);
-            let (actual, uv) = Coords::from_vector_with_coords(8, &direction);
+            let direction = coords.direction(&local);
+            let (actual, uv) = Coords::from_vector_with_coords(8, &direction).unwrap();
             assert_eq!(coords, actual);
             assert_abs_diff_eq!(uv, local, epsilon = 1.0e-5);
         }
@@ -1467,52 +1620,27 @@ mod test {
             let center = face.basis() * na::Vector3::z();
             assert_eq!(
                 Coords::neighborhood(1, center, 0.1).collect::<Vec<_>>(),
-                vec![Coords { x: 0, y: 0, face }]
+                vec![Coords::root(face)]
             );
             assert_eq!(
                 Coords::neighborhood(3, center, 0.1).collect::<Vec<_>>(),
-                vec![Coords { x: 1, y: 1, face }]
+                vec![Coords::new(3, face, 1, 1).unwrap()]
             );
             let xs = Coords::neighborhood(2, center, 0.1).collect::<Vec<_>>();
             assert_eq!(xs.len(), 4);
-            for expected in (0..2).flat_map(|y| (0..2).map(move |x| Coords { x, y, face })) {
+            for expected in
+                (0..2).flat_map(|y| (0..2).map(move |x| Coords::new(2, face, x, y).unwrap()))
+            {
                 assert!(xs.contains(&expected));
             }
         }
         assert_eq!(
             Coords::neighborhood(1, na::Vector3::new(1.0, 1.0, 1.0), 0.1).collect::<Vec<_>>(),
-            vec![
-                Coords {
-                    x: 0,
-                    y: 0,
-                    face: Px
-                },
-                Coords {
-                    x: 0,
-                    y: 0,
-                    face: Py
-                },
-                Coords {
-                    x: 0,
-                    y: 0,
-                    face: Pz
-                }
-            ]
+            vec![Coords::root(Px), Coords::root(Py), Coords::root(Pz)]
         );
         assert_eq!(
             Coords::neighborhood(1, na::Vector3::new(1.0, 1.0, 0.0), 0.1).collect::<Vec<_>>(),
-            vec![
-                Coords {
-                    x: 0,
-                    y: 0,
-                    face: Px
-                },
-                Coords {
-                    x: 0,
-                    y: 0,
-                    face: Py
-                },
-            ]
+            vec![Coords::root(Px), Coords::root(Py),]
         );
         assert_eq!(
             Coords::neighborhood(5, na::Vector3::new(1.0, 1.0, 1.0), 0.1).count(),
@@ -1546,17 +1674,13 @@ mod test {
 
     #[test]
     fn samples_sanity() {
-        const COORDS: Coords = Coords {
-            x: 0,
-            y: 0,
-            face: Face::Py,
-        };
+        const COORDS: Coords = Coords::root(Face::Py);
         assert_abs_diff_eq!(
-            COORDS.samples::<f32>(1, 1).next().unwrap(),
+            COORDS.samples::<f32>(1).next().unwrap(),
             na::Vector3::y_axis()
         );
         let corners = COORDS
-            .samples(1, 2)
+            .samples(2)
             .map(|x| x.into_inner())
             .collect::<Vec<_>>();
         let corner = na::Unit::new_normalize(na::Vector3::new(1.0, 1.0, 1.0));
@@ -1576,13 +1700,9 @@ mod test {
         for face in Face::iter() {
             for resolution in [1, 3, 4096, 1 << 31, u32::MAX] {
                 for x in [0, resolution / 2, resolution - 1] {
-                    let coords = Coords {
-                        x,
-                        y: resolution / 2,
-                        face,
-                    };
+                    let coords = Coords::new(resolution, face, x, resolution / 2).unwrap();
                     for side in [0, 1, 2, 3, 7, 8, 17, 33] {
-                        let mut samples = coords.samples::<f64>(resolution, side);
+                        let mut samples = coords.samples::<f64>(side);
                         for y in 0..side {
                             for x in 0..side {
                                 let scale = f64::from(resolution);
@@ -1617,12 +1737,8 @@ mod test {
 
     #[test]
     fn maximum_scanline_dimensions_preserve_full_length_and_final_cell() {
-        let coords = Coords {
-            x: u32::MAX - 1,
-            y: u32::MAX - 1,
-            face: Face::Pz,
-        };
-        let mut grid = SampleGrid::new(coords, u32::MAX, u32::MAX);
+        let coords = Coords::new(u32::MAX, Face::Pz, u32::MAX - 1, u32::MAX - 1).unwrap();
+        let mut grid = SampleGrid::new(coords, u32::MAX);
         assert_eq!(grid.remaining(), u64::from(u32::MAX).pow(2));
         // Reach the final column and row without consuming 2^64 samples.
         grid.column = u32::MAX - 1;
@@ -1642,14 +1758,11 @@ mod test {
         fn check<S: Simd>(simd: S) {
             for face in Face::iter() {
                 for resolution in [3, 4096, 1 << 31, u32::MAX] {
-                    let coords = Coords {
-                        x: resolution / 2,
-                        y: resolution / 3,
-                        face,
-                    };
+                    let coords =
+                        Coords::new(resolution, face, resolution / 2, resolution / 3).unwrap();
                     for side in [0, 1, 2, 3, 7, 8, 17, 33] {
-                        let mut scalar = coords.samples::<f32>(resolution, side);
-                        let mut vector = coords.samples_ps(simd, resolution, side);
+                        let mut scalar = coords.samples::<f32>(side);
+                        let mut vector = coords.samples_ps(simd, side);
                         let mut last = None;
                         while let Some(batch) = vector.next() {
                             for i in 0..S::f32s::LEN {
@@ -1680,18 +1793,10 @@ mod test {
 
     #[test]
     fn neighboring_samples_align() {
-        const LEFT: Coords = Coords {
-            x: 0,
-            y: 0,
-            face: Face::Pz,
-        };
-        const RIGHT: Coords = Coords {
-            x: 1,
-            y: 0,
-            face: Face::Pz,
-        };
-        let left = LEFT.samples::<f32>(2, 2).collect::<Vec<_>>();
-        let right = RIGHT.samples::<f32>(2, 2).collect::<Vec<_>>();
+        const LEFT: Coords = Coords::new(2, Face::Pz, 0, 0).unwrap();
+        const RIGHT: Coords = Coords::new(2, Face::Pz, 1, 0).unwrap();
+        let left = LEFT.samples::<f32>(2).collect::<Vec<_>>();
+        let right = RIGHT.samples::<f32>(2).collect::<Vec<_>>();
         assert_abs_diff_eq!(left[1], right[0]);
         assert_abs_diff_eq!(left[3], right[2]);
     }
@@ -1701,15 +1806,10 @@ mod test {
     fn simd_samples_consistent() {
         use fearless_simd::Fallback;
 
-        const COORDS: Coords = Coords {
-            x: 0,
-            y: 0,
-            face: Face::Py,
-        };
-        const FACE_RES: u32 = 1;
+        const COORDS: Coords = Coords::root(Face::Py);
         const CHUNK_RES: u32 = 17;
-        let mut scalar = COORDS.samples(FACE_RES, CHUNK_RES);
-        let simd = COORDS.samples_ps(Fallback::new(), FACE_RES, CHUNK_RES);
+        let mut scalar = COORDS.samples(CHUNK_RES);
+        let simd = COORDS.samples_ps(Fallback::new(), CHUNK_RES);
         assert_eq!(
             simd.len(),
             scalar.len().div_ceil(<Fallback as Simd>::f32s::LEN)
@@ -1769,8 +1869,8 @@ mod test {
                 for face in Face::iter() {
                     for y in 0..RESOLUTION {
                         for x in 0..RESOLUTION {
-                            let coords = Coords { x, y, face };
-                            let sample = coords.center::<f64>(RESOLUTION);
+                            let coords = Coords::new(RESOLUTION, face, x, y).unwrap();
+                            let sample = coords.center::<f64>();
                             if axis.dot(sample.as_ref()) > theta.cos() + 1e-4 {
                                 assert!(
                                     actual.contains(&coords),
@@ -1788,7 +1888,7 @@ mod test {
     fn neighborhood_consistency() {
         let dir = na::Vector3::new(-5_195_083.148, 3_582_099.8, -877_091.25);
         assert_eq!(
-            Coords::from_vector(4096, &dir),
+            Coords::from_vector(4096, &dir).unwrap(),
             Coords::neighborhood(4096, dir, 0.0).next().unwrap()
         );
     }

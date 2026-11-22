@@ -58,8 +58,7 @@ impl Planet {
         // Both triangle interiors and displaced vertices lie in this
         // patch's angular cone; unlike the sample vertex radii, its
         // projected radial minimum is conservative for triangle chords.
-        let cone =
-            DirectionCone::from_region(FaceRegion::from_coords(chunk_coords), self.face_resolution);
+        let cone = DirectionCone::from_region(FaceRegion::from_coords(chunk_coords));
         let min_height = f64::from(data.min);
         let minimum_radius = cone.minimum_radius(self.radius, min_height);
         if outer_displaced_radius(self.radius, f64::from(data.min), f64::from(data.max))
@@ -69,7 +68,7 @@ impl Planet {
         {
             return true;
         }
-        let patch = Patch::new(&chunk_coords, self.face_resolution);
+        let patch = Patch::new(&chunk_coords);
         let mut emit = |quad: Quad| {
             for (i, triangle) in quad
                 .displace(self.radius, self.chunk_resolution, &data.samples)

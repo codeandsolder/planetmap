@@ -98,7 +98,7 @@ impl Config {
     }
 
     fn should_subdivide(&self, chunk: &Chunk, viewpoints: &[na::Point3<f64>]) -> bool {
-        chunk.depth < self.max_depth
+        chunk.depth() < self.max_depth
             && viewpoints
                 .iter()
                 .any(|viewpoint| needs_subdivision(chunk, viewpoint))
@@ -381,7 +381,7 @@ impl Manager {
                     let state = &self.chunks[slot as usize];
                     if state.drawn {
                         neighborhood[edge] =
-                            (chunk.depth - x.depth).min(self.config.max_neighbor_delta);
+                            (chunk.depth() - x.depth()).min(self.config.max_neighbor_delta);
                         break;
                     }
                 }
@@ -668,7 +668,7 @@ mod test {
         assert_eq!(visited.len(), visited.iter().collect::<HashSet<_>>().len());
         let pending = *transfer
             .iter()
-            .find(|chunk| chunk.depth >= 3)
+            .find(|chunk| chunk.depth() >= 3)
             .expect("near-viewpoint deep patch");
         let slot = mgr.allocate(pending).unwrap();
         mgr.update_with_visited(&[west], &mut transfer, &mut visited);
@@ -702,16 +702,16 @@ mod test {
         let mut transfer = Vec::new();
         let mut visited = Vec::new();
         mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
-        let pending = *transfer.iter().find(|c| c.depth == 1).unwrap();
+        let pending = *transfer.iter().find(|c| c.depth() == 1).unwrap();
         let slot = mgr.allocate(pending).unwrap();
         assert_eq!(mgr.cancel(slot), Ok(pending));
         mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
         assert!(transfer.contains(&pending));
         assert!(
             mgr.renderable().contains(&(
-                Chunk::root(pending.coords.face),
+                Chunk::root(pending.coords().face()),
                 Neighborhood::default(),
-                mgr.index[&Chunk::root(pending.coords.face)],
+                mgr.index[&Chunk::root(pending.coords().face())],
             )),
             "root must stay rendered during incomplete child split"
         );
@@ -766,7 +766,6 @@ mod test {
 
     #[test]
     fn neighborhood() {
-        use crate::cubemap::Coords;
         let mut mgr =
             Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
@@ -775,54 +774,12 @@ mod test {
         assert_eq!(mgr.renderable().len(), 0);
         // Get +X to `LoD` 1, +Y to `LoD` 0
         for &chunk in &[
-            Chunk {
-                coords: Coords {
-                    x: 0,
-                    y: 0,
-                    face: Face::Px,
-                },
-                depth: 0,
-            },
-            Chunk {
-                coords: Coords {
-                    x: 0,
-                    y: 0,
-                    face: Face::Py,
-                },
-                depth: 0,
-            },
-            Chunk {
-                coords: Coords {
-                    x: 0,
-                    y: 0,
-                    face: Face::Px,
-                },
-                depth: 1,
-            },
-            Chunk {
-                coords: Coords {
-                    x: 0,
-                    y: 1,
-                    face: Face::Px,
-                },
-                depth: 1,
-            },
-            Chunk {
-                coords: Coords {
-                    x: 1,
-                    y: 0,
-                    face: Face::Px,
-                },
-                depth: 1,
-            },
-            Chunk {
-                coords: Coords {
-                    x: 1,
-                    y: 1,
-                    face: Face::Px,
-                },
-                depth: 1,
-            },
+            Chunk::try_new(0, Face::Px, 0, 0).unwrap(),
+            Chunk::try_new(0, Face::Py, 0, 0).unwrap(),
+            Chunk::try_new(1, Face::Px, 0, 0).unwrap(),
+            Chunk::try_new(1, Face::Px, 0, 1).unwrap(),
+            Chunk::try_new(1, Face::Px, 1, 0).unwrap(),
+            Chunk::try_new(1, Face::Px, 1, 1).unwrap(),
         ] {
             assert!(transfers.contains(&chunk));
             let slot = mgr.allocate(chunk).unwrap();
@@ -840,14 +797,7 @@ mod test {
             .map(|&(chunk, neighbors, _slot)| (chunk, neighbors))
             .collect::<HashMap<_, _>>();
         let neighborhood = *neighbors
-            .get(&Chunk {
-                coords: Coords {
-                    x: 0,
-                    y: 0,
-                    face: Face::Px,
-                },
-                depth: 1,
-            })
+            .get(&Chunk::try_new(1, Face::Px, 0, 0).unwrap())
             .unwrap();
         assert_ne!(
             neighborhood,
@@ -903,8 +853,9 @@ mod test {
         // Fully resolve coarse levels, with only selected complete groups of
         // deeper children. This models partial splits and asymmetric streaming.
         for chunk in transfers {
-            if chunk.depth <= 2
-                || (chunk.depth == 3 && (chunk.coords.x / 2 + chunk.coords.y / 2) % 2 == 0)
+            if chunk.depth() <= 2
+                || (chunk.depth() == 3
+                    && (chunk.coords().x() / 2 + chunk.coords().y() / 2) % 2 == 0)
             {
                 let slot = manager.allocate(chunk).unwrap();
                 manager.release(slot).unwrap();
@@ -919,7 +870,7 @@ mod test {
                 let expected = neighbor
                     .path()
                     .find(|candidate| visible.contains(candidate))
-                    .map_or(0, |candidate| chunk.depth - candidate.depth);
+                    .map_or(0, |candidate| chunk.depth() - candidate.depth());
                 assert_eq!(
                     neighborhood[edge], expected,
                     "chunk {chunk:?} edge {edge:?}"
@@ -952,7 +903,7 @@ mod test {
             let viewpoint = viewpoints[(frame / 10) % viewpoints.len()];
             manager.update(&[viewpoint], &mut transfers);
             for (idx, &chunk) in transfers.iter().enumerate() {
-                if chunk.depth == 0 || idx % 3 == frame % 3 {
+                if chunk.depth() == 0 || idx % 3 == frame % 3 {
                     if let Some(slot) = manager.allocate(chunk) {
                         manager.release(slot).unwrap();
                     }
@@ -969,7 +920,7 @@ mod test {
                     let expected = neighbor
                         .path()
                         .find(|candidate| visible.contains(candidate))
-                        .map_or(0, |candidate| chunk.depth - candidate.depth);
+                        .map_or(0, |candidate| chunk.depth() - candidate.depth());
                     assert_eq!(
                         neighborhood[edge], expected,
                         "frame {frame} chunk {chunk:?} edge {edge:?}"
@@ -981,14 +932,7 @@ mod test {
 
     #[test]
     fn subdivision_sanity() {
-        let chunk = Chunk {
-            depth: 10,
-            coords: crate::cubemap::Coords {
-                x: 12,
-                y: 34,
-                face: Face::Px,
-            },
-        };
+        let chunk = Chunk::try_new(10, Face::Px, 12, 34).unwrap();
         // Verify that a chunk containing the viewpoint gets subdivided
         assert!(needs_subdivision(
             &chunk,

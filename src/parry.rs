@@ -38,7 +38,8 @@ const fn cube_vector(v: Vector) -> na::Vector3<f64> {
 /// be deterministic, finite, and inside the advertised inclusive height range.
 /// Concurrent cache misses may sample the same coordinate independently.
 pub trait Terrain: Send + Sync + 'static {
-    /// Generate a `resolution * resolution` grid of heights wrt. sea level
+    /// Generate a `chunk_resolution() * chunk_resolution()` grid of heights wrt. sea level.
+    /// The address's resolution is equal to `face_resolution()`.
     fn sample(&self, coords: &Coords, out: &mut [f32]);
     /// Number of blocks of samples (chunks) along the edge of a cubemap face
     fn face_resolution(&self) -> u32;
