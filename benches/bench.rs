@@ -11,9 +11,9 @@ use planetmap::parry::{FlatTerrain, Planet, PlanetDispatcher};
 use planetmap::*;
 
 #[cfg(feature = "parry")]
-criterion_group!(benches, cache, face_coords, collision);
+criterion_group!(benches, cache, face_coords, samples, collision);
 #[cfg(not(feature = "parry"))]
-criterion_group!(benches, cache, face_coords);
+criterion_group!(benches, cache, face_coords, samples);
 criterion_main!(benches);
 
 fn face_coords(c: &mut Criterion) {
@@ -308,3 +308,40 @@ fn collision(c: &mut Criterion) {
         });
     });
 }
+
+#[cfg(feature = "fearless_simd")]
+fn sample_batch<S: fearless_simd::Simd>(simd: S, coords: cubemap::Coords, face: u32, side: u32) {
+    for directions in coords.samples_ps(simd, face, side) {
+        std::hint::black_box(directions);
+    }
+}
+
+#[cfg(feature = "fearless_simd")]
+fn samples(c: &mut Criterion) {
+    use criterion::{BenchmarkId, Throughput};
+    use fearless_simd::{Level, dispatch};
+    let mut group = c.benchmark_group("direction samples");
+    let level = Level::new();
+    for (face, side) in [(64u32, 17u32), (4096, 65), (1 << 31, 17), (u32::MAX, 129)] {
+        let coords = cubemap::Coords {
+            x: face / 2,
+            y: face / 3,
+            face: cubemap::Face::Py,
+        };
+        group.throughput(Throughput::Elements(u64::from(side).pow(2)));
+        let id = format!("{face}/{side}");
+        group.bench_function(BenchmarkId::new("scalar f32", &id), |b| {
+            b.iter(|| {
+                for direction in std::hint::black_box(coords).samples::<f32>(face, side) {
+                    std::hint::black_box(direction);
+                }
+            });
+        });
+        group.bench_function(BenchmarkId::new("native SIMD", &id), |b| {
+            b.iter(|| dispatch!(level, simd => sample_batch(simd, std::hint::black_box(coords), face, side)));
+        });
+    }
+    group.finish();
+}
+#[cfg(not(feature = "fearless_simd"))]
+fn samples(_: &mut Criterion) {}

@@ -419,8 +419,8 @@ impl Planet {
     /// are ephemeral and can be recycled by nested calls.
     ///
     /// Positive-radius radial terrain supports fast angular neighborhood
-    /// discovery. Inward-displaced triangles and query spheres centered at
-    /// the origin instead use conservative best-first global region bounds.
+    /// discovery for small caps. Wide caps and inward-displaced triangles
+    /// instead use conservative hierarchical region bounds.
     pub fn map_elements_in_local_sphere(
         &self,
         bounds: &BoundingSphere,
@@ -430,8 +430,6 @@ impl Planet {
         let dir = bounds.center();
         let distance = dir.length();
         let min_height = f64::from(self.min_height);
-        let max_height = f64::from(self.max_height);
-        let face_resolution = self.face_resolution;
         // A full cube face has minimum axis projection 1/sqrt(3).
         // This bound covers triangle *interiors*, not only vertices.
         let inscribed = self.radius / 3.0_f64.sqrt()
@@ -454,54 +452,21 @@ impl Planet {
             } else {
                 std::f64::consts::PI
             };
-            for coords in Coords::neighborhood(face_resolution, direction, theta) {
-                if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
-                    return;
+            if theta * f64::from(self.face_resolution) <= MAX_DIRECT_CAP_CELLS {
+                for coords in Coords::neighborhood(self.face_resolution, direction, theta) {
+                    if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
+                        return;
+                    }
                 }
+                return;
             }
-            return;
         }
 
-        // A deeply inward-displaced triangle can point toward an *opposite*
-        // cube face; querying only the sphere's angular neighborhood is
-        // unsound. Use the proof-backed global projection region lower
-        // distance bound to visit every potentially intersecting tile.
-        let query = ProjectionQuery {
-            resolution: face_resolution,
-            query_radius: if distance.is_finite() { distance } else { 0.0 },
-            query_axis: if distance.is_finite() && distance > 0.0 {
-                dir / distance
-            } else {
-                Vector::X
-            },
-            planet_radius: self.radius,
-            min_height,
-            max_height,
-        };
-        let threshold2 = bounds.radius().powi(2);
-        let mut regions = BinaryHeap::new();
-        regions.extend(
-            FaceRegion::roots(face_resolution)
-                .map(|region| RankedRegion::projection(region, &query)),
-        );
-        while let Some(region) = regions.pop() {
-            if region.lower_bound > threshold2 {
-                break;
-            }
-            if let Some(coords) = region.region.leaf() {
-                if !self.map_elements_in_chunk(coords, bounds, aabb, &mut f) {
-                    return;
-                }
-                continue;
-            }
-            regions.extend(
-                region
-                    .region
-                    .children()
-                    .map(|child| RankedRegion::projection(child, &query))
-                    .filter(|candidate| candidate.lower_bound <= threshold2),
-            );
-        }
+        // A broad angular cap may cover billions of tiles, even if the
+        // query AABB touches only a narrow stripe or none of the surface.
+        // Inward terrain also invalidates angular address clipping. Both
+        // cases use the same conservative hierarchy as swept queries.
+        self.visit_bounded_triangles(bounds, aabb, f);
     }
 }
 
@@ -871,6 +836,9 @@ struct RankedRegion {
     region: FaceRegion,
     lower_bound: f64,
 }
+
+/// Use direct angular enumeration only for caps comparable to a single tile.
+const MAX_DIRECT_CAP_CELLS: f64 = 2.0;
 
 /// At most 1.5 MiB of f64 vertices per tile is retained for warm queries.
 /// Larger grids use the same projection algorithm with transient geometry.
@@ -1691,7 +1659,7 @@ impl Planet {
             return None;
         }
         let theta = (cap_radius / distance).asin();
-        if theta * f64::from(self.face_resolution) > 2.0 {
+        if theta * f64::from(self.face_resolution) > MAX_DIRECT_CAP_CELLS {
             return None;
         }
         let axis = cube_vector(bounds.center() / distance);
@@ -2878,29 +2846,40 @@ fn swept_translation_bounds(
     Some(first.merged(&last).loosened(margin))
 }
 
-/// A long, thin sweep may have a bounding sphere encompassing the entire
-/// planet. Traverse the cubemap hierarchy using its conservative displaced
-/// AABBs instead of enumerating every tile in that sphere.
-fn visit_swept_triangles(
-    planet: &Planet,
-    aabb: &Aabb,
-    mut visit: impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
-) {
-    let bounds = aabb.bounding_sphere();
-    let resolution = planet.face_resolution;
-    let mut stack: Vec<_> = FaceRegion::roots(resolution)
-        .map(|region| PatchBounds::new(planet, &Pose::IDENTITY, region))
-        .collect();
-    while let Some(patch) = stack.pop() {
-        if !patch.aabb.intersects(aabb) {
-            continue;
-        }
-        if let Some(coords) = patch.region.leaf() {
-            if !planet.map_elements_in_chunk(coords, &bounds, aabb, &mut visit) {
-                return;
+impl Planet {
+    /// Traverse the same geometrically certified cubemap region bounds for
+    /// broad static queries and swept shapes. Both the AABB and sphere
+    /// must be disjoint-safe; their intersection encloses the other shape.
+    fn visit_bounded_triangles(
+        &self,
+        bounds: &BoundingSphere,
+        aabb: &Aabb,
+        mut visit: impl FnMut(&Coords, u32, u32, &Triangle) -> bool,
+    ) {
+        let mut stack: Vec<_> = FaceRegion::roots(self.face_resolution)
+            .map(|region| PatchBounds::new(self, &Pose::IDENTITY, region))
+            .collect();
+        while let Some(patch) = stack.pop() {
+            if !patch.aabb.intersects(aabb) {
+                continue;
             }
-        } else {
-            stack.extend(patch.children(planet, &Pose::IDENTITY));
+            let distance = patch.sphere_center.distance(bounds.center());
+            let allowance = patch.sphere_radius + bounds.radius();
+            let rounding = 128.0
+                * f64::EPSILON
+                * (patch.sphere_center.abs().max_element()
+                    + bounds.center().abs().max_element()
+                    + allowance);
+            if distance.is_finite() && distance > allowance + rounding {
+                continue;
+            }
+            if let Some(coords) = patch.region.leaf() {
+                if !self.map_elements_in_chunk(coords, bounds, aabb, &mut visit) {
+                    return;
+                }
+            } else {
+                stack.extend(patch.children(self, &Pose::IDENTITY));
+            }
         }
     }
 }
@@ -2914,8 +2893,10 @@ fn earliest_cast(
 ) -> Result<Option<ShapeCastHit>, Unsupported> {
     let mut closest: Option<(Coords, u32, ShapeCastHit)> = None;
     let mut unsupported = false;
-    visit_swept_triangles(planet, aabb, |&coords, _, index, triangle| {
-        match cast(triangle) {
+    planet.visit_bounded_triangles(
+        &aabb.bounding_sphere(),
+        aabb,
+        |&coords, _, index, triangle| match cast(triangle) {
             Ok(Some(hit)) => {
                 if closest.is_none_or(|(_, _, old)| hit.time_of_impact < old.time_of_impact) {
                     closest = Some((coords, index, hit));
@@ -2927,8 +2908,8 @@ fn earliest_cast(
                 unsupported = true;
                 false
             }
-        }
-    });
+        },
+    );
     if unsupported {
         return Err(Unsupported);
     }
@@ -4639,6 +4620,45 @@ heights=({min_h},{max_h}), q={query_point:?}, p={point:?}",
                 assert_eq!(actual.maxs, expected.maxs);
             }
         }
+    }
+
+    #[test]
+    fn broadphase_wide_caps_prune_before_sampling_high_resolution_terrain() {
+        const RADIUS: f64 = 6_371_000.0;
+        let source = Arc::new(ProjectionTerrain {
+            face_resolution: 1 << 24,
+            peak: None,
+            patterned: false,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let planet = Planet::new(source.clone(), 8, RADIUS).unwrap();
+
+        // Off-center sphere covers the origin; its AABB is still
+        // well inside the shell. No chunk should need sampling.
+        let inside = Aabb::from_half_extents(Vector::new(100.0, 0.0, 0.0), Vector::splat(1000.0));
+        planet.map_elements_in_local_sphere(&inside.bounding_sphere(), &inside, |_, _, _, _| {
+            panic!("interior volume cannot intersect flat terrain")
+        });
+        assert_eq!(source.samples.load(AtomicOrdering::Relaxed), 0);
+
+        // The bounding sphere covers the planet, but the AABB is a
+        // millimetre-thin stripe intersecting only the two axis crossings.
+        let stripe = Aabb::from_half_extents(
+            Vector::new(0.01, 0.0, 0.0),
+            Vector::new(RADIUS + 10.0, 0.001, 0.001),
+        );
+        let mut faces = std::collections::HashSet::new();
+        planet.map_elements_in_local_sphere(
+            &stripe.bounding_sphere(),
+            &stripe,
+            |coords, _, _, _| {
+                faces.insert(coords.face);
+                true
+            },
+        );
+        assert_eq!(faces, [Face::Px, Face::Nx].into_iter().collect());
+        let samples = source.samples.load(AtomicOrdering::Relaxed);
+        assert!(samples < 64, "thin stripe sampled {samples} patches");
     }
 
     #[test]
