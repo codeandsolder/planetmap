@@ -1,4 +1,5 @@
 use super::Planet;
+use super::TerrainTriangle;
 use super::discrete::planet_shape_contact;
 use crate::cubemap::Coords;
 use parry3d_f64::bounding_volume::{Aabb, BoundingVolume};
@@ -66,7 +67,11 @@ fn earliest_cast(
     planet.visit_bounded_triangles(
         &aabb.bounding_sphere(),
         aabb,
-        |&coords, _, index, triangle| match cast(triangle) {
+        |TerrainTriangle {
+             coords,
+             triangle_index: index,
+             triangle,
+         }| match cast(triangle) {
             Ok(Some(hit)) => {
                 if closest.is_none_or(|(_, _, old)| hit.time_of_impact < old.time_of_impact) {
                     closest = Some((coords, index, hit));

@@ -92,7 +92,7 @@ fn collision(c: &mut Criterion) {
         let sphere = aabb.bounding_sphere();
         b.iter(|| {
             let mut count = 0;
-            planet.map_elements_in_local_sphere(&sphere, &aabb, |_, _, _, _| {
+            planet.map_elements_in_local_sphere(&sphere, &aabb, |_| {
                 count += 1;
                 true
             });
@@ -125,14 +125,10 @@ fn collision(c: &mut Criterion) {
             let index = next_face;
             next_face ^= 1;
             let mut count = 0;
-            churn.map_elements_in_local_sphere(
-                &churn_spheres[index],
-                &churn_boxes[index],
-                |_, _, _, _| {
-                    count += 1;
-                    true
-                },
-            );
+            churn.map_elements_in_local_sphere(&churn_spheres[index], &churn_boxes[index], |_| {
+                count += 1;
+                true
+            });
             std::hint::black_box(count)
         });
     });

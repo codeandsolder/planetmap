@@ -1,3 +1,4 @@
+use super::TerrainTriangle;
 use super::{Planet, PlanetDispatcher};
 use crate::cubemap::Coords;
 use hashbrown::HashMap;
@@ -237,20 +238,28 @@ where
         }
         true
     };
-    planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, triangle_index, triangle| {
-        visit_manifold_parts(
-            other,
-            &pos21,
-            prediction,
-            ManifoldKey {
-                coords,
-                triangle: triangle_index,
-                other_part: None,
-            },
-            triangle,
-            &mut visit,
-        )
-    });
+    planet.map_elements_in_local_sphere(
+        &bounds,
+        &aabb,
+        |TerrainTriangle {
+             coords,
+             triangle_index,
+             triangle,
+         }| {
+            visit_manifold_parts(
+                other,
+                &pos21,
+                prediction,
+                ManifoldKey {
+                    coords,
+                    triangle: triangle_index,
+                    other_part: None,
+                },
+                triangle,
+                &mut visit,
+            )
+        },
+    );
     status?;
 
     let slots = resolve_manifold_slots(planet, &keys)?;

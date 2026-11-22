@@ -210,6 +210,7 @@ impl Chunk {
     }
 }
 
+/// Iterator over a chunk and its ancestors, ending at the face root.
 pub struct Path {
     chunk: Option<Chunk>,
 }

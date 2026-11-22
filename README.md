@@ -32,6 +32,9 @@ For an exact capacity requirement for a particular set of viewpoints, use
 `cache::Config::slots_needed(viewpoints)`. It counts every desired chunk,
 including ancestors and roots, rather than assuming a worst-case direction.
 
+The renderable cut contains named `RenderableChunk` records with the chunk,
+edge-stitching neighborhood and ready physical slot.
+
 A transfer allocation returns an opaque generation-qualified token.
 Use its `slot()` to locate the GPU buffer region, then pass the token to
 `release` on successful completion or `cancel` on abandonment. An abandoned
@@ -81,10 +84,15 @@ panics. An empty cubemap has no valid coordinate addresses.
 Terrain dimensions and declared height bounds are fixed per planet. Sampling
 must be deterministic, finite, and within those bounds; independent cache
 misses may invoke the sampler concurrently. Subshape IDs identify the current
-collision-cache slots, not permanent world-space triangles. Queries returning
+collision-cache slots, not permanent world-space triangles. Broadphase callbacks receive a `TerrainTriangle` containing its validated
+address, local triangle index and geometry rather than a recyclable cache
+slot. Queries returning
 multiple live IDs require enough resident slots to represent those chunks
 simultaneously; persistent manifolds report an unsupported query when that is
 not possible. Planet-versus-planet continuous casts and persistent contact
 manifolds are not implemented.
 
-The minimum supported compiler is Rust 1.100.
+The minimum supported compiler is Rust 1.100. CI runs the all-feature tests,
+strict source policy, duplicate-code regression, and focused cubemap memory
+safety tests under a dated Miri nightly without the optional collision and
+native SIMD features.

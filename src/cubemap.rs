@@ -309,6 +309,7 @@ impl<'a, T> IntoIterator for &'a CubeMap<T> {
     }
 }
 
+/// Borrowed cell-center directions and cubemap values in face/row/column order.
 pub struct Iter<'a, T> {
     resolution: u32,
     data: &'a [T],
@@ -348,6 +349,7 @@ impl<'a, T> IntoIterator for &'a mut CubeMap<T> {
     }
 }
 
+/// Cell-center directions and disjoint mutable cubemap values.
 pub struct IterMut<'a, T> {
     resolution: u32,
     data: std::iter::Enumerate<std::slice::IterMut<'a, T>>,
