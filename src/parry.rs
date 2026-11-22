@@ -604,6 +604,54 @@ struct RayRegion {
     lower_time: f64,
 }
 
+/// Conservative local AABB of a displaced angular cone, shared by ray and pair traversal.
+fn displaced_cone_aabb(
+    axis: Vector,
+    min_cos: f64,
+    radial_min: f64,
+    radial_max: f64,
+    pad: Vector,
+) -> Aabb {
+    if radial_min <= 0.0 {
+        // An unusually deep inward displacement can invalidate angular
+        // bounds. A full containing cube remains correct and eventually
+        // subdivides to narrower, positive-radius regions.
+        Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
+    } else {
+        let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
+        let component_bounds = |component: f64| {
+            let perpendicular = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
+            let min_component = if -component >= min_cos {
+                -1.0
+            } else {
+                component.mul_add(min_cos, -perpendicular)
+            };
+            let max_component = if component >= min_cos {
+                1.0
+            } else {
+                component.mul_add(min_cos, perpendicular)
+            };
+            let lower = min_component
+                * if min_component >= 0.0 {
+                    radial_min
+                } else {
+                    radial_max
+                };
+            let upper = max_component
+                * if max_component >= 0.0 {
+                    radial_max
+                } else {
+                    radial_min
+                };
+            (lower, upper)
+        };
+        let (lx, ux) = component_bounds(axis.x);
+        let (ly, uy) = component_bounds(axis.y);
+        let (lz, uz) = component_bounds(axis.z);
+        Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
+    }
+}
+
 impl RayRegion {
     #[expect(
         clippy::too_many_arguments,
@@ -641,44 +689,7 @@ impl RayRegion {
         let pad = Vector::splat(
             256.0 * f64::EPSILON * (radial_max + ray.origin.abs().max_element() + radius),
         );
-        let aabb = if radial_min <= 0.0 {
-            // An unusually deep inward displacement can invalidate angular
-            // bounds. A full containing cube remains correct and eventually
-            // subdivides to narrower, positive-radius regions.
-            Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
-        } else {
-            let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-            let component_bounds = |component: f64| {
-                let perpendicular = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
-                let min_component = if -component >= min_cos {
-                    -1.0
-                } else {
-                    component.mul_add(min_cos, -perpendicular)
-                };
-                let max_component = if component >= min_cos {
-                    1.0
-                } else {
-                    component.mul_add(min_cos, perpendicular)
-                };
-                let lower = min_component
-                    * if min_component >= 0.0 {
-                        radial_min
-                    } else {
-                        radial_max
-                    };
-                let upper = max_component
-                    * if max_component >= 0.0 {
-                        radial_max
-                    } else {
-                        radial_min
-                    };
-                (lower, upper)
-            };
-            let (lx, ux) = component_bounds(axis.x);
-            let (ly, uy) = component_bounds(axis.y);
-            let (lz, uz) = component_bounds(axis.z);
-            Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
-        };
+        let aabb = displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad);
         let lower_time = aabb.cast_local_ray(ray, max_toi, true)?;
         Some(Self { region, lower_time })
     }
@@ -2376,42 +2387,8 @@ impl PairPatch {
                 radius_at(radial_min).max(radius_at(radial_max)) + pad.x,
             )
         };
-        let aabb = if radial_min <= 0.0 {
-            Aabb::from_half_extents(Vector::ZERO, Vector::splat(radial_max) + pad)
-        } else {
-            let sin_cone = min_cos.mul_add(-min_cos, 1.0).max(0.0).sqrt();
-            let component_bounds = |component: f64| {
-                let transverse = component.mul_add(-component, 1.0).max(0.0).sqrt() * sin_cone;
-                let min_component = if -component >= min_cos {
-                    -1.0
-                } else {
-                    component.mul_add(min_cos, -transverse)
-                };
-                let max_component = if component >= min_cos {
-                    1.0
-                } else {
-                    component.mul_add(min_cos, transverse)
-                };
-                let low = min_component
-                    * if min_component >= 0.0 {
-                        radial_min
-                    } else {
-                        radial_max
-                    };
-                let high = max_component
-                    * if max_component >= 0.0 {
-                        radial_max
-                    } else {
-                        radial_min
-                    };
-                (low, high)
-            };
-            let (lx, ux) = component_bounds(axis.x);
-            let (ly, uy) = component_bounds(axis.y);
-            let (lz, uz) = component_bounds(axis.z);
-            Aabb::new(Vector::new(lx, ly, lz) - pad, Vector::new(ux, uy, uz) + pad)
-        }
-        .transform_by(pose);
+        let aabb =
+            displaced_cone_aabb(axis, min_cos, radial_min, radial_max, pad).transform_by(pose);
         Self {
             region: ProjectionRegion {
                 face,
