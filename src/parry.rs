@@ -3509,6 +3509,39 @@ fn manifold_bounds(
     Ok((aabb, bounds))
 }
 
+/// Descend into the other shape's BVH only for parts that can meet the
+/// current terrain triangle. The visitor is shared with the simple-shape path.
+fn visit_manifold_parts(
+    other: &dyn Shape,
+    pos21: &Pose,
+    prediction: Real,
+    mut key: ManifoldKey,
+    triangle: &Triangle,
+    visit: &mut impl FnMut(
+        ManifoldKey,
+        &Triangle,
+        &dyn Shape,
+        Option<&Pose>,
+        Option<&dyn NormalConstraints>,
+    ) -> bool,
+) -> bool {
+    let Some(composite) = other.as_composite_shape() else {
+        return visit(key, triangle, other, None, None);
+    };
+    let tri_aabb = triangle.compute_aabb(pos21).loosened(prediction);
+    for part in composite.bvh().intersect_aabb(&tri_aabb) {
+        key.other_part = Some(part);
+        let mut keep_going = true;
+        composite.map_part_at(part, &mut |pose, shape, constraints| {
+            keep_going = keep_going && visit(key, triangle, shape, pose, constraints);
+        });
+        if !keep_going {
+            return false;
+        }
+    }
+    true
+}
+
 fn compute_manifolds<ManifoldData, ContactData>(
     pos12: &Pose,
     planet: &Planet,
@@ -3527,7 +3560,6 @@ where
         .and_then(|workspace| workspace.0.downcast_ref::<Workspace>())
         .filter(|workspace| workspace.flipped == flipped);
     let (aabb, bounds) = manifold_bounds(other, pos12, prediction)?;
-    let composite = other.as_composite_shape();
     let pos21 = pos12.inverse();
     let mut next = Vec::new();
     let mut keys = Vec::new();
@@ -3541,8 +3573,8 @@ where
                      part: &dyn Shape,
                      part_pos: Option<&Pose>,
                      constraints: Option<&dyn NormalConstraints>| {
-        if status.is_err() || next_state.state.contains_key(&key) {
-            return;
+        if next_state.state.contains_key(&key) {
+            return true;
         }
         // An external caller can reset the vector without resetting the
         // workspace. Missing historical entries simply start cold.
@@ -3581,44 +3613,28 @@ where
         };
         if let Err(error) = result {
             status = Err(error);
-        } else if !manifold.contacts().is_empty() {
+            return false;
+        }
+        if !manifold.contacts().is_empty() {
             next_state.state.insert(key, next.len());
             keys.push(key);
             next.push(manifold);
         }
+        true
     };
     planet.map_elements_in_local_sphere(&bounds, &aabb, |&coords, _, triangle_index, triangle| {
-        if let Some(composite) = composite {
-            let tri_aabb = triangle.compute_aabb(&pos21).loosened(prediction);
-            for part in composite.bvh().intersect_aabb(&tri_aabb) {
-                composite.map_part_at(part, &mut |pose, shape, constraints| {
-                    visit(
-                        ManifoldKey {
-                            coords,
-                            triangle: triangle_index,
-                            other_part: Some(part),
-                        },
-                        triangle,
-                        shape,
-                        pose,
-                        constraints,
-                    );
-                });
-            }
-        } else {
-            visit(
-                ManifoldKey {
-                    coords,
-                    triangle: triangle_index,
-                    other_part: None,
-                },
-                triangle,
-                other,
-                None,
-                None,
-            );
-        }
-        true
+        visit_manifold_parts(
+            other,
+            &pos21,
+            prediction,
+            ManifoldKey {
+                coords,
+                triangle: triangle_index,
+                other_part: None,
+            },
+            triangle,
+            &mut visit,
+        )
     });
     status?;
 
