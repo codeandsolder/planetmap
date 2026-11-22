@@ -170,6 +170,15 @@ impl Chunk {
         self.coords.edge_length()
     }
 
+    /// Conservative angular radius in radians around the chunk center.
+    /// The separable face warp has derivative at most 1.757 on [-1,1].
+    /// Normalizing [u,v,1] has operator norm at most one; integrating
+    /// along a straight face path bounds arc length to every point.
+    #[must_use = "Use the bound to prune spherical feature queries"]
+    pub fn angular_radius_bound(&self) -> f64 {
+        2.5 / f64::from(self.resolution())
+    }
+
     /// Location of the center of this chunk on the surface of the sphere
     ///
     /// Shorthand for `direction(&[0.5; 2].into())`.
