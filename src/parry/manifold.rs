@@ -78,10 +78,12 @@ impl WorkspaceData for Workspace {
     }
 }
 
-fn resolve_manifold_slots(
+fn assign_manifold_subshapes<ManifoldData, ContactData>(
     planet: &Planet,
     keys: &[ManifoldKey],
-) -> Result<HashMap<Coords, u32>, Unsupported> {
+    manifolds: &mut [ContactManifold<ManifoldData, ContactData>],
+    flipped: bool,
+) -> Result<(), Unsupported> {
     // Resolve every active chunk together, *after* traversal; otherwise
     // a later chunk can recycle a slot used by an earlier manifold.
     let mut chunks = HashMap::new();
@@ -102,8 +104,17 @@ fn resolve_manifold_slots(
         let (slot, _) = cache.insert(data);
         slots.insert(coords, slot);
     }
-    drop(cache);
-    Ok(slots)
+    // Keep every newly assigned slot resident until publication is complete.
+    for (key, manifold) in keys.iter().zip(manifolds) {
+        let slot = *slots.get(&key.coords).ok_or(Unsupported)?;
+        let subshape = planet.subshape_id(slot, key.triangle);
+        if flipped {
+            manifold.subshape2 = subshape;
+        } else {
+            manifold.subshape1 = subshape;
+        }
+    }
+    Ok(())
 }
 
 fn manifold_bounds(
@@ -262,16 +273,7 @@ where
     );
     status?;
 
-    let slots = resolve_manifold_slots(planet, &keys)?;
-    for (key, manifold) in keys.into_iter().zip(&mut next) {
-        let slot = *slots.get(&key.coords).ok_or(Unsupported)?;
-        let subshape = planet.subshape_id(slot, key.triangle);
-        if flipped {
-            manifold.subshape2 = subshape;
-        } else {
-            manifold.subshape1 = subshape;
-        }
-    }
+    assign_manifold_subshapes(planet, &keys, &mut next, flipped)?;
     *manifolds = next;
     *workspace = Some(ContactManifoldsWorkspace(Box::new(next_state)));
     Ok(())

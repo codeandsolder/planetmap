@@ -1,5 +1,4 @@
 use std::alloc::{Allocator, Global};
-use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::ops::{Index, IndexMut, Neg};
@@ -109,10 +108,6 @@ impl<T> CubeMap<T> {
 
     // The backing allocation contains a u32 header followed by len elements of T.
     // Layout::extend determines the correct padding and alignment for any T.
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "Layout::extend guarantees the header, payload and DST are properly aligned"
-    )]
     fn allocate_with(
         resolution: u32,
         mut initialize: impl FnMut(usize) -> Option<T>,
@@ -436,38 +431,43 @@ impl Neg for Face {
 }
 
 impl Face {
-    /// Find the face that intersects a vector originating at the center of a cube
-    #[must_use = "Use the returned face or cell to locate the direction"]
-    pub fn from_vector<N: RealField + PartialOrd + Copy>(x: &na::Vector3<N>) -> Self {
-        // Seed from X: the three-component vector cannot be empty. On ties
-        // and incomparable values, prefer the later axis, as max_by does.
+    /// Find the face intersected by a finite nonzero direction from the cube center.
+    /// On edge and corner ties, the later axis in X, Y, Z order wins.
+    #[must_use = "Use the returned face to locate the direction or handle an invalid direction"]
+    pub fn from_vector<N: RealField + Copy>(x: &na::Vector3<N>) -> Option<Self> {
+        if !x.iter().all(|component| component.is_finite()) {
+            return None;
+        }
         let (mut value, mut axis) = (x.x, Self::Px);
         for (candidate, candidate_axis) in [(x.y, Self::Py), (x.z, Self::Pz)] {
-            let order = value
-                .abs()
-                .partial_cmp(&candidate.abs())
-                .unwrap_or(Ordering::Less);
-            if order != Ordering::Greater {
+            if candidate.abs() >= value.abs() {
                 value = candidate;
                 axis = candidate_axis;
             }
         }
-        if value.is_sign_negative() {
+        if value == N::zero() {
+            return None;
+        }
+        Some(if value.is_sign_negative() {
             -axis
         } else {
             axis
-        }
+        })
     }
 
-    /// Compute which `Face` a vector intersects, and where the intersection lies in [-1..1]^2
-    #[must_use = "Use the returned face and local coordinates to locate the direction"]
-    pub fn coords<N: RealField + Copy>(x: &na::Vector3<N>) -> (Self, na::Point2<N>) {
-        let face = Self::from_vector(x);
+    /// Find the intersected face and its warped local coordinates in [-1, 1]^2.
+    /// Returns None for zero or nonfinite directions.
+    #[must_use = "Use the returned face and local coordinates or handle an invalid direction"]
+    pub fn coords<N: RealField + Copy>(x: &na::Vector3<N>) -> Option<(Self, na::Point2<N>)> {
+        let face = Self::from_vector(x)?;
         let wrt_face = face.basis().inverse_transform_vector(x);
-        (
-            face,
-            na::Point2::from(wrt_face.xy() / wrt_face.z).map(unwarp),
-        )
+        // Divide components directly instead of multiplying by a reciprocal,
+        // which may overflow for a subnormal dominant component.
+        let local = na::Point2::new(
+            unwarp(wrt_face.x / wrt_face.z),
+            unwarp(wrt_face.y / wrt_face.z),
+        );
+        Some((face, local))
     }
 
     /// Transform from face space (facing +Z) to sphere space (facing the named axis).
@@ -681,13 +681,7 @@ impl Coords {
         vector: &na::Vector3<f64>,
     ) -> Option<(Self, na::Point2<f64>)> {
         let resolution = NonZeroU32::new(resolution)?;
-        if !vector.iter().all(|x| x.is_finite()) || vector.iter().all(|&x| x == 0.0) {
-            return None;
-        }
-        let (face, coords) = Face::coords(vector);
-        if !coords.iter().all(|x| x.is_finite()) {
-            return None;
-        }
+        let (face, coords) = Face::coords(vector)?;
         let coords = coords * 0.5 + na::Vector2::new(0.5, 0.5);
         let (x, y) = discretize(resolution.get(), coords);
         let scale = f64::from(resolution.get());
@@ -1698,12 +1692,60 @@ mod test {
     #[test]
     fn face_coord_sanity() {
         let o = na::Point2::<f32>::origin();
-        assert_eq!(Face::coords(&na::Vector3::x()), (Face::Px, o));
-        assert_eq!(Face::coords(&na::Vector3::y()), (Face::Py, o));
-        assert_eq!(Face::coords(&na::Vector3::z()), (Face::Pz, o));
-        assert_eq!(Face::coords(&-na::Vector3::x()), (Face::Nx, o));
-        assert_eq!(Face::coords(&-na::Vector3::y()), (Face::Ny, o));
-        assert_eq!(Face::coords(&-na::Vector3::z()), (Face::Nz, o));
+        assert_eq!(Face::coords(&na::Vector3::x()), Some((Face::Px, o)));
+        assert_eq!(Face::coords(&na::Vector3::y()), Some((Face::Py, o)));
+        assert_eq!(Face::coords(&na::Vector3::z()), Some((Face::Pz, o)));
+        assert_eq!(Face::coords(&-na::Vector3::x()), Some((Face::Nx, o)));
+        assert_eq!(Face::coords(&-na::Vector3::y()), Some((Face::Ny, o)));
+        assert_eq!(Face::coords(&-na::Vector3::z()), Some((Face::Nz, o)));
+    }
+
+    #[test]
+    fn face_lookup_validates_directions_and_preserves_ties_and_orientation() {
+        use Face::{Nx, Ny, Nz, Px, Py, Pz};
+
+        for invalid in [
+            na::Vector3::zeros(),
+            na::Vector3::new(f64::NAN, 1.0, 0.0),
+            na::Vector3::new(1.0, f64::INFINITY, 0.0),
+            na::Vector3::new(1.0, 0.0, f64::NEG_INFINITY),
+        ] {
+            assert_eq!(Face::from_vector(&invalid), None);
+            assert_eq!(Face::coords(&invalid), None);
+        }
+        // Explicit orientation oracle independent of Face::basis.
+        // The expected local slopes are specified in the cube-face frame.
+        for (face, vector) in [
+            (Px, [1.0, -0.5, 0.25]),
+            (Nx, [-1.0, -0.5, -0.25]),
+            (Py, [0.25, 1.0, -0.5]),
+            (Ny, [0.25, -1.0, 0.5]),
+            (Pz, [0.25, 0.5, 1.0]),
+            (Nz, [-0.25, 0.5, -1.0]),
+        ] {
+            for scale in [f64::from_bits(4), 1.0, f64::MAX] {
+                let direction = na::Vector3::from(vector) * scale;
+                let (actual, local) = Face::coords(&direction).unwrap();
+                assert_eq!(actual, face);
+                let reference = |x: f64| {
+                    0.745_558_715_593 * x
+                        + 0.130_546_850_193 * x.powi(3)
+                        + 0.123_894_434_214 * x.powi(5)
+                };
+                assert!((reference(local.x) - 0.25).abs() <= 8.0 * f64::EPSILON);
+                assert!((reference(local.y) - 0.5).abs() <= 8.0 * f64::EPSILON);
+            }
+        }
+        for (vector, expected) in [
+            ([1.0, -1.0, 0.0], Ny),
+            ([-1.0, 1.0, -1.0], Nz),
+            ([0.0, -1.0, 1.0], Pz),
+        ] {
+            assert_eq!(
+                Face::from_vector(&na::Vector3::from(vector)),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -1936,7 +1978,7 @@ mod test {
                 for x in -10..10 {
                     let p = na::Point2::new(x as f32 / 11.0, y as f32 / 11.0);
                     let v = face.direction(&p);
-                    let (actual_face, actual_p) = Face::coords(&v);
+                    let (actual_face, actual_p) = Face::coords(&v).unwrap();
                     assert_eq!(face, actual_face);
                     assert_abs_diff_eq!(p, actual_p);
                 }

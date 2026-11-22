@@ -69,7 +69,8 @@ levels are required.
 `Coords::new(resolution, face, x, y)` validates a cell address. Its resolution
 is part of its identity, and the indices and face are available through
 `x()`, `y()`, and `face()`. `Coords::from_vector` returns `None` for an
-invalid direction or empty grid. Direction, center, neighbor, and sampling
+invalid direction or empty grid. Face-level lookup (`Face::from_vector` and
+`Face::coords`) also rejects zero and nonfinite directions. Direction, center, neighbor, and sampling
 methods use the address's own resolution; callers supply only local offsets
 or the desired sample count.
 
@@ -84,10 +85,10 @@ panics. An empty cubemap has no valid coordinate addresses.
 Terrain dimensions and declared height bounds are fixed per planet. Sampling
 must be deterministic, finite, and within those bounds; independent cache
 misses may invoke the sampler concurrently. Subshape IDs identify the current
-collision-cache slots, not permanent world-space triangles. Broadphase callbacks receive a `TerrainTriangle` containing its validated
+collision-cache slots, not permanent world-space triangles. Broadphase
+callbacks receive a `TerrainTriangle` containing its validated
 address, local triangle index and geometry rather than a recyclable cache
-slot. Queries returning
-multiple live IDs require enough resident slots to represent those chunks
+slot. Queries returning multiple live IDs require enough resident slots to represent those chunks
 simultaneously; persistent manifolds report an unsupported query when that is
 not possible. Planet-versus-planet continuous casts and persistent contact
 manifolds are not implemented.

@@ -80,29 +80,18 @@ impl Planet {
             return None;
         }
         let axis = cube_vector(bounds.center() / distance);
-        let face_resolution = self.face_resolution;
-        for coords in Coords::neighborhood(face_resolution, axis, theta) {
-            let rounding = 512.0
-                * f64::EPSILON
-                * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
-            let limit = (*max_distance + rounding).max(0.0);
-            let query_aabb = other_aabb.loosened(limit);
-            let query_bounds = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
-            let mut continue_search = true;
-            self.map_elements_in_chunk(
+        let rounding = 512.0
+            * f64::EPSILON
+            * (self.max_radius() + bounds.center().abs().max_element() + cap_radius);
+        for coords in Coords::neighborhood(self.face_resolution, axis, theta) {
+            if !self.visit_proximity_leaf(
                 coords,
-                &query_bounds,
-                &query_aabb,
-                &mut |TerrainTriangle {
-                          coords: at,
-                          triangle_index: index,
-                          triangle,
-                      }| {
-                    continue_search = visitor(at, index, triangle, max_distance);
-                    continue_search
-                },
-            );
-            if !continue_search {
+                bounds,
+                other_aabb,
+                rounding,
+                max_distance,
+                visitor,
+            ) {
                 return Some(false);
             }
         }
@@ -143,21 +132,18 @@ impl Planet {
             let limit = (*max_distance + roundoff).max(0.0);
             let search_aabb = other_aabb.loosened(limit);
             let search_sphere = BoundingSphere::new(bounds.center(), bounds.radius() + limit);
-            let mut continue_search = true;
             self.map_elements_in_chunk(
                 coords,
                 &search_sphere,
                 &search_aabb,
                 &mut |TerrainTriangle {
-                          coords: at,
-                          triangle_index: index,
+                          coords,
+                          triangle_index,
                           triangle,
                       }| {
-                    continue_search = visitor(at, index, triangle, max_distance);
-                    continue_search
+                    visitor(coords, triangle_index, triangle, max_distance)
                 },
-            );
-            continue_search
+            )
         }
     }
 
