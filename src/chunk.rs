@@ -58,13 +58,13 @@ impl Chunk {
     }
 
     /// Coordinates identifying the chunk within its face at the current depth.
-    #[must_use]
+    #[must_use = "Use the grid address to locate this chunk"]
     pub const fn coords(&self) -> Coords {
         self.coords
     }
 
     /// Depth of the chunk within the face quadtree.
-    #[must_use]
+    #[must_use = "Use the depth for level-of-detail decisions"]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "Validated quadtree resolution is a u32 power of two, so its log2 is at most 31"
@@ -74,7 +74,7 @@ impl Chunk {
     }
 
     /// The top-level chunk corresponding to a particular cubemap face
-    #[must_use]
+    #[must_use = "Use the returned root chunk to begin traversal"]
     pub const fn root(face: Face) -> Self {
         Self {
             coords: Coords::root(face),
@@ -119,7 +119,7 @@ impl Chunk {
     }
 
     /// The smallest chunk that contains this chunk
-    #[must_use]
+    #[must_use = "Use the returned parent to traverse the quadtree"]
     pub fn parent(&self) -> Option<Self> {
         let coords = Coords::new(
             self.resolution() / 2,
@@ -131,13 +131,13 @@ impl Chunk {
     }
 
     /// Iterator over the path from this chunk to the root, inclusive
-    #[must_use]
+    #[must_use = "The iterator must be consumed to traverse ancestors"]
     pub const fn path(self) -> Path {
         Path { chunk: Some(self) }
     }
 
     /// The four direct children, or `None` at the maximum representable depth.
-    #[must_use]
+    #[must_use = "Use the returned children to descend the quadtree"]
     pub fn children(&self) -> Option<[Self; 4]> {
         let resolution = self.resolution().checked_mul(2)?;
         let (x, y) = (self.coords.x() * 2, self.coords.y() * 2);
@@ -159,13 +159,13 @@ impl Chunk {
     }
 
     /// Chunks that share an edge with this chunk
-    #[must_use]
+    #[must_use = "Use the returned neighbors for adjacency calculations"]
     pub fn neighbors(&self) -> [Self; 4] {
         self.coords.neighbors().map(|coords| Self { coords })
     }
 
     /// Length of one of this chunk's edges before mapping onto the sphere
-    #[must_use]
+    #[must_use = "Use the computed edge length for geometry"]
     pub fn edge_length<N: RealField>(&self) -> N {
         self.coords.edge_length()
     }
@@ -173,13 +173,13 @@ impl Chunk {
     /// Location of the center of this chunk on the surface of the sphere
     ///
     /// Shorthand for `direction(&[0.5; 2].into())`.
-    #[must_use]
+    #[must_use = "Use the computed origin for geometry"]
     pub fn origin<N: RealField + Copy>(&self) -> na::Unit<na::Vector3<N>> {
         self.coords.center()
     }
 
     /// Returns a grid of resolution^2 directions contained by the chunk, in scan-line order
-    #[must_use]
+    #[must_use = "The iterator must be consumed to compute sample directions"]
     pub fn samples<N: RealField + Copy>(&self, resolution: u32) -> SampleIter<N> {
         self.coords.samples(resolution)
     }
@@ -189,13 +189,13 @@ impl Chunk {
     /// Because this returns data in batches of `S::VF32_WIDTH`, a few excess values will be
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
-    #[must_use]
+    #[must_use = "The iterator must be consumed to compute SIMD sample directions"]
     pub fn samples_ps<S: Simd>(&self, simd: S, resolution: u32) -> SampleIterSimd<S> {
         self.coords.samples_ps(simd, resolution)
     }
 
     /// Compute the direction identified by a [0..1]^2 vector on this chunk
-    #[must_use]
+    #[must_use = "Use the computed direction for geometry"]
     pub fn direction<N: RealField + Copy + Into<f64>>(
         &self,
         coords: &na::Point2<N>,
@@ -204,7 +204,7 @@ impl Chunk {
     }
 
     /// Number of chunks at this depth along a cubemap edge, i.e. 2^depth
-    #[must_use]
+    #[must_use = "Use the resolution to interpret the chunk grid"]
     pub const fn resolution(&self) -> u32 {
         self.coords.resolution()
     }

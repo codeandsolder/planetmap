@@ -55,7 +55,7 @@ impl<T> CubeMap<T> {
     /// the header at the alignment required by `T` (and may have padding).
     /// The entire DST must be valid for shared reads for `'a`, with no mutable
     /// borrows during that lifetime. The metadata length must fit in `usize`.
-    #[must_use]
+    #[must_use = "Use the returned reference to access the cubemap"]
     pub const unsafe fn from_raw<'a>(ptr: *const u32) -> &'a Self {
         // SAFETY: caller guarantees a valid, aligned u32 header.
         let dim = unsafe { ptr.read() } as usize;
@@ -74,7 +74,7 @@ impl<T> CubeMap<T> {
     /// the header at the alignment required by `T` (and may have padding).
     /// The entire DST must be exclusively accessible for `'a`. The metadata
     /// length must fit in `usize`, and no other references may alias the data.
-    #[must_use]
+    #[must_use = "Use the returned mutable reference to access the cubemap"]
     pub const unsafe fn from_raw_mut<'a>(ptr: *mut u32) -> &'a mut Self {
         // SAFETY: caller guarantees a valid, aligned u32 header.
         let dim = unsafe { ptr.read() } as usize;
@@ -133,7 +133,7 @@ impl<T> CubeMap<T> {
 
     /// Construct a cube map with faces containing `resolution * resolution` slots, each
     /// initialized to `value`. Returns `None` if dimensions or allocation cannot be represented.
-    #[must_use]
+    #[must_use = "Use the returned value or handle failure to construct it"]
     pub fn new(resolution: u32, value: T) -> Option<Box<Self>>
     where
         T: Clone,
@@ -145,7 +145,7 @@ impl<T> CubeMap<T> {
     /// -X, +Y, -Y, +Z, -Z order.
     ///
     /// Returns `None` for mismatched data length, unrepresentable dimensions or allocation failure.
-    #[must_use]
+    #[must_use = "Use the copied cubemap or handle allocation or dimension failure"]
     pub fn from_slice(resolution: u32, data: &[T]) -> Option<Box<Self>>
     where
         T: Copy,
@@ -158,7 +158,7 @@ impl<T> CubeMap<T> {
 
     /// Compute a cube map based on the direction of each slot. Returns `None`
     /// if the dimensions cannot be represented or allocation fails.
-    #[must_use]
+    #[must_use = "Use the constructed cubemap or handle allocation or dimension failure"]
     pub fn from_fn(
         resolution: u32,
         mut f: impl FnMut(na::Unit<na::Vector3<f64>>) -> T,
@@ -166,17 +166,17 @@ impl<T> CubeMap<T> {
         Self::allocate_with(resolution, |i| get_dir(resolution, i).map(&mut f))
     }
 
-    #[must_use]
+    #[must_use = "Use the resolution to interpret grid addresses"]
     pub const fn resolution(&self) -> u32 {
         self.resolution
     }
 
-    #[must_use]
+    #[must_use = "The iterator must be consumed to visit the cells"]
     pub fn iter(&self) -> Iter<'_, T> {
         self.into_iter()
     }
 
-    #[must_use]
+    #[must_use = "The iterator must be consumed to visit the mutable cells"]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         self.into_iter()
     }
@@ -213,7 +213,7 @@ impl<T> IndexMut<Face> for CubeMap<T> {
 
 impl<T> CubeMap<T> {
     /// Access a cell only when it belongs to this map's resolution.
-    #[must_use]
+    #[must_use = "Use the returned cell or handle an incompatible address"]
     pub fn get(&self, coord: Coords) -> Option<&T> {
         if coord.resolution() != self.resolution {
             return None;
@@ -222,7 +222,7 @@ impl<T> CubeMap<T> {
     }
 
     /// Mutably access a cell only when it belongs to this map's resolution.
-    #[must_use]
+    #[must_use = "Use the returned mutable cell or handle an incompatible address"]
     pub fn get_mut(&mut self, coord: Coords) -> Option<&mut T> {
         if coord.resolution() != self.resolution {
             return None;
@@ -231,13 +231,13 @@ impl<T> CubeMap<T> {
     }
 
     /// Access the cell addressed by a finite nonzero direction.
-    #[must_use]
+    #[must_use = "Use the returned cell or handle an invalid direction or empty map"]
     pub fn get_direction(&self, direction: &na::Vector3<f64>) -> Option<&T> {
         self.get(Coords::from_vector(self.resolution, direction)?)
     }
 
     /// Mutably access the cell addressed by a finite nonzero direction.
-    #[must_use]
+    #[must_use = "Use the returned mutable cell or handle an invalid direction or empty map"]
     pub fn get_direction_mut(&mut self, direction: &na::Vector3<f64>) -> Option<&mut T> {
         self.get_mut(Coords::from_vector(self.resolution, direction)?)
     }
@@ -412,7 +412,7 @@ impl Neg for Face {
 
 impl Face {
     /// Find the face that intersects a vector originating at the center of a cube
-    #[must_use]
+    #[must_use = "Use the returned face or cell to locate the direction"]
     pub fn from_vector<N: RealField + PartialOrd + Copy>(x: &na::Vector3<N>) -> Self {
         // Seed from X: the three-component vector cannot be empty. On ties
         // and incomparable values, prefer the later axis, as max_by does.
@@ -435,7 +435,7 @@ impl Face {
     }
 
     /// Compute which `Face` a vector intersects, and where the intersection lies in [-1..1]^2
-    #[must_use]
+    #[must_use = "Use the returned face and local coordinates to locate the direction"]
     pub fn coords<N: RealField + Copy>(x: &na::Vector3<N>) -> (Self, na::Point2<N>) {
         let face = Self::from_vector(x);
         let wrt_face = face.basis().inverse_transform_vector(x);
@@ -446,7 +446,7 @@ impl Face {
     }
 
     /// Transform from face space (facing +Z) to sphere space (facing the named axis).
-    #[must_use]
+    #[must_use = "Use the returned rotation to transform between coordinate spaces"]
     pub fn basis<N: RealField>(self) -> na::Rotation3<N> {
         use self::Face::{Nx, Ny, Nz, Px, Py, Pz};
         let (x, y, z) = match self {
@@ -470,7 +470,7 @@ impl Face {
     /// Returns the neighboring face, the edge of that face, and whether the axis shared with that face is parallel or antiparallel.
     ///
     /// Index by `sign << 1 | axis`.
-    #[must_use]
+    #[must_use = "Use the returned adjacency data to cross cell or face boundaries"]
     pub(crate) const fn neighbors(self) -> &'static [(Self, Edge, bool); 4] {
         use self::Face::{Nx, Ny, Nz, Px, Py, Pz};
         match self {
@@ -514,7 +514,7 @@ impl Face {
     }
 
     /// Compute the direction identified by a [-1..1]^2 vector on this face
-    #[must_use]
+    #[must_use = "Use the computed direction for geometry"]
     pub fn direction<N: RealField + Copy>(
         self,
         coords: &na::Point2<N>,
@@ -590,7 +590,7 @@ pub struct Coords {
 
 impl Coords {
     /// Construct an address only when both indices are within the nonempty face.
-    #[must_use]
+    #[must_use = "Use the returned value or handle failure to construct it"]
     pub const fn new(resolution: u32, face: Face, x: u32, y: u32) -> Option<Self> {
         if x >= resolution || y >= resolution {
             return None;
@@ -607,7 +607,7 @@ impl Coords {
     }
 
     /// The sole address at resolution one.
-    #[must_use]
+    #[must_use = "Use the returned root address to locate the face"]
     pub const fn root(face: Face) -> Self {
         Self {
             x: 0,
@@ -618,39 +618,39 @@ impl Coords {
     }
 
     /// Column on this face.
-    #[must_use]
+    #[must_use = "Use the returned column to locate the cell"]
     pub const fn x(self) -> u32 {
         self.x
     }
 
     /// Row on this face.
-    #[must_use]
+    #[must_use = "Use the returned row to locate the cell"]
     pub const fn y(self) -> u32 {
         self.y
     }
 
     /// Face containing this address.
-    #[must_use]
+    #[must_use = "Use the returned face to locate the cell"]
     pub const fn face(self) -> Face {
         self.face
     }
 
     /// Number of addresses along either axis of a face.
-    #[must_use]
+    #[must_use = "Use the resolution to interpret grid addresses"]
     pub const fn resolution(self) -> u32 {
         self.resolution.get()
     }
 
     /// Compute the cell containing a finite nonzero vector, or return None
     /// for an invalid direction or empty grid.
-    #[must_use]
+    #[must_use = "Use the returned face or cell to locate the direction"]
     pub fn from_vector(resolution: u32, vector: &na::Vector3<f64>) -> Option<Self> {
         Self::from_vector_with_coords(resolution, vector).map(|(coords, _)| coords)
     }
 
     /// Compute the coordinates of the cell containing a finite nonzero vector,
     /// and its [0..1]^2 coordinates within that cell.
-    #[must_use]
+    #[must_use = "Use the returned cell and local position or handle invalid input"]
     pub fn from_vector_with_coords(
         resolution: u32,
         vector: &na::Vector3<f64>,
@@ -681,7 +681,7 @@ impl Coords {
         ))
     }
 
-    #[must_use]
+    #[must_use = "Use the returned adjacency data to cross cell or face boundaries"]
     pub fn neighbors(&self) -> [Self; 4] {
         let Self {
             x,
@@ -847,7 +847,7 @@ impl Coords {
     }
 
     /// The direction through the center of this cell.
-    #[must_use]
+    #[must_use = "Use the computed cell-center direction for geometry"]
     pub fn center<N: RealField + Copy>(&self) -> na::Unit<na::Vector3<N>> {
         self.face
             .direction(&self.face_position(na::Point2::new(0.5, 0.5)).cast())
@@ -864,7 +864,7 @@ impl Coords {
 
     /// Compute the direction identified by a point in the [0..1]^2 area covered by these
     /// coordinates. Address arithmetic is performed in f64 before conversion to the output type.
-    #[must_use]
+    #[must_use = "Use the computed direction for geometry"]
     pub fn direction<N: RealField + Copy + Into<f64>>(
         &self,
         coords: &na::Point2<N>,
@@ -875,7 +875,7 @@ impl Coords {
 
     /// Length of an edge of the bounding square of the cubemap-space area covered by a coordinate
     /// in its cubemap grid.
-    #[must_use]
+    #[must_use = "Use the computed edge length for geometry"]
     pub fn edge_length<N: RealField>(&self) -> N {
         na::convert::<_, N>(2.0) / na::convert::<_, N>(f64::from(self.resolution()))
     }
@@ -889,7 +889,7 @@ impl Coords {
     /// (0.5/w, 0.5/h), and the last has position (1, 1), not (1 - 0.5/w, 1 - 0.5/h). This allows
     /// for seamless interpolation in the neighborhood of chunk edges/corners without needing access
     /// to data for neighboring chunks.
-    #[must_use]
+    #[must_use = "The iterator must be consumed to compute sample directions"]
     pub fn samples<N: RealField + Copy>(&self, chunk_resolution: u32) -> SampleIter<N> {
         SampleIter {
             face: self.face,
@@ -903,7 +903,7 @@ impl Coords {
     /// Because this returns data in batches of `S::VF32_WIDTH`, a few excess values will be
     /// computed at the end for any `resolution` whose square is not a multiple of the batch size.
     #[cfg(feature = "fearless_simd")]
-    #[must_use]
+    #[must_use = "The iterator must be consumed to compute SIMD sample directions"]
     pub fn samples_ps<S: Simd>(&self, simd: S, chunk_resolution: u32) -> SampleIterSimd<S> {
         SampleIterSimd {
             face: self.face,
@@ -976,7 +976,7 @@ impl Edge {
     }
 
     /// Unit vector across the edge
-    #[must_use]
+    #[must_use = "Use the computed direction for geometry"]
     pub fn direction<N: RealField>(self) -> na::UnitVector2<N> {
         let x = match self {
             Self::Nx => [-1.0, 0.0],
