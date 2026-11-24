@@ -28,15 +28,29 @@ fn face_coords(c: &mut Criterion) {
 fn cache(c: &mut Criterion) {
     let mut mgr = CacheManager::new(2048, Default::default()).expect("valid benchmark cache");
     let mut transfers = Vec::with_capacity(2048);
-    mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
+    mgr.update(
+        planetmap::cache::viewpoint_refinement(&[na::Point3::from(na::Vector3::z())]),
+        &mut transfers,
+        None,
+    );
     resolve_transfers(&mut mgr, &transfers);
     c.bench_function("best-case update", move |b| {
         let mut transfers = Vec::with_capacity(2048);
-        b.iter(|| mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers));
+        b.iter(|| {
+            mgr.update(
+                planetmap::cache::viewpoint_refinement(&[na::Point3::from(na::Vector3::z())]),
+                &mut transfers,
+                None,
+            )
+        });
     });
 
     let mut mgr = CacheManager::new(2048, Default::default()).expect("valid benchmark cache");
-    mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
+    mgr.update(
+        planetmap::cache::viewpoint_refinement(&[na::Point3::from(na::Vector3::z())]),
+        &mut transfers,
+        None,
+    );
     resolve_transfers(&mut mgr, &transfers);
     let diagonal1 = na::Point3::from(-na::Vector3::new(1.0, 1.0, 1.0).normalize());
     let diagonal2 = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
@@ -44,9 +58,17 @@ fn cache(c: &mut Criterion) {
         let mut which = true;
         b.iter(|| {
             if which {
-                mgr.update(&[diagonal1], &mut transfers);
+                mgr.update(
+                    planetmap::cache::viewpoint_refinement(&[diagonal1]),
+                    &mut transfers,
+                    None,
+                );
             } else {
-                mgr.update(&[diagonal2], &mut transfers);
+                mgr.update(
+                    planetmap::cache::viewpoint_refinement(&[diagonal2]),
+                    &mut transfers,
+                    None,
+                );
             }
             resolve_transfers(&mut mgr, &transfers);
             which = !which;

@@ -85,32 +85,30 @@ impl Config {
         self.max_neighbor_delta
     }
 
-    /// Number of slots required to retain every chunk selected by these viewpoints,
-    /// including all ancestors and the six roots. Returns `None` if the count
-    /// cannot be represented as a `usize`.
+    /// Number of slots required to retain every chunk selected by the same
+    /// refinement criterion passed to the cache, including ancestors and roots.
+    /// The criterion must be deterministic for the duration of a traversal.
+    /// Returns None if the count cannot be represented as a usize.
     #[must_use = "Use the checked slot count when sizing the cache"]
-    pub fn slots_needed(&self, viewpoints: &[na::Point3<f64>]) -> Option<usize> {
+    pub fn slots_needed(&self, refine: impl Fn(&Chunk) -> bool) -> Option<usize> {
         Face::iter()
             .map(Chunk::root)
             .try_fold(0_usize, |sum, chunk| {
-                sum.checked_add(self.slots_needed_inner(&chunk, viewpoints)?)
+                sum.checked_add(self.slots_needed_inner(&chunk, &refine)?)
             })
     }
 
-    fn should_subdivide(&self, chunk: &Chunk, viewpoints: &[na::Point3<f64>]) -> bool {
-        chunk.depth() < self.max_depth
-            && viewpoints
-                .iter()
-                .any(|viewpoint| needs_subdivision(chunk, viewpoint))
+    fn should_subdivide(&self, chunk: &Chunk, refine: &impl Fn(&Chunk) -> bool) -> bool {
+        chunk.depth() < self.max_depth && refine(chunk)
     }
 
-    fn slots_needed_inner(&self, chunk: &Chunk, viewpoints: &[na::Point3<f64>]) -> Option<usize> {
-        if !self.should_subdivide(chunk, viewpoints) {
+    fn slots_needed_inner(&self, chunk: &Chunk, refine: &impl Fn(&Chunk) -> bool) -> Option<usize> {
+        if !self.should_subdivide(chunk, refine) {
             return Some(1);
         }
         let children = chunk.children()?;
         children.iter().try_fold(1_usize, |sum, child| {
-            sum.checked_add(self.slots_needed_inner(child, viewpoints)?)
+            sum.checked_add(self.slots_needed_inner(child, refine)?)
         })
     }
 }
@@ -203,37 +201,19 @@ impl Manager {
         })
     }
 
-    /// Compute slots to render for a given set of viewpoints, and to load for improved detail in
-    /// future passes.
+    /// Compute the current render cut and requests for improved detail.
     ///
-    /// Viewpoints should be positioned with regard to the sphere's origin, and scaled such
-    /// viewpoints on the surface are 1.0 units from the sphere's origin.
+    /// The caller supplies a deterministic refinement predicate. The
+    /// configured maximum depth always bounds its traversal. For ordinary
+    /// spherical distance-based selection, use [`viewpoint_refinement`].
     ///
-    /// Writes unavailable chunks needed for target quality to `transfer`,
-    /// ordered by increasing depth so coarse coverage can load first.
-    pub fn update(&mut self, viewpoints: &[na::Point3<f64>], transfer: &mut Vec<Chunk>) {
-        self.update_inner(viewpoints, transfer, None);
-    }
-
-    /// Updates the render cut and reports *every* chunk selected by the
-    /// current viewpoint traversal, including already allocated and pending
-    /// chunks. Applications can use `visited` to cancel obsolete in-flight
-    /// requests without guessing which parts of the quadtree are needed.
-    ///
-    /// Both vectors are cleared before use. The visited list contains no
-    /// duplicate chunks for a single update.
-    pub fn update_with_visited(
+    /// Both output vectors are cleared before use. Unavailable chunks are
+    /// ordered by increasing depth so coarse coverage can load first. The
+    /// optional visited list includes all selected chunks, including ready
+    /// and pending ones, in traversal order, without duplicates.
+    pub fn update(
         &mut self,
-        viewpoints: &[na::Point3<f64>],
-        transfer: &mut Vec<Chunk>,
-        visited: &mut Vec<Chunk>,
-    ) {
-        self.update_inner(viewpoints, transfer, Some(visited));
-    }
-
-    fn update_inner(
-        &mut self,
-        viewpoints: &[na::Point3<f64>],
+        refine: impl Fn(&Chunk) -> bool,
         transfer: &mut Vec<Chunk>,
         mut visited: Option<&mut Vec<Chunk>>,
     ) {
@@ -245,7 +225,7 @@ impl Manager {
             self.chunks[slot as usize].drawn = false;
         }
         self.render.clear();
-        self.walk(viewpoints, transfer, &mut visited);
+        self.walk(&refine, transfer, &mut visited);
         // Resolve ancestors before descendants, across all faces. A small
         // cache must not fill with one deep subtree before other roots load.
         transfer.sort_unstable_by_key(Chunk::depth);
@@ -355,7 +335,7 @@ impl Manager {
 
     fn walk(
         &mut self,
-        viewpoints: &[na::Point3<f64>],
+        refine: &impl Fn(&Chunk) -> bool,
         transfers: &mut Vec<Chunk>,
         visited: &mut Option<&mut Vec<Chunk>>,
     ) {
@@ -364,7 +344,7 @@ impl Manager {
             let slot = self.get(&chunk);
             // Kick off the loop for each face's quadtree
             self.walk_inner(
-                viewpoints,
+                refine,
                 transfers,
                 visited,
                 &ChunkState {
@@ -408,7 +388,7 @@ impl Manager {
     /// Walk the quadtree below `chunk`, recording chunks to render and transfer.
     fn walk_inner(
         &mut self,
-        viewpoints: &[na::Point3<f64>],
+        refine: &impl Fn(&Chunk) -> bool,
         transfers: &mut Vec<Chunk>,
         visited: &mut Option<&mut Vec<Chunk>>,
         chunk: &ChunkState,
@@ -424,7 +404,7 @@ impl Manager {
             transfers.push(chunk.chunk);
         }
 
-        let subdivide = self.config.should_subdivide(&chunk.chunk, viewpoints);
+        let subdivide = self.config.should_subdivide(&chunk.chunk, refine);
         if !subdivide {
             if let Some(slot) = chunk.slot.filter(|_| chunk.renderable) {
                 self.render.push(RenderableChunk {
@@ -461,7 +441,7 @@ impl Manager {
         // Recurse into the children
         for (&child, &slot) in children.iter().zip(child_slots.iter()) {
             self.walk_inner(
-                viewpoints,
+                refine,
                 transfers,
                 visited,
                 &ChunkState {
@@ -528,6 +508,20 @@ struct ChunkState {
     slot: Option<u32>,
     /// Whether the subtree at this chunk will be rendered
     renderable: bool,
+}
+
+/// Standard view-distance refinement policy for a unit sphere. Viewpoints are
+/// positions relative to the sphere origin, in units of its radius.
+///
+/// Compose this with a terrain-dependent criterion when needed; the cache
+/// and its capacity estimator use precisely the same selection predicate.
+#[must_use = "Pass the criterion to the cache or capacity estimator"]
+pub fn viewpoint_refinement(viewpoints: &[na::Point3<f64>]) -> impl Fn(&Chunk) -> bool + '_ {
+    move |chunk| {
+        viewpoints
+            .iter()
+            .any(|viewpoint| needs_subdivision(chunk, viewpoint))
+    }
 }
 
 fn needs_subdivision(chunk: &Chunk, viewpoint: &na::Point3<f64>) -> bool {
@@ -657,14 +651,14 @@ mod test {
         let mut manager = Manager::new(6, Config::new(8, 1).unwrap()).unwrap();
         let mut transfer = Vec::new();
         let viewpoint = na::Point3::new(1.0, 0.0, 0.0);
-        manager.update(&[viewpoint], &mut transfer);
+        manager.update(viewpoint_refinement(&[viewpoint]), &mut transfer, None);
         assert_eq!(transfer.len(), 6);
         assert!(transfer.iter().all(|chunk| chunk.depth() == 0));
         for chunk in transfer.drain(..) {
             let allocation = manager.allocate(chunk).unwrap();
             manager.release(allocation).unwrap();
         }
-        manager.update(&[viewpoint], &mut transfer);
+        manager.update(viewpoint_refinement(&[viewpoint]), &mut transfer, None);
         assert_eq!(manager.renderable().len(), 6);
     }
 
@@ -684,7 +678,11 @@ mod test {
         let west = na::Point3::new(-1.001, 0.0, 0.0);
         let mut transfer = Vec::new();
         let mut visited = Vec::new();
-        mgr.update_with_visited(&[east], &mut transfer, &mut visited);
+        mgr.update(
+            viewpoint_refinement(&[east]),
+            &mut transfer,
+            Some(&mut visited),
+        );
         assert!(!transfer.is_empty());
         assert!(transfer.iter().all(|chunk| visited.contains(chunk)));
         assert_eq!(visited.len(), visited.iter().collect::<HashSet<_>>().len());
@@ -693,13 +691,21 @@ mod test {
             .find(|chunk| chunk.depth() >= 3)
             .expect("near-viewpoint deep patch");
         let slot = mgr.allocate(pending).unwrap();
-        mgr.update_with_visited(&[west], &mut transfer, &mut visited);
+        mgr.update(
+            viewpoint_refinement(&[west]),
+            &mut transfer,
+            Some(&mut visited),
+        );
         assert!(
             !visited.contains(&pending),
             "opposite hemisphere should not need old deep patch"
         );
         assert_eq!(mgr.cancel(slot), Ok(pending));
-        mgr.update_with_visited(&[east], &mut transfer, &mut visited);
+        mgr.update(
+            viewpoint_refinement(&[east]),
+            &mut transfer,
+            Some(&mut visited),
+        );
         assert!(
             transfer.contains(&pending),
             "cancelled tile must be requested again"
@@ -723,11 +729,19 @@ mod test {
         let viewpoint = na::Point3::new(1.001, 0.0, 0.0);
         let mut transfer = Vec::new();
         let mut visited = Vec::new();
-        mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
+        mgr.update(
+            viewpoint_refinement(&[viewpoint]),
+            &mut transfer,
+            Some(&mut visited),
+        );
         let pending = *transfer.iter().find(|c| c.depth() == 1).unwrap();
         let slot = mgr.allocate(pending).unwrap();
         assert_eq!(mgr.cancel(slot), Ok(pending));
-        mgr.update_with_visited(&[viewpoint], &mut transfer, &mut visited);
+        mgr.update(
+            viewpoint_refinement(&[viewpoint]),
+            &mut transfer,
+            Some(&mut visited),
+        );
         assert!(transfer.contains(&pending));
         assert!(
             mgr.renderable().contains(&RenderableChunk {
@@ -744,13 +758,21 @@ mod test {
         let mut mgr =
             Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let mut transfers = Vec::new();
-        mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
+        mgr.update(
+            viewpoint_refinement(&[na::Point3::from(na::Vector3::z())]),
+            &mut transfers,
+            None,
+        );
         assert_eq!(mgr.renderable().len(), 0);
         for &transfer in &transfers {
             let slot = mgr.allocate(transfer).unwrap();
             mgr.release(slot).unwrap();
         }
-        mgr.update(&[na::Point3::from(na::Vector3::z())], &mut transfers);
+        mgr.update(
+            viewpoint_refinement(&[na::Point3::from(na::Vector3::z())]),
+            &mut transfers,
+            None,
+        );
         assert_eq!(transfers.len(), 0);
         assert_ne!(mgr.renderable().len(), 0);
     }
@@ -766,7 +788,12 @@ mod test {
         let multiple = [diagonal, oblique, na::Point3::new(-1.0, 0.0, 0.0)];
         let config = Config::default();
         assert!(
-            config.slots_needed(&[oblique]).unwrap() > config.slots_needed(&[diagonal]).unwrap()
+            config
+                .slots_needed(viewpoint_refinement(&[oblique]))
+                .unwrap()
+                > config
+                    .slots_needed(viewpoint_refinement(&[diagonal]))
+                    .unwrap()
         );
         for max_depth in 0..=12 {
             let config = Config {
@@ -774,11 +801,17 @@ mod test {
                 ..Config::default()
             };
             for viewpoints in [&[][..], &multiple[..1], &multiple[1..2], &multiple[..]] {
-                let needed = config.slots_needed(viewpoints).unwrap();
+                let needed = config
+                    .slots_needed(viewpoint_refinement(viewpoints))
+                    .unwrap();
                 let mut mgr = Manager::new(needed, config.clone()).unwrap();
                 let mut transfers = Vec::new();
                 let mut visited = Vec::new();
-                mgr.update_with_visited(viewpoints, &mut transfers, &mut visited);
+                mgr.update(
+                    viewpoint_refinement(viewpoints),
+                    &mut transfers,
+                    Some(&mut visited),
+                );
                 assert_eq!(visited.len(), needed);
                 assert_eq!(transfers.len(), needed);
                 assert!(needed >= 6);
@@ -792,7 +825,7 @@ mod test {
             Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let viewpoint = na::Point3::from(na::Vector3::new(1.0, 1.0, 1.0).normalize());
         let mut transfers = Vec::new();
-        mgr.update(&[viewpoint], &mut transfers);
+        mgr.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
         assert_eq!(mgr.renderable().len(), 0);
         // Get +X to `LoD` 1, +Y to `LoD` 0
         for &chunk in &[
@@ -810,7 +843,7 @@ mod test {
 
         // Validate output
         let mut transfers = Vec::new();
-        mgr.update(&[viewpoint], &mut transfers);
+        mgr.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
         assert_eq!(mgr.renderable().len(), 5);
         use std::collections::HashMap;
         let neighbors = mgr
@@ -838,7 +871,7 @@ mod test {
             Manager::new(2048, Config::default()).expect("valid test cache configuration");
         let viewpoint = na::Point3::from(na::Vector3::new(0.0, 1.0, 0.0));
         let mut transfers = Vec::new();
-        mgr.update(&[viewpoint], &mut transfers);
+        mgr.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
         let expected = transfers.len();
         const BATCH_SIZE: usize = 17;
         let mut actual = 0;
@@ -849,7 +882,7 @@ mod test {
                 mgr.release(slot).unwrap();
             }
             transfers.clear();
-            mgr.update(&[viewpoint], &mut transfers);
+            mgr.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
             assert_eq!(transfers.len(), expected - actual);
         }
     }
@@ -871,7 +904,7 @@ mod test {
             na::Point3::new(-0.75, 0.5, -1.0),
         ];
         let mut transfers = Vec::new();
-        manager.update(&viewpoints, &mut transfers);
+        manager.update(viewpoint_refinement(&viewpoints), &mut transfers, None);
         // Fully resolve coarse levels, with only selected complete groups of
         // deeper children. This models partial splits and asymmetric streaming.
         for chunk in transfers {
@@ -883,7 +916,7 @@ mod test {
                 manager.release(slot).unwrap();
             }
         }
-        manager.update(&viewpoints, &mut Vec::new());
+        manager.update(viewpoint_refinement(&viewpoints), &mut Vec::new(), None);
         let rendered = manager.renderable();
         assert!(!rendered.is_empty());
         let visible: HashSet<_> = rendered.iter().map(|entry| entry.chunk).collect();
@@ -928,7 +961,7 @@ mod test {
         let mut transfers = Vec::new();
         for frame in 0..120 {
             let viewpoint = viewpoints[(frame / 10) % viewpoints.len()];
-            manager.update(&[viewpoint], &mut transfers);
+            manager.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
             for (idx, &chunk) in transfers.iter().enumerate() {
                 if chunk.depth() == 0 || idx % 3 == frame % 3 {
                     if let Some(slot) = manager.allocate(chunk) {
@@ -936,7 +969,7 @@ mod test {
                     }
                 }
             }
-            manager.update(&[viewpoint], &mut transfers);
+            manager.update(viewpoint_refinement(&[viewpoint]), &mut transfers, None);
             let visible: HashSet<_> = manager
                 .renderable()
                 .iter()
@@ -960,6 +993,30 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn custom_refinement_and_capacity_share_one_tree() {
+        let config = Config::new(5, 1).unwrap();
+        let target = Chunk::try_new(5, Face::Nz, 17, 21).unwrap();
+        let refine = |chunk: &Chunk| target.path().any(|ancestor| ancestor == *chunk);
+        let needed = config.slots_needed(refine).unwrap();
+        assert_eq!(needed, 6 + 4 * 5);
+        let mut manager = Manager::new(needed, config).unwrap();
+        let mut transfers = Vec::new();
+        let mut visited = Vec::new();
+        manager.update(refine, &mut transfers, Some(&mut visited));
+        assert_eq!(visited.len(), needed);
+        assert_eq!(transfers.len(), needed);
+        assert!(visited.contains(&target));
+        for chunk in transfers.drain(..) {
+            let allocation = manager.allocate(chunk).unwrap();
+            manager.release(allocation).unwrap();
+        }
+        manager.update(refine, &mut transfers, Some(&mut visited));
+        assert!(transfers.is_empty());
+        assert!(manager.renderable().iter().any(|tile| tile.chunk == target));
+        assert_eq!(manager.renderable().len(), 6 + 3 * 5);
     }
 
     #[test]

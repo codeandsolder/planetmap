@@ -170,6 +170,15 @@ impl Chunk {
         self.coords.edge_length()
     }
 
+    /// Conservative angular radius in radians around the chunk center.
+    /// The separable face warp has derivative at most 1.757 on [-1,1].
+    /// Normalizing [u,v,1] has operator norm at most one; integrating
+    /// along a straight face path bounds arc length to every point.
+    #[must_use = "Use the bound to prune spherical feature queries"]
+    pub fn angular_radius_bound(&self) -> f64 {
+        2.5 / f64::from(self.resolution())
+    }
+
     /// Location of the center of this chunk on the surface of the sphere
     ///
     /// Shorthand for `direction(&[0.5; 2].into())`.
@@ -268,6 +277,28 @@ mod test {
         assert_eq!(Chunk::try_new(0, face, 0, 1), Err(ChunkError::Coordinates));
         let parent = Chunk::try_new(30, face, max / 2, max / 2).unwrap();
         assert!(parent.children().unwrap().contains(&deepest));
+    }
+
+    #[test]
+    fn angular_bound_covers_warped_grid_and_extreme_addresses() {
+        for face in Face::iter() {
+            for depth in [0, 1, 4, 10, 20, Chunk::MAX_DEPTH] {
+                let last = (1u32 << depth) - 1;
+                for x in [0, last / 3, last / 2, last] {
+                    for y in [0, last / 3, last / 2, last] {
+                        let chunk = Chunk::try_new(depth, face, x, y).unwrap();
+                        let center = chunk.origin::<f64>().into_inner();
+                        let radius = 2.0 * (0.5 * chunk.angular_radius_bound()).sin();
+                        for direction in chunk.samples::<f64>(9) {
+                            assert!(
+                                (direction.into_inner() - center).norm()
+                                    <= radius + 64.0 * f64::EPSILON
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
