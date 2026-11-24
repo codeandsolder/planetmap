@@ -16,20 +16,20 @@ concurrency:
 jobs:
   strict-rust:
     name: Strict Rust and source policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@23937d404c2556ec3ef7dd8eef345623fa97a099 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
     with:
       cargo-args: --locked --workspace --all-targets --all-features
 
   tests:
     name: Rust pinned nightly all-feature tests
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8ab6060d47a3c56bb406aff41189fbfcf7aa9acc # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
       rust-toolchain: "nightly-2026-11-19"
       command: cargo +nightly-2026-11-19 test --locked --workspace --all-targets --all-features
 
   miri:
     name: Cubemap allocation and borrowing under Miri
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8ab6060d47a3c56bb406aff41189fbfcf7aa9acc # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
       rust-toolchain: "nightly-2026-11-19"
       rust-components: "miri rust-src"
