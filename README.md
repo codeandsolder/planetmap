@@ -28,9 +28,14 @@ level along a ray originating at the center of a planet. Streaming and
 level of detail can then be implemented with a `CacheManager`
 associated with GPU-resident buffers.
 
-For an exact capacity requirement for a particular set of viewpoints, use
-`cache::Config::slots_needed(viewpoints)`. It counts every desired chunk,
-including ancestors and roots, rather than assuming a worst-case direction.
+The application supplies a deterministic refinement criterion to
+`CacheManager::update(refine, &mut transfers, visited)`. For ordinary
+view-distance selection, use `cache::viewpoint_refinement(&viewpoints)`.
+Compose it with local surface feature or geometric error criteria as needed.
+`cache::Config::slots_needed(refine)` counts the same desired chunks,
+including ancestors and roots. Both operations obey the configured maximum
+depth. `Chunk::angular_radius_bound()` conservatively encloses each
+warped chunk in a spherical cap, useful for broad-phase feature queries.
 
 The renderable cut contains named `RenderableChunk` records with the chunk,
 edge-stitching neighborhood and ready physical slot.
