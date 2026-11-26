@@ -22,14 +22,14 @@ jobs:
 
   tests:
     name: Rust pinned nightly all-feature tests
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@91183d106cd3b1f251fa52d9f3b78429af6f9e7c # main
     with:
       rust-toolchain: "nightly-2026-11-19"
       command: cargo +nightly-2026-11-19 test --locked --workspace --all-targets --all-features
 
   miri:
     name: Cubemap allocation and borrowing under Miri
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@91183d106cd3b1f251fa52d9f3b78429af6f9e7c # main
     with:
       rust-toolchain: "nightly-2026-11-19"
       rust-components: "miri rust-src"
